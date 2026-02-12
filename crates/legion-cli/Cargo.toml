@@ -1,0 +1,20 @@
+[package]
+name = "legion-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "legion"
+path = "src/main.rs"
+
+[dependencies]
+legion-tui = { path = "../legion-tui" }
+legion-core = { path = "../legion-core" }
+legion-db = { path = "../legion-db" }
+legion-daemon = { path = "../legion-daemon" }
+
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

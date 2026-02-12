@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/legion-cli",
+    "crates/legion-tui",
+    "crates/legion-core",
+    "crates/legion-db",
+    "crates/legion-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["rainlei"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# HTTP
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# PTY
+portable-pty = "0.8"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Utils
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"

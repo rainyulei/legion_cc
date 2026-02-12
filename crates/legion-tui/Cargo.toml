@@ -1,0 +1,13 @@
+[package]
+name = "legion-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+legion-core = { path = "../legion-core" }
+legion-db = { path = "../legion-db" }
+
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
