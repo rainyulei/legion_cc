@@ -26,20 +26,22 @@ pub fn discover_sessions() -> Result<Vec<ClaudeSession>> {
         return Ok(sessions);
     }
 
-    // Walk through projects directory
-    for entry in std::fs::read_dir(&projects_dir)? {
-        let entry = entry?;
+    // Walk through projects directory, skipping entries that fail to read
+    for entry in std::fs::read_dir(&projects_dir)?.flatten() {
         let path = entry.path();
 
         if path.is_dir() {
-            // Look for .jsonl files
-            for file_entry in std::fs::read_dir(&path)? {
-                let file_entry = file_entry?;
+            let dir_entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for file_entry in dir_entries.flatten() {
                 let file_path = file_entry.path();
 
                 if file_path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                    let metadata = std::fs::metadata(&file_path)?;
-                    let modified: DateTime<Utc> = metadata.modified()?.into();
+                    let Ok(metadata) = std::fs::metadata(&file_path) else { continue };
+                    let Ok(modified_time) = metadata.modified() else { continue };
+                    let modified: DateTime<Utc> = modified_time.into();
 
                     let id = file_path
                         .file_stem()
@@ -72,7 +74,9 @@ pub fn discover_sessions() -> Result<Vec<ClaudeSession>> {
 
 pub fn get_session_display_name(session: &ClaudeSession) -> String {
     let elapsed = Utc::now() - session.last_modified;
-    let time_str = if elapsed.num_hours() < 1 {
+    let time_str = if elapsed.num_minutes() < 1 {
+        "just now".to_string()
+    } else if elapsed.num_hours() < 1 {
         format!("{}m ago", elapsed.num_minutes())
     } else if elapsed.num_days() < 1 {
         format!("{}h ago", elapsed.num_hours())

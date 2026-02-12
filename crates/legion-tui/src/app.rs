@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use legion_core::{ProxyConfig, ProxyServer};
-use legion_core::session::{discover_sessions, ClaudeSession, get_session_display_name};
+use legion_core::session::{discover_sessions, ClaudeSession};
 use legion_db::{Provider, Session};
 
 use crate::pty::PtyHandle;
@@ -325,11 +325,6 @@ impl App {
         // Restart Claude with --resume pointing to the session file
         // This will require modifying PTY spawn
         Ok(())
-    }
-
-    /// Get display name for a Claude session
-    pub fn get_claude_session_display_name(session: &ClaudeSession) -> String {
-        get_session_display_name(session)
     }
 
     /// Load data from repository
