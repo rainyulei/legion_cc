@@ -28,8 +28,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Start) | None => {
-            println!("Starting Legion in single window mode...");
-            // TODO: Start TUI
+            legion_tui::run().await?;
         }
         Some(Commands::Squad { workers }) => {
             println!("Starting Legion squad mode with {} workers...", workers);
