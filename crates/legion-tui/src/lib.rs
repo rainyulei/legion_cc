@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod input;
+pub mod pty;
 pub mod ui;
 
 use std::io;
@@ -58,6 +59,11 @@ pub async fn run_with_port(proxy_port: u16) -> Result<()> {
         }
     }
 
+    // Start Claude Code in PTY
+    if let Err(e) = app.start_claude() {
+        tracing::warn!("Failed to start Claude Code: {}", e);
+    }
+
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
 
@@ -75,11 +81,14 @@ async fn run_event_loop(
     app: &mut App,
 ) -> Result<()> {
     loop {
+        // Update PTY output
+        app.update_pty_output();
+
         // Draw the UI
         terminal.draw(|frame| draw(frame, app))?;
 
-        // Poll for events with a small timeout to allow async operations
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // Poll for events with a small timeout for smoother PTY output
+        if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 match handle_key(app, key) {
                     InputResult::Quit => break,

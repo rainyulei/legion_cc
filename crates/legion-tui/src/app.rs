@@ -5,6 +5,8 @@ use std::sync::Arc;
 use legion_core::{ProxyConfig, ProxyServer};
 use legion_db::{Provider, Session};
 
+use crate::pty::PtyHandle;
+
 /// Popup menu types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PopupMenu {
@@ -73,6 +75,11 @@ pub struct App {
     pub proxy: Arc<ProxyServer>,
     /// Proxy server port
     pub proxy_port: u16,
+
+    /// PTY handle for Claude Code process
+    pub pty: Option<PtyHandle>,
+    /// PTY output buffer as string
+    pub pty_output: String,
 }
 
 impl Default for App {
@@ -97,6 +104,8 @@ impl App {
             submenu_index: 0,
             proxy: Arc::new(ProxyServer::new(proxy_port)),
             proxy_port,
+            pty: None,
+            pty_output: String::new(),
         }
     }
 
@@ -331,6 +340,28 @@ impl App {
                 model: self.current_model.clone(),
             };
             self.proxy.update_config(config).await;
+        }
+    }
+
+    /// Start Claude Code in a PTY
+    pub fn start_claude(&mut self) -> anyhow::Result<()> {
+        let pty = PtyHandle::spawn_claude(self.proxy_port)?;
+        self.pty = Some(pty);
+        Ok(())
+    }
+
+    /// Update PTY output buffer from the PTY handle
+    pub fn update_pty_output(&mut self) {
+        if let Some(pty) = &self.pty {
+            let output = pty.read_output();
+            self.pty_output = String::from_utf8_lossy(&output).to_string();
+        }
+    }
+
+    /// Send data to the PTY
+    pub fn send_to_pty(&mut self, data: &[u8]) {
+        if let Some(pty) = &mut self.pty {
+            let _ = pty.write(data);
         }
     }
 }

@@ -69,16 +69,20 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// Draw main content area (placeholder for PTY output)
-fn draw_main(frame: &mut Frame, _app: &App, area: Rect) {
+/// Draw main content area (PTY output)
+fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(" Claude Code ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue));
 
-    let content = Paragraph::new("PTY output will be rendered here...")
-        .style(Style::default().fg(Color::DarkGray))
-        .block(block);
+    // Show last lines of PTY output
+    let lines: Vec<&str> = app.pty_output.lines().rev().take(100).collect();
+    let text: Vec<Line> = lines.iter().rev().map(|l| Line::from(*l)).collect();
+
+    let content = Paragraph::new(text)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: false });
 
     frame.render_widget(content, area);
 }
