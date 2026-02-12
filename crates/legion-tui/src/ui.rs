@@ -8,6 +8,8 @@ use ratatui::{
     Frame,
 };
 
+use legion_core::session::get_session_display_name;
+
 use crate::app::{App, AppMode, MainMenuItem, PopupMenu};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -146,8 +148,9 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 MainMenuItem::Session => {
                     let session = app
-                        .get_current_session()
-                        .and_then(|s| s.name.clone())
+                        .current_claude_session
+                        .as_ref()
+                        .map(|s| get_session_display_name(s))
                         .unwrap_or_else(|| "None".to_string());
                     format!("[{}]", session)
                 }
@@ -302,19 +305,20 @@ fn draw_session_menu(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(Color::Green));
 
     let items: Vec<ListItem> = app
-        .sessions
+        .claude_sessions
         .iter()
         .enumerate()
         .map(|(i, session)| {
             let is_selected = i == app.submenu_index;
-            let is_current = app.current_session == Some(i);
+            let is_current = app
+                .current_claude_session
+                .as_ref()
+                .map(|s| s.id == session.id)
+                .unwrap_or(false);
             let prefix = if is_selected { "> " } else { "  " };
             let indicator = if is_current { " \u{25cf}" } else { "" };
 
-            let name = session
-                .name
-                .as_deref()
-                .unwrap_or(&session.id);
+            let name = get_session_display_name(session);
 
             let style = if is_selected {
                 Style::default()

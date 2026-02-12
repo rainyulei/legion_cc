@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use legion_core::{ProxyConfig, ProxyServer};
+use legion_core::session::{discover_sessions, ClaudeSession, get_session_display_name};
 use legion_db::{Provider, Session};
 
 use crate::pty::PtyHandle;
@@ -61,10 +62,15 @@ pub struct App {
     /// Whether we're connected to the provider
     pub provider_connected: bool,
 
-    /// Available sessions
+    /// Available sessions (from database)
     pub sessions: Vec<Session>,
     /// Currently selected session index
     pub current_session: Option<usize>,
+
+    /// Discovered Claude Code sessions (from ~/.claude/projects/)
+    pub claude_sessions: Vec<ClaudeSession>,
+    /// Currently active Claude session
+    pub current_claude_session: Option<ClaudeSession>,
 
     /// Current menu selection index (main menu)
     pub menu_index: usize,
@@ -100,6 +106,8 @@ impl App {
             provider_connected: false,
             sessions: Vec::new(),
             current_session: None,
+            claude_sessions: Vec::new(),
+            current_claude_session: None,
             menu_index: 0,
             submenu_index: 0,
             proxy: Arc::new(ProxyServer::new(proxy_port)),
@@ -149,8 +157,16 @@ impl App {
                         self.submenu_index = self.get_current_model_index().unwrap_or(0);
                     }
                     MainMenuItem::Session => {
+                        self.refresh_sessions();
                         self.mode = AppMode::Popup(PopupMenu::Session);
-                        self.submenu_index = self.current_session.unwrap_or(0);
+                        // Find current claude session index
+                        self.submenu_index = self
+                            .current_claude_session
+                            .as_ref()
+                            .and_then(|current| {
+                                self.claude_sessions.iter().position(|s| s.id == current.id)
+                            })
+                            .unwrap_or(0);
                     }
                     MainMenuItem::Settings => {
                         // TODO: Settings submenu
@@ -186,8 +202,9 @@ impl App {
                 self.back_to_main_menu();
             }
             AppMode::Popup(PopupMenu::Session) => {
-                if self.submenu_index < self.sessions.len() {
-                    self.current_session = Some(self.submenu_index);
+                if self.submenu_index < self.claude_sessions.len() {
+                    let session = self.claude_sessions[self.submenu_index].clone();
+                    let _ = self.switch_session(&session);
                 }
                 self.back_to_main_menu();
             }
@@ -230,7 +247,7 @@ impl App {
                 if self.submenu_index > 0 {
                     self.submenu_index -= 1;
                 } else {
-                    self.submenu_index = self.sessions.len().saturating_sub(1);
+                    self.submenu_index = self.claude_sessions.len().saturating_sub(1);
                 }
             }
             _ => {}
@@ -264,7 +281,7 @@ impl App {
                 }
             }
             AppMode::Popup(PopupMenu::Session) => {
-                if self.submenu_index < self.sessions.len().saturating_sub(1) {
+                if self.submenu_index < self.claude_sessions.len().saturating_sub(1) {
                     self.submenu_index += 1;
                 } else {
                     self.submenu_index = 0;
@@ -294,6 +311,25 @@ impl App {
     /// Get current session
     pub fn get_current_session(&self) -> Option<&Session> {
         self.current_session.and_then(|i| self.sessions.get(i))
+    }
+
+    /// Refresh discovered Claude sessions from ~/.claude/projects/
+    pub fn refresh_sessions(&mut self) {
+        self.claude_sessions = discover_sessions().unwrap_or_default();
+    }
+
+    /// Switch to a discovered Claude session
+    pub fn switch_session(&mut self, session: &ClaudeSession) -> anyhow::Result<()> {
+        self.current_claude_session = Some(session.clone());
+
+        // Restart Claude with --resume pointing to the session file
+        // This will require modifying PTY spawn
+        Ok(())
+    }
+
+    /// Get display name for a Claude session
+    pub fn get_claude_session_display_name(session: &ClaudeSession) -> String {
+        get_session_display_name(session)
     }
 
     /// Load data from repository
