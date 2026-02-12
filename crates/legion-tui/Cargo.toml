@@ -11,3 +11,4 @@ ratatui.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+tracing.workspace = true

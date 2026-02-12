@@ -1,5 +1,8 @@
 //! TUI application state and logic
 
+use std::sync::Arc;
+
+use legion_core::{ProxyConfig, ProxyServer};
 use legion_db::{Provider, Session};
 
 /// Popup menu types
@@ -65,17 +68,22 @@ pub struct App {
     pub menu_index: usize,
     /// Current submenu selection index
     pub submenu_index: usize,
+
+    /// Proxy server instance
+    pub proxy: Arc<ProxyServer>,
+    /// Proxy server port
+    pub proxy_port: u16,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self::new()
+        Self::new(18080)
     }
 }
 
 impl App {
-    /// Create a new App instance
-    pub fn new() -> Self {
+    /// Create a new App instance with specified proxy port
+    pub fn new(proxy_port: u16) -> Self {
         Self {
             mode: AppMode::Normal,
             should_quit: false,
@@ -87,6 +95,8 @@ impl App {
             current_session: None,
             menu_index: 0,
             submenu_index: 0,
+            proxy: Arc::new(ProxyServer::new(proxy_port)),
+            proxy_port,
         }
     }
 
@@ -294,6 +304,33 @@ impl App {
             if !self.sessions.is_empty() {
                 self.current_session = Some(0);
             }
+        }
+    }
+
+    /// Connect to the currently selected provider and update proxy configuration
+    pub async fn connect_provider(&self) -> anyhow::Result<()> {
+        if let Some(provider) = self.get_current_provider() {
+            let config = ProxyConfig {
+                target_url: Some(provider.base_url.clone()),
+                api_key: provider.api_key.clone(),
+                api_format: Some(provider.api_format.clone()),
+                model: self.current_model.clone(),
+            };
+            self.proxy.update_config(config).await;
+        }
+        Ok(())
+    }
+
+    /// Update proxy configuration when model changes
+    pub async fn update_proxy_model(&self) {
+        if let Some(provider) = self.get_current_provider() {
+            let config = ProxyConfig {
+                target_url: Some(provider.base_url.clone()),
+                api_key: provider.api_key.clone(),
+                api_format: Some(provider.api_format.clone()),
+                model: self.current_model.clone(),
+            };
+            self.proxy.update_config(config).await;
         }
     }
 }

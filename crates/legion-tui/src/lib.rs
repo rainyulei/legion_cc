@@ -24,7 +24,7 @@ pub async fn run() -> Result<()> {
 }
 
 /// Run the TUI with specified port
-pub async fn run_with_port(_port: u16) -> Result<()> {
+pub async fn run_with_port(proxy_port: u16) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -32,12 +32,30 @@ pub async fn run_with_port(_port: u16) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app state
-    let mut app = App::new();
+    // Create app state with proxy port
+    let mut app = App::new(proxy_port);
 
     // Load data from database
     if let Ok(repo) = legion_db::open_db() {
         app.load_from_repo(&repo);
+    }
+
+    // Start proxy in background
+    let proxy = app.proxy.clone();
+    tokio::spawn(async move {
+        if let Err(e) = proxy.start().await {
+            tracing::error!("Proxy error: {}", e);
+        }
+    });
+
+    // Wait a bit for proxy to start
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Connect to default provider if available
+    if app.provider_connected {
+        if let Err(e) = app.connect_provider().await {
+            tracing::warn!("Failed to connect to default provider: {}", e);
+        }
     }
 
     // Main event loop
