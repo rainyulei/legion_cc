@@ -27,7 +27,12 @@ pub async fn run() -> Result<()> {
 /// Run the TUI with specified port
 pub async fn run_with_port(proxy_port: u16) -> Result<()> {
     // Setup terminal
-    enable_raw_mode()?;
+    enable_raw_mode().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to initialize terminal: {}. Legion requires an interactive terminal (e.g. iTerm2, Terminal.app).",
+            e
+        )
+    })?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -68,9 +73,9 @@ pub async fn run_with_port(proxy_port: u16) -> Result<()> {
     let result = run_event_loop(&mut terminal, &mut app).await;
 
     // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
 
     result
 }
