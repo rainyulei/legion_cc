@@ -97,6 +97,19 @@ fn main() {
             "  Worker {}: [{}] \"{}\" ({}s)",
             id, badge, display_ticket, elapsed
         );
+
+        // Show summary if available
+        if let Some(summary) = w.get("summary").and_then(|v| v.as_str()) {
+            if !summary.is_empty() {
+                println!("           Summary: {}", summary);
+            }
+        }
+
+        // Show result file if available
+        let result_path = format!("/tmp/legion/results/worker-{}.md", id);
+        if std::path::Path::new(&result_path).exists() {
+            println!("           Result: {}", result_path);
+        }
     }
 
     println!("Completed: {}/{}", completed, total);

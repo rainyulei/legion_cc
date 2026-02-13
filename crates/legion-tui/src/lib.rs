@@ -1,6 +1,7 @@
 //! Legion TUI - Embedded terminal interface with provider/model switching
 
 pub mod app;
+pub mod claudemd;
 pub mod input;
 pub mod pty;
 pub mod ui;
@@ -82,6 +83,11 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     let worker_height = content_height / worker_count;
     let worker_pty_rows = worker_height.saturating_sub(2);
     let worker_pty_cols = worker_width.saturating_sub(2);
+
+    // Generate CLAUDE.md files for Leader and Workers
+    if let Err(e) = claudemd::write_squad_claude_md(worker_count) {
+        tracing::warn!("Failed to write CLAUDE.md files: {}", e);
+    }
 
     // Port assignments:
     // Leader: proxy = base_port, control = base_port + 1000
