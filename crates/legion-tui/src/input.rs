@@ -136,7 +136,7 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
 
 fn handle_matrix_keys(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc => app.back_to_main_menu(),
+        KeyCode::Esc => app.toggle_popup(),
         KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
         KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
         KeyCode::Tab | KeyCode::Left | KeyCode::Right
@@ -161,11 +161,7 @@ fn handle_main_menu_keys(app: &mut App, key: KeyEvent) {
 fn handle_submenu_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
-            if app.model_target.is_some() {
-                app.back_to_matrix();
-            } else {
-                app.back_to_main_menu();
-            }
+            app.back_to_matrix();
         }
         KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
         KeyCode::Down | KeyCode::Char('j') => app.menu_down(),

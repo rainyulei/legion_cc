@@ -327,7 +327,7 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_matrix(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
-        .title(" Configuration [ESC] ")
+        .title(" Switch Model [ESC] ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::DarkGray));

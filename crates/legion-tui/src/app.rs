@@ -290,19 +290,38 @@ impl App {
         }
     }
 
-    /// Load providers from database
+    /// Load providers from database, prepend "Native" option
     pub fn load_from_db(&mut self) {
+        // "Native" provider: bypasses proxy, uses Claude Code's own API key
+        let native = Provider {
+            id: "__native__".to_string(),
+            name: "Native".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: None,
+            api_format: "anthropic".to_string(),
+            models: None,
+            is_default: false,
+            created_at: 0,
+        };
+        self.providers = vec![native];
+
         if let Ok(repo) = legion_db::open_db() {
-            if let Ok(providers) = repo.list_providers() {
-                self.providers = providers;
-                if let Ok(Some(default)) = repo.get_default_provider() {
-                    self.current_provider =
-                        self.providers.iter().position(|p| p.id == default.id);
-                    self.current_model =
-                        default.models.as_ref().and_then(|m| m.first().cloned());
-                    self.provider_connected = true;
-                }
+            if let Ok(mut providers) = repo.list_providers() {
+                self.providers.append(&mut providers);
             }
+            if let Ok(Some(default)) = repo.get_default_provider() {
+                self.current_provider =
+                    self.providers.iter().position(|p| p.id == default.id);
+                self.current_model =
+                    default.models.as_ref().and_then(|m| m.first().cloned());
+                self.provider_connected = true;
+            }
+        }
+
+        // Default to Native (index 0) if no default provider set
+        if self.current_provider.is_none() {
+            self.current_provider = Some(0);
+            self.provider_connected = true;
         }
     }
 
@@ -315,8 +334,9 @@ impl App {
     pub fn toggle_popup(&mut self) {
         match self.mode {
             AppMode::Normal => {
-                self.mode = AppMode::Popup(PopupMenu::Main);
-                self.menu_index = 0;
+                self.mode = AppMode::Popup(PopupMenu::Matrix);
+                self.matrix_row = 0;
+                self.matrix_col = MatrixCol::Provider;
             }
             AppMode::Popup(_) => {
                 self.mode = AppMode::Normal;
