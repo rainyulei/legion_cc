@@ -6,6 +6,7 @@ members = [
     "crates/legion-core",
     "crates/legion-db",
     "crates/legion-daemon",
+    "crates/legion-tools",
 ]
 exclude = ["proto"]
 

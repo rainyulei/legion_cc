@@ -1,0 +1,28 @@
+[package]
+name = "legion-tools"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "legion-dispatch"
+path = "src/bin/legion-dispatch.rs"
+
+[[bin]]
+name = "legion-check"
+path = "src/bin/legion-check.rs"
+
+[[bin]]
+name = "legion-report"
+path = "src/bin/legion-report.rs"
+
+[[bin]]
+name = "legion-status"
+path = "src/bin/legion-status.rs"
+
+[[bin]]
+name = "legion-stop"
+path = "src/bin/legion-stop.rs"
+
+[dependencies]
+ureq.workspace = true
+serde_json.workspace = true
