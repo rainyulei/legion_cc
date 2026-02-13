@@ -221,7 +221,13 @@ async fn handle_request(
             Some("openai_chat") => {
                 request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
             }
+            Some("anthropic_bearer") => {
+                // Copilot, OpenCode Zen, etc. — Anthropic format but Bearer auth
+                request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+                request_builder = request_builder.header("anthropic-version", "2023-06-01");
+            }
             _ => {
+                // Native Anthropic — x-api-key auth
                 request_builder = request_builder.header("x-api-key", api_key);
                 request_builder = request_builder.header("anthropic-version", "2023-06-01");
             }

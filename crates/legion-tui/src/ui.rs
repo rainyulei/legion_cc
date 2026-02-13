@@ -367,7 +367,7 @@ fn matrix_row_item<'a>(
     } else if is_selected_row {
         Style::default().fg(Color::White)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Color::Gray)
     };
 
     let model_style = if is_selected_row && app.matrix_col == MatrixCol::Model {
@@ -375,7 +375,7 @@ fn matrix_row_item<'a>(
     } else if is_selected_row {
         Style::default().fg(Color::White)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Color::Gray)
     };
 
     let row_style = if is_selected_row {

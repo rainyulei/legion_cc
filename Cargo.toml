@@ -31,6 +31,7 @@ hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
+ureq = "3"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }

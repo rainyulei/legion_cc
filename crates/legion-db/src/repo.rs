@@ -97,6 +97,24 @@ impl Repository {
         Ok(())
     }
 
+    pub fn upsert_provider(&self, provider: &Provider) -> Result<()> {
+        let models_json = provider.models.as_ref().map(|m| serde_json::to_string(m).unwrap());
+        self.conn.execute(
+            "INSERT OR REPLACE INTO providers (id, name, base_url, api_key, api_format, models, is_default, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                provider.id,
+                provider.name,
+                provider.base_url,
+                provider.api_key,
+                provider.api_format,
+                models_json,
+                provider.is_default as i32,
+                provider.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn update_provider_models(&self, id: &str, models: &[String]) -> Result<()> {
         let models_json = serde_json::to_string(models)?;
         self.conn.execute(

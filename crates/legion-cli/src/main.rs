@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -44,6 +45,13 @@ enum Commands {
     Switch {
         #[arg(long, default_value = "19080")]
         control_port: u16,
+    },
+
+    /// Import providers from cc-switch database
+    Import {
+        /// Path to cc-switch database (default: ~/.cc-switch/cc-switch.db)
+        #[arg(long)]
+        from: Option<PathBuf>,
     },
 }
 
@@ -102,6 +110,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Switch { control_port }) => {
             legion_tui::run_popup(control_port).await?;
+        }
+        Some(Commands::Import { from }) => {
+            cmd_import(from)?;
         }
         None => {
             cmd_start(18080, 19080, false).await?;
@@ -167,6 +178,164 @@ async fn cmd_start(proxy_port: u16, control_port: u16, serve_only: bool) -> Resu
     legion_tui::run(proxy_port, control_port).await?;
 
     Ok(())
+}
+
+fn cmd_import(from: Option<PathBuf>) -> Result<()> {
+    let repo = legion_db::open_db()?;
+    let now = chrono::Utc::now().timestamp();
+
+    // Read Copilot token from cc-switch if available
+    let copilot_token = read_ccswitch_copilot_token(&from);
+
+    let providers = vec![
+        legion_db::Provider {
+            id: "claude-code".into(),
+            name: "Claude Code".into(),
+            base_url: "https://api.anthropic.com".into(),
+            api_key: None,
+            api_format: "anthropic".into(),
+            models: Some(vec![
+                "claude-opus-4-6".into(),
+                "claude-sonnet-4-5".into(),
+                "claude-haiku-4-5".into(),
+            ]),
+            is_default: false,
+            created_at: now,
+        },
+        legion_db::Provider {
+            id: "opencode-zen".into(),
+            name: "OpenCode Zen".into(),
+            base_url: "https://opencode.ai/zen/v1".into(),
+            api_key: Some("free".into()),
+            api_format: "anthropic_bearer".into(),
+            models: None, // fetched dynamically below
+            is_default: true,
+            created_at: now,
+        },
+        legion_db::Provider {
+            id: "github-copilot".into(),
+            name: "GitHub Copilot".into(),
+            base_url: "https://api.githubcopilot.com".into(),
+            api_key: copilot_token.clone(),
+            api_format: "anthropic_bearer".into(),
+            models: None, // fetched dynamically below
+            is_default: false,
+            created_at: now,
+        },
+        legion_db::Provider {
+            id: "codex-openai".into(),
+            name: "Codex (OpenAI)".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: None,
+            api_format: "openai_chat".into(),
+            models: Some(vec![
+                "gpt-5.2".into(),
+                "gpt-5.2-codex".into(),
+                "gpt-5.1-codex-max".into(),
+            ]),
+            is_default: false,
+            created_at: now,
+        },
+    ];
+
+    let mut imported = 0u32;
+    let mut updated = 0u32;
+
+    for provider in &providers {
+        let action = if repo.get_provider(&provider.id)?.is_some() {
+            "updated"
+        } else {
+            "imported"
+        };
+        repo.upsert_provider(provider)?;
+        println!("  {}: {} [{}]", action, provider.name, provider.api_format);
+        if action == "imported" { imported += 1; } else { updated += 1; }
+    }
+
+    // Dynamic model fetch for providers with tokens
+    println!("\nFetching models...");
+
+    // OpenCode Zen — always available (free)
+    print!("  OpenCode Zen: ");
+    match fetch_models_from_api("https://opencode.ai/zen/v1/models", "free") {
+        Ok(models) => {
+            println!("{} models", models.len());
+            repo.update_provider_models("opencode-zen", &models)?;
+        }
+        Err(e) => println!("failed ({})", e),
+    }
+
+    // GitHub Copilot — fetch if we have a token
+    if let Some(ref token) = copilot_token {
+        print!("  GitHub Copilot: ");
+        match fetch_models_from_api("https://api.githubcopilot.com/models", token) {
+            Ok(models) => {
+                println!("{} models", models.len());
+                repo.update_provider_models("github-copilot", &models)?;
+            }
+            Err(e) => {
+                println!("failed ({}), using defaults", e);
+                let defaults: Vec<String> = vec![
+                    "claude-sonnet-4-20250514".into(), "gpt-4o".into(),
+                    "o3-mini".into(), "gemini-2.5-pro".into(),
+                ];
+                repo.update_provider_models("github-copilot", &defaults)?;
+            }
+        }
+    }
+
+    println!("\nDone: {} imported, {} updated", imported, updated);
+    if copilot_token.is_none() {
+        println!("Note: GitHub Copilot token not found (install cc-switch or set manually)");
+    }
+    Ok(())
+}
+
+/// Read GitHub Copilot token from cc-switch database
+fn read_ccswitch_copilot_token(from: &Option<PathBuf>) -> Option<String> {
+    let db_path = from.clone().unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".cc-switch")
+            .join("cc-switch.db")
+    });
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open(&db_path).ok()?;
+    let token: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(settings_config, '$.env.ANTHROPIC_AUTH_TOKEN') FROM providers WHERE app_type='claude' AND name LIKE '%Copilot%' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    token
+}
+
+/// Fetch models from an OpenAI-compatible /models endpoint
+fn fetch_models_from_api(url: &str, token: &str) -> Result<Vec<String>> {
+    let body = ureq::get(url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Copilot-Integration-Id", "vscode-chat")
+        .call()
+        .map_err(|e| anyhow::anyhow!("{}", e))?
+        .into_body()
+        .read_to_string()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let data: serde_json::Value = serde_json::from_str(&body)?;
+    let models: Vec<String> = data["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item["id"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if models.is_empty() {
+        anyhow::bail!("no models in response");
+    }
+    Ok(models)
 }
 
 async fn cmd_squad(workers: u16, base_port: u16) -> Result<()> {
