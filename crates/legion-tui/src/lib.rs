@@ -1,4 +1,4 @@
-//! Legion TUI - Terminal User Interface for Legion
+//! Legion TUI - Embedded terminal interface with provider/model switching
 
 pub mod app;
 pub mod input;
@@ -9,65 +9,37 @@ use std::io;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use app::App;
-use input::{handle_key, InputResult};
+use input::{handle_key, handle_mouse, InputResult};
 use ui::draw;
 
-/// Run the TUI with default port
-pub async fn run() -> Result<()> {
-    run_with_port(18080).await
-}
-
-/// Run the TUI with specified port
-pub async fn run_with_port(proxy_port: u16) -> Result<()> {
+/// Run the full TUI with a single embedded Claude Code
+pub async fn run(proxy_port: u16, control_port: u16) -> Result<()> {
     // Setup terminal
-    enable_raw_mode().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to initialize terminal: {}. Legion requires an interactive terminal (e.g. iTerm2, Terminal.app).",
-            e
-        )
-    })?;
+    enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app state with proxy port
-    let mut app = App::new(proxy_port);
+    // Create app and load providers from DB
+    let mut app = App::new();
+    app.load_from_db();
 
-    // Load data from database
-    if let Ok(repo) = legion_db::open_db() {
-        app.load_from_repo(&repo);
-    }
+    // Calculate PTY size from terminal (minus header=1, footer=1, border=2)
+    let size = terminal.size()?;
+    app.term_size = (size.width, size.height);
+    let pty_rows = size.height.saturating_sub(4);
+    let pty_cols = size.width.saturating_sub(2);
 
-    // Start proxy in background
-    let proxy = app.proxy.clone();
-    tokio::spawn(async move {
-        if let Err(e) = proxy.start().await {
-            tracing::error!("Proxy error: {}", e);
-        }
-    });
-
-    // Wait a bit for proxy to start
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Connect to default provider if available
-    if app.provider_connected {
-        if let Err(e) = app.connect_provider().await {
-            tracing::warn!("Failed to connect to default provider: {}", e);
-        }
-    }
-
-    // Start Claude Code in PTY
-    if let Err(e) = app.start_claude() {
-        tracing::warn!("Failed to start Claude Code: {}", e);
-    }
+    // Start Claude in single pane (no skip permissions - normal interactive flow)
+    app.add_pane(pty_rows, pty_cols, proxy_port, control_port, "Claude Code".into(), false);
 
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
@@ -80,33 +52,112 @@ pub async fn run_with_port(proxy_port: u16) -> Result<()> {
     result
 }
 
-/// Main event loop
+/// Run the squad TUI with multiple embedded Claude Code panes
+pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
+    // Setup terminal with mouse support for divider dragging
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create app and load providers from DB
+    let mut app = App::new();
+    app.load_from_db();
+
+    // Cache terminal size
+    let size = terminal.size()?;
+    app.term_size = (size.width, size.height);
+
+    // Calculate PTY sizes based on layout
+    let content_height = size.height.saturating_sub(2); // header + footer
+
+    // Leader pane: leader_ratio% width
+    let leader_width = (size.width as u32 * app.leader_ratio as u32 / 100) as u16;
+    let leader_pty_rows = content_height.saturating_sub(2);
+    let leader_pty_cols = leader_width.saturating_sub(2);
+
+    // Worker panes: remaining width minus 1 for divider, height divided equally
+    let worker_width = size.width.saturating_sub(leader_width).saturating_sub(1);
+    let worker_height = content_height / worker_count;
+    let worker_pty_rows = worker_height.saturating_sub(2);
+    let worker_pty_cols = worker_width.saturating_sub(2);
+
+    // Port assignments:
+    // Leader: proxy = base_port, control = base_port + 1000
+    // Worker i: proxy = base_port + i + 1, control = base_port + 1000 + i + 1
+    let leader_proxy = base_port;
+    let leader_control = base_port + 1000;
+    // Squad mode: all panes skip permissions (auto-trust)
+    app.add_pane(leader_pty_rows, leader_pty_cols, leader_proxy, leader_control, "Leader".into(), true);
+
+    for i in 0..worker_count {
+        let proxy = base_port + i + 1;
+        let control = base_port + 1000 + i + 1;
+        let label = format!("Worker {}", i + 1);
+        app.add_pane(worker_pty_rows, worker_pty_cols, proxy, control, label, true);
+    }
+
+    // Main event loop
+    let result = run_event_loop(&mut terminal, &mut app).await;
+
+    // Restore terminal
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = terminal.show_cursor();
+
+    result
+}
+
+/// Run the popup TUI only (for backward compat with `legion switch`)
+pub async fn run_popup(control_port: u16) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = App::new();
+    app.load_from_db();
+    app.toggle_popup(); // Start in popup mode
+
+    let result = run_event_loop(&mut terminal, &mut app).await;
+
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+
+    result
+}
+
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
     loop {
-        // Update PTY output
-        app.update_pty_output();
-
-        // Draw the UI
         terminal.draw(|frame| draw(frame, app))?;
 
-        // Poll for events with a small timeout for smoother PTY output
         if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                match handle_key(app, key) {
-                    InputResult::Quit => break,
-                    InputResult::Continue => {}
+            match event::read()? {
+                Event::Key(key) => {
+                    match handle_key(app, key) {
+                        InputResult::Quit => break,
+                        InputResult::Continue => {}
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    handle_mouse(app, mouse);
+                }
+                Event::Resize(w, h) => {
+                    app.resize_panes(w, h);
+                }
+                _ => {}
             }
         }
 
-        // Check if app wants to quit
         if app.should_quit {
             break;
         }
     }
-
     Ok(())
 }

@@ -1,12 +1,17 @@
-//! TUI application state and logic
+//! TUI application state
 
-use std::sync::Arc;
+use legion_db::Provider;
 
-use legion_core::{ProxyConfig, ProxyServer};
-use legion_core::session::{discover_sessions, ClaudeSession};
-use legion_db::{Provider, Session};
+use crate::pty::{PtyHandle, SharedParser};
 
-use crate::pty::PtyHandle;
+/// Application mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppMode {
+    /// Normal mode - keys go to PTY
+    Normal,
+    /// Popup menu mode - keys navigate menu
+    Popup(PopupMenu),
+}
 
 /// Popup menu types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,89 +19,83 @@ pub enum PopupMenu {
     Main,
     Provider,
     Model,
-    Session,
+    Matrix,
 }
 
-/// Application mode
+/// Which column is active in the matrix view
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppMode {
-    Normal,
-    Popup(PopupMenu),
+pub enum MatrixCol {
+    Provider,
+    Model,
+}
+
+/// Target for provider/model assignment
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTarget {
+    Pane(usize),
+    AllWorkers,
+    AllPanes,
 }
 
 /// Main menu items
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainMenuItem {
-    Provider,
-    Model,
-    Session,
-    Settings,
+    Config,
     Quit,
 }
 
 impl MainMenuItem {
     pub fn label(&self) -> &'static str {
         match self {
-            MainMenuItem::Provider => "Provider",
-            MainMenuItem::Model => "Model",
-            MainMenuItem::Session => "Session",
-            MainMenuItem::Settings => "Settings",
-            MainMenuItem::Quit => "Quit",
+            Self::Config => "Config",
+            Self::Quit => "Quit",
         }
     }
 }
 
-/// TUI application state
-pub struct App {
-    /// Current application mode
-    pub mode: AppMode,
-    /// Whether the app should quit
-    pub should_quit: bool,
-
-    /// Available providers
-    pub providers: Vec<Provider>,
-    /// Currently selected provider index
-    pub current_provider: Option<usize>,
-    /// Currently selected model name
-    pub current_model: Option<String>,
-    /// Whether we're connected to the provider
-    pub provider_connected: bool,
-
-    /// Available sessions (from database)
-    pub sessions: Vec<Session>,
-    /// Currently selected session index
-    pub current_session: Option<usize>,
-
-    /// Discovered Claude Code sessions (from ~/.claude/projects/)
-    pub claude_sessions: Vec<ClaudeSession>,
-    /// Currently active Claude session
-    pub current_claude_session: Option<ClaudeSession>,
-
-    /// Current menu selection index (main menu)
-    pub menu_index: usize,
-    /// Current submenu selection index
-    pub submenu_index: usize,
-
-    /// Proxy server instance
-    pub proxy: Arc<ProxyServer>,
-    /// Proxy server port
-    pub proxy_port: u16,
-
-    /// PTY handle for Claude Code process
+/// A single pane in the TUI - each runs its own Claude Code instance
+pub struct Pane {
     pub pty: Option<PtyHandle>,
-    /// PTY output buffer as string
-    pub pty_output: String,
+    pub proxy_port: u16,
+    pub control_port: u16,
+    pub label: String,
+    pub current_provider: Option<usize>,
+    pub current_model: Option<String>,
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self::new(18080)
-    }
+/// Full TUI application state
+pub struct App {
+    pub mode: AppMode,
+    pub should_quit: bool,
+
+    // Provider/model state
+    pub providers: Vec<Provider>,
+    pub current_provider: Option<usize>,
+    pub current_model: Option<String>,
+    pub provider_connected: bool,
+
+    // Menu navigation
+    pub menu_index: usize,
+    pub submenu_index: usize,
+
+    // Matrix navigation
+    pub matrix_row: usize,
+    pub matrix_col: MatrixCol,
+    pub model_target: Option<ModelTarget>,
+
+    // Panes (replaces single pty + ports)
+    pub panes: Vec<Pane>,
+    pub focused_pane: usize,
+
+    // Layout
+    pub leader_ratio: u16,        // leader width percentage (20-80), default 65
+    pub dragging_divider: bool,   // mouse drag state
+    pub hover_on_divider: bool,   // mouse hovering near divider
+    pub term_size: (u16, u16),    // cached (width, height) for resize after ratio change
 }
 
 impl App {
-    /// Create a new App instance with specified proxy port
-    pub fn new(proxy_port: u16) -> Self {
+    pub fn new() -> Self {
         Self {
             mode: AppMode::Normal,
             should_quit: false,
@@ -104,31 +103,176 @@ impl App {
             current_provider: None,
             current_model: None,
             provider_connected: false,
-            sessions: Vec::new(),
-            current_session: None,
-            claude_sessions: Vec::new(),
-            current_claude_session: None,
             menu_index: 0,
             submenu_index: 0,
-            proxy: Arc::new(ProxyServer::new(proxy_port)),
-            proxy_port,
-            pty: None,
-            pty_output: String::new(),
+            matrix_row: 0,
+            matrix_col: MatrixCol::Provider,
+            model_target: None,
+            panes: Vec::new(),
+            focused_pane: 0,
+            leader_ratio: 65,
+            dragging_divider: false,
+            hover_on_divider: false,
+            term_size: (0, 0),
         }
     }
 
-    /// Get the main menu items
-    pub fn main_menu_items() -> &'static [MainMenuItem] {
-        &[
-            MainMenuItem::Provider,
-            MainMenuItem::Model,
-            MainMenuItem::Session,
-            MainMenuItem::Settings,
-            MainMenuItem::Quit,
-        ]
+    /// Add a pane, spawning a Claude Code PTY inside it
+    pub fn add_pane(&mut self, rows: u16, cols: u16, proxy_port: u16, control_port: u16, label: String, dangerously_skip_permissions: bool) {
+        let pty = match PtyHandle::spawn(rows, cols, proxy_port, control_port, dangerously_skip_permissions) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::error!("Failed to spawn Claude for pane '{}': {}", label, e);
+                None
+            }
+        };
+        self.panes.push(Pane {
+            pty,
+            proxy_port,
+            control_port,
+            label,
+            current_provider: self.current_provider,
+            current_model: self.current_model.clone(),
+        });
     }
 
-    /// Toggle popup menu
+    /// Whether we're in squad (multi-pane) mode
+    pub fn is_squad(&self) -> bool {
+        self.panes.len() > 1
+    }
+
+    /// Get shared parser ref for rendering the focused pane
+    pub fn parser(&self) -> Option<&SharedParser> {
+        self.panes.get(self.focused_pane)
+            .and_then(|pane| pane.pty.as_ref())
+            .map(|pty| &pty.parser)
+    }
+
+    /// Get shared parser ref for a specific pane
+    pub fn parser_at(&self, index: usize) -> Option<&SharedParser> {
+        self.panes.get(index)
+            .and_then(|pane| pane.pty.as_ref())
+            .map(|pty| &pty.parser)
+    }
+
+    /// Send bytes to the focused pane's PTY
+    pub fn write_to_pty(&mut self, data: &[u8]) {
+        if let Some(pane) = self.panes.get_mut(self.focused_pane) {
+            if let Some(ref mut pty) = pane.pty {
+                let _ = pty.write(data);
+            }
+        }
+    }
+
+    /// Get the control port of the focused pane
+    pub fn focused_control_port(&self) -> u16 {
+        self.panes.get(self.focused_pane)
+            .map(|p| p.control_port)
+            .unwrap_or(0)
+    }
+
+    /// Cycle focus to next pane
+    pub fn focus_next(&mut self) {
+        if !self.panes.is_empty() {
+            self.focused_pane = (self.focused_pane + 1) % self.panes.len();
+        }
+    }
+
+    /// Cycle focus to previous pane
+    pub fn focus_prev(&mut self) {
+        if !self.panes.is_empty() {
+            self.focused_pane = if self.focused_pane > 0 {
+                self.focused_pane - 1
+            } else {
+                self.panes.len() - 1
+            };
+        }
+    }
+
+    /// Adjust leader ratio by delta (clamped 20-80), then resize panes
+    pub fn adjust_leader_ratio(&mut self, delta: i16) {
+        self.leader_ratio = (self.leader_ratio as i16 + delta).clamp(20, 80) as u16;
+        self.apply_resize();
+    }
+
+    /// Set leader ratio from absolute mouse x position
+    pub fn set_leader_ratio_from_x(&mut self, x: u16) {
+        let (w, _) = self.term_size;
+        if w > 0 {
+            self.leader_ratio = ((x as u32 * 100) / w as u32).clamp(20, 80) as u16;
+        }
+    }
+
+    /// Re-apply resize using cached terminal size (after ratio change)
+    pub fn apply_resize(&mut self) {
+        let (w, h) = self.term_size;
+        if w > 0 && h > 0 {
+            self.resize_panes(w, h);
+        }
+    }
+
+    /// Resize all panes to match new terminal dimensions
+    pub fn resize_panes(&mut self, term_width: u16, term_height: u16) {
+        self.term_size = (term_width, term_height);
+        let content_height = term_height.saturating_sub(2); // header + footer
+
+        if self.is_squad() {
+            let worker_count = (self.panes.len() - 1) as u16;
+
+            // Leader: leader_ratio% width, full content height
+            let leader_width = (term_width as u32 * self.leader_ratio as u32 / 100) as u16;
+            let leader_rows = content_height.saturating_sub(2);
+            let leader_cols = leader_width.saturating_sub(2);
+            if let Some(pane) = self.panes.get_mut(0) {
+                if let Some(ref mut pty) = pane.pty {
+                    let _ = pty.resize(leader_rows, leader_cols);
+                }
+            }
+
+            // Workers: remaining width minus 1 for divider column, vertically split
+            let worker_width = term_width.saturating_sub(leader_width).saturating_sub(1);
+            let worker_height = if worker_count > 0 { content_height / worker_count } else { 0 };
+            let worker_rows = worker_height.saturating_sub(2);
+            let worker_cols = worker_width.saturating_sub(2);
+            for i in 1..self.panes.len() {
+                if let Some(ref mut pty) = self.panes[i].pty {
+                    let _ = pty.resize(worker_rows, worker_cols);
+                }
+            }
+        } else {
+            // Single pane: full width minus border
+            let rows = content_height.saturating_sub(2);
+            let cols = term_width.saturating_sub(2);
+            if let Some(pane) = self.panes.get_mut(0) {
+                if let Some(ref mut pty) = pane.pty {
+                    let _ = pty.resize(rows, cols);
+                }
+            }
+        }
+    }
+
+    /// Load providers from database
+    pub fn load_from_db(&mut self) {
+        if let Ok(repo) = legion_db::open_db() {
+            if let Ok(providers) = repo.list_providers() {
+                self.providers = providers;
+                if let Ok(Some(default)) = repo.get_default_provider() {
+                    self.current_provider =
+                        self.providers.iter().position(|p| p.id == default.id);
+                    self.current_model =
+                        default.models.as_ref().and_then(|m| m.first().cloned());
+                    self.provider_connected = true;
+                }
+            }
+        }
+    }
+
+    // --- Menu navigation ---
+
+    pub fn main_menu_items() -> &'static [MainMenuItem] {
+        &[MainMenuItem::Config, MainMenuItem::Quit]
+    }
+
     pub fn toggle_popup(&mut self) {
         match self.mode {
             AppMode::Normal => {
@@ -141,35 +285,15 @@ impl App {
         }
     }
 
-    /// Enter a submenu based on current selection
     pub fn enter_submenu(&mut self) {
         if let AppMode::Popup(PopupMenu::Main) = self.mode {
             let items = Self::main_menu_items();
             if self.menu_index < items.len() {
                 match items[self.menu_index] {
-                    MainMenuItem::Provider => {
-                        self.mode = AppMode::Popup(PopupMenu::Provider);
-                        self.submenu_index = self.current_provider.unwrap_or(0);
-                    }
-                    MainMenuItem::Model => {
-                        self.mode = AppMode::Popup(PopupMenu::Model);
-                        // Find current model index
-                        self.submenu_index = self.get_current_model_index().unwrap_or(0);
-                    }
-                    MainMenuItem::Session => {
-                        self.refresh_sessions();
-                        self.mode = AppMode::Popup(PopupMenu::Session);
-                        // Find current claude session index
-                        self.submenu_index = self
-                            .current_claude_session
-                            .as_ref()
-                            .and_then(|current| {
-                                self.claude_sessions.iter().position(|s| s.id == current.id)
-                            })
-                            .unwrap_or(0);
-                    }
-                    MainMenuItem::Settings => {
-                        // TODO: Settings submenu
+                    MainMenuItem::Config => {
+                        self.mode = AppMode::Popup(PopupMenu::Matrix);
+                        self.matrix_row = 0;
+                        self.matrix_col = MatrixCol::Provider;
                     }
                     MainMenuItem::Quit => {
                         self.should_quit = true;
@@ -179,220 +303,227 @@ impl App {
         }
     }
 
-    /// Select item in submenu
     pub fn select_submenu_item(&mut self) {
         match self.mode {
             AppMode::Popup(PopupMenu::Provider) => {
                 if self.submenu_index < self.providers.len() {
-                    self.current_provider = Some(self.submenu_index);
-                    // Reset model when provider changes
-                    self.current_model = self.get_current_provider()
+                    let first_model = self.providers.get(self.submenu_index)
                         .and_then(|p| p.models.as_ref())
                         .and_then(|m| m.first().cloned());
+
+                    match self.model_target {
+                        Some(ModelTarget::Pane(i)) => {
+                            if let Some(pane) = self.panes.get_mut(i) {
+                                pane.current_provider = Some(self.submenu_index);
+                                pane.current_model = first_model;
+                            }
+                        }
+                        Some(ModelTarget::AllWorkers) => {
+                            for pane in self.panes.iter_mut().skip(1) {
+                                pane.current_provider = Some(self.submenu_index);
+                                pane.current_model = first_model.clone();
+                            }
+                        }
+                        Some(ModelTarget::AllPanes) | None => {
+                            self.current_provider = Some(self.submenu_index);
+                            self.current_model = first_model.clone();
+                            for pane in self.panes.iter_mut() {
+                                pane.current_provider = Some(self.submenu_index);
+                                pane.current_model = first_model.clone();
+                            }
+                        }
+                    }
                     self.provider_connected = true;
                 }
-                self.back_to_main_menu();
+                if self.model_target.is_some() {
+                    self.back_to_matrix();
+                } else {
+                    self.mode = AppMode::Popup(PopupMenu::Main);
+                }
             }
             AppMode::Popup(PopupMenu::Model) => {
-                if let Some(models) = self.get_current_provider_models() {
-                    if self.submenu_index < models.len() {
-                        self.current_model = Some(models[self.submenu_index].clone());
+                let model_name = self.target_provider_models()
+                    .and_then(|models| models.get(self.submenu_index).cloned());
+
+                if let Some(model) = model_name {
+                    match self.model_target {
+                        Some(ModelTarget::Pane(i)) => {
+                            if let Some(pane) = self.panes.get_mut(i) {
+                                pane.current_model = Some(model);
+                            }
+                        }
+                        Some(ModelTarget::AllWorkers) => {
+                            for pane in self.panes.iter_mut().skip(1) {
+                                pane.current_model = Some(model.clone());
+                            }
+                        }
+                        Some(ModelTarget::AllPanes) | None => {
+                            self.current_model = Some(model.clone());
+                            for pane in self.panes.iter_mut() {
+                                pane.current_model = Some(model.clone());
+                            }
+                        }
                     }
                 }
-                self.back_to_main_menu();
-            }
-            AppMode::Popup(PopupMenu::Session) => {
-                if self.submenu_index < self.claude_sessions.len() {
-                    let session = self.claude_sessions[self.submenu_index].clone();
-                    let _ = self.switch_session(&session);
+                if self.model_target.is_some() {
+                    self.back_to_matrix();
+                } else {
+                    self.mode = AppMode::Popup(PopupMenu::Main);
                 }
-                self.back_to_main_menu();
             }
             _ => {}
         }
     }
 
-    /// Go back to main menu
     pub fn back_to_main_menu(&mut self) {
         self.mode = AppMode::Popup(PopupMenu::Main);
     }
 
-    /// Move menu selection up
     pub fn menu_up(&mut self) {
-        match self.mode {
-            AppMode::Popup(PopupMenu::Main) => {
-                let items = Self::main_menu_items();
-                if self.menu_index > 0 {
-                    self.menu_index -= 1;
-                } else {
-                    self.menu_index = items.len().saturating_sub(1);
-                }
-            }
-            AppMode::Popup(PopupMenu::Provider) => {
-                if self.submenu_index > 0 {
-                    self.submenu_index -= 1;
-                } else {
-                    self.submenu_index = self.providers.len().saturating_sub(1);
-                }
-            }
+        let len = match self.mode {
+            AppMode::Popup(PopupMenu::Main) => Self::main_menu_items().len(),
+            AppMode::Popup(PopupMenu::Provider) => self.providers.len(),
             AppMode::Popup(PopupMenu::Model) => {
-                let count = self.get_current_provider_models().map(|m| m.len()).unwrap_or(0);
-                if self.submenu_index > 0 {
-                    self.submenu_index -= 1;
-                } else {
-                    self.submenu_index = count.saturating_sub(1);
-                }
+                self.target_provider_models().map(|m| m.len()).unwrap_or(0)
             }
-            AppMode::Popup(PopupMenu::Session) => {
-                if self.submenu_index > 0 {
-                    self.submenu_index -= 1;
-                } else {
-                    self.submenu_index = self.claude_sessions.len().saturating_sub(1);
-                }
-            }
-            _ => {}
-        }
+            AppMode::Popup(PopupMenu::Matrix) => self.matrix_row_count(),
+            _ => return,
+        };
+        let idx = match self.mode {
+            AppMode::Popup(PopupMenu::Main) => &mut self.menu_index,
+            AppMode::Popup(PopupMenu::Matrix) => &mut self.matrix_row,
+            _ => &mut self.submenu_index,
+        };
+        *idx = if *idx > 0 { *idx - 1 } else { len.saturating_sub(1) };
     }
 
-    /// Move menu selection down
     pub fn menu_down(&mut self) {
-        match self.mode {
-            AppMode::Popup(PopupMenu::Main) => {
-                let items = Self::main_menu_items();
-                if self.menu_index < items.len().saturating_sub(1) {
-                    self.menu_index += 1;
-                } else {
-                    self.menu_index = 0;
-                }
-            }
-            AppMode::Popup(PopupMenu::Provider) => {
-                if self.submenu_index < self.providers.len().saturating_sub(1) {
-                    self.submenu_index += 1;
-                } else {
-                    self.submenu_index = 0;
-                }
-            }
+        let len = match self.mode {
+            AppMode::Popup(PopupMenu::Main) => Self::main_menu_items().len(),
+            AppMode::Popup(PopupMenu::Provider) => self.providers.len(),
             AppMode::Popup(PopupMenu::Model) => {
-                let count = self.get_current_provider_models().map(|m| m.len()).unwrap_or(0);
-                if self.submenu_index < count.saturating_sub(1) {
-                    self.submenu_index += 1;
-                } else {
-                    self.submenu_index = 0;
-                }
+                self.target_provider_models().map(|m| m.len()).unwrap_or(0)
             }
-            AppMode::Popup(PopupMenu::Session) => {
-                if self.submenu_index < self.claude_sessions.len().saturating_sub(1) {
-                    self.submenu_index += 1;
-                } else {
-                    self.submenu_index = 0;
-                }
-            }
-            _ => {}
-        }
+            AppMode::Popup(PopupMenu::Matrix) => self.matrix_row_count(),
+            _ => return,
+        };
+        let idx = match self.mode {
+            AppMode::Popup(PopupMenu::Main) => &mut self.menu_index,
+            AppMode::Popup(PopupMenu::Matrix) => &mut self.matrix_row,
+            _ => &mut self.submenu_index,
+        };
+        *idx = if *idx < len.saturating_sub(1) { *idx + 1 } else { 0 };
     }
 
-    /// Get current provider
     pub fn get_current_provider(&self) -> Option<&Provider> {
         self.current_provider.and_then(|i| self.providers.get(i))
     }
 
-    /// Get current provider's models
     pub fn get_current_provider_models(&self) -> Option<&Vec<String>> {
         self.get_current_provider().and_then(|p| p.models.as_ref())
     }
 
-    /// Get current model index in the provider's model list
-    fn get_current_model_index(&self) -> Option<usize> {
-        let models = self.get_current_provider_models()?;
-        let current = self.current_model.as_ref()?;
-        models.iter().position(|m| m == current)
+    // --- Matrix navigation ---
+
+    /// Total selectable rows in matrix: panes + batch options (squad only)
+    pub fn matrix_row_count(&self) -> usize {
+        if self.is_squad() {
+            self.panes.len() + 2
+        } else {
+            self.panes.len()
+        }
     }
 
-    /// Get current session
-    pub fn get_current_session(&self) -> Option<&Session> {
-        self.current_session.and_then(|i| self.sessions.get(i))
+    /// Convert current matrix_row to a ModelTarget
+    pub fn matrix_target(&self) -> ModelTarget {
+        let pane_count = self.panes.len();
+        if self.matrix_row < pane_count {
+            ModelTarget::Pane(self.matrix_row)
+        } else if self.matrix_row == pane_count {
+            ModelTarget::AllWorkers
+        } else {
+            ModelTarget::AllPanes
+        }
     }
 
-    /// Refresh discovered Claude sessions from ~/.claude/projects/
-    pub fn refresh_sessions(&mut self) {
-        self.claude_sessions = discover_sessions().unwrap_or_default();
-    }
-
-    /// Switch to a discovered Claude session
-    pub fn switch_session(&mut self, session: &ClaudeSession) -> anyhow::Result<()> {
-        self.current_claude_session = Some(session.clone());
-
-        // Restart Claude with --resume pointing to the session file
-        // This will require modifying PTY spawn
-        Ok(())
-    }
-
-    /// Load data from repository
-    pub fn load_from_repo(&mut self, repo: &legion_db::Repository) {
-        if let Ok(providers) = repo.list_providers() {
-            self.providers = providers;
-            // Set default provider if available
-            if let Ok(Some(default)) = repo.get_default_provider() {
-                self.current_provider = self.providers.iter().position(|p| p.id == default.id);
-                self.current_model = default.models.as_ref().and_then(|m| m.first().cloned());
-                self.provider_connected = true;
+    /// From the matrix, open the provider or model picker for the current cell
+    pub fn matrix_enter(&mut self) {
+        let target = self.matrix_target();
+        self.model_target = Some(target);
+        match self.matrix_col {
+            MatrixCol::Provider => {
+                self.mode = AppMode::Popup(PopupMenu::Provider);
+                self.submenu_index = match target {
+                    ModelTarget::Pane(i) => self.panes.get(i)
+                        .and_then(|p| p.current_provider)
+                        .unwrap_or(0),
+                    _ => self.current_provider.unwrap_or(0),
+                };
+            }
+            MatrixCol::Model => {
+                self.mode = AppMode::Popup(PopupMenu::Model);
+                self.submenu_index = match target {
+                    ModelTarget::Pane(i) => {
+                        let pane_model = self.panes.get(i).and_then(|p| p.current_model.as_ref());
+                        let pane_provider = self.panes.get(i).and_then(|p| p.current_provider);
+                        pane_provider
+                            .and_then(|pi| self.providers.get(pi))
+                            .and_then(|p| p.models.as_ref())
+                            .and_then(|models| {
+                                pane_model.and_then(|m| models.iter().position(|x| x == m))
+                            })
+                            .unwrap_or(0)
+                    }
+                    _ => {
+                        self.current_provider
+                            .and_then(|pi| self.providers.get(pi))
+                            .and_then(|p| p.models.as_ref())
+                            .and_then(|models| {
+                                self.current_model
+                                    .as_ref()
+                                    .and_then(|m| models.iter().position(|x| x == m))
+                            })
+                            .unwrap_or(0)
+                    }
+                };
             }
         }
-
-        if let Ok(sessions) = repo.list_sessions() {
-            self.sessions = sessions;
-            if !self.sessions.is_empty() {
-                self.current_session = Some(0);
-            }
-        }
     }
 
-    /// Connect to the currently selected provider and update proxy configuration
-    pub async fn connect_provider(&self) -> anyhow::Result<()> {
-        if let Some(provider) = self.get_current_provider() {
-            let config = ProxyConfig {
-                target_url: Some(provider.base_url.clone()),
-                api_key: provider.api_key.clone(),
-                api_format: Some(provider.api_format.clone()),
-                model: self.current_model.clone(),
-            };
-            self.proxy.update_config(config).await;
-        }
-        Ok(())
+    /// Return from Provider/Model sub-menu back to the matrix view
+    pub fn back_to_matrix(&mut self) {
+        self.model_target = None;
+        self.mode = AppMode::Popup(PopupMenu::Matrix);
     }
 
-    /// Update proxy configuration when model changes
-    pub async fn update_proxy_model(&self) {
-        if let Some(provider) = self.get_current_provider() {
-            let config = ProxyConfig {
-                target_url: Some(provider.base_url.clone()),
-                api_key: provider.api_key.clone(),
-                api_format: Some(provider.api_format.clone()),
-                model: self.current_model.clone(),
-            };
-            self.proxy.update_config(config).await;
-        }
+    /// Toggle the active column in the matrix view
+    pub fn matrix_col_toggle(&mut self) {
+        self.matrix_col = match self.matrix_col {
+            MatrixCol::Provider => MatrixCol::Model,
+            MatrixCol::Model => MatrixCol::Provider,
+        };
     }
 
-    /// Start Claude Code in a PTY
-    pub fn start_claude(&mut self) -> anyhow::Result<()> {
-        let pty = PtyHandle::spawn_claude(self.proxy_port)?;
-        self.pty = Some(pty);
-        Ok(())
+    /// Get models for the current target's provider
+    pub fn target_provider_models(&self) -> Option<&Vec<String>> {
+        let provider_idx = match self.model_target {
+            Some(ModelTarget::Pane(i)) => self.panes.get(i).and_then(|p| p.current_provider),
+            _ => self.current_provider,
+        };
+        provider_idx
+            .and_then(|i| self.providers.get(i))
+            .and_then(|p| p.models.as_ref())
     }
 
-    /// Update PTY output buffer from the PTY handle
-    pub fn update_pty_output(&mut self) {
-        if let Some(pty) = &self.pty {
-            let output = pty.read_output();
-            self.pty_output = String::from_utf8_lossy(&output).to_string();
-        }
-    }
-
-    /// Send data to the PTY
-    pub fn send_to_pty(&mut self, data: &[u8]) {
-        if let Some(pty) = &mut self.pty {
-            let _ = pty.write(data);
+    /// Get the target label for sub-menu titles
+    pub fn target_label(&self) -> &str {
+        match self.model_target {
+            Some(ModelTarget::Pane(i)) => self.panes.get(i)
+                .map(|p| p.label.as_str())
+                .unwrap_or("Pane"),
+            Some(ModelTarget::AllWorkers) => "All Workers",
+            Some(ModelTarget::AllPanes) => "All Panes",
+            None => "All",
         }
     }
 }

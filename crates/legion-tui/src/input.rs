@@ -1,124 +1,240 @@
-//! TUI input handling
+//! Input handling - mode-aware key routing
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::app::{App, AppMode, PopupMenu};
 
-/// Result of handling input
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputResult {
-    /// Continue running
     Continue,
-    /// Quit the application
     Quit,
 }
 
-/// Main key handler
 pub fn handle_key(app: &mut App, key: KeyEvent) -> InputResult {
-    // Global shortcuts (work in any mode)
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char('q') => return InputResult::Quit,
-            KeyCode::Char('p') => {
-                app.toggle_popup();
-                return InputResult::Continue;
-            }
-            _ => {}
-        }
+    // Global: Ctrl+Q always quits
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+        return InputResult::Quit;
     }
 
-    // Mode-specific handling
     match app.mode {
         AppMode::Normal => handle_normal_mode(app, key),
         AppMode::Popup(_) => handle_popup_mode(app, key),
     }
 }
 
-/// Handle input in normal mode (forward keys to PTY)
 fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
-    // Forward keys to PTY
+    // Ctrl+P toggles popup menu
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+        app.toggle_popup();
+        return InputResult::Continue;
+    }
+
+    // Squad-only shortcuts (not forwarded to PTY)
+    if app.is_squad() {
+        match key.code {
+            // Tab / BackTab cycle pane focus
+            KeyCode::Tab => {
+                app.focus_next();
+                return InputResult::Continue;
+            }
+            KeyCode::BackTab => {
+                app.focus_prev();
+                return InputResult::Continue;
+            }
+            // Ctrl+Left/Right adjust leader/worker split ratio
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.adjust_leader_ratio(-5);
+                return InputResult::Continue;
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.adjust_leader_ratio(5);
+                return InputResult::Continue;
+            }
+            _ => {}
+        }
+    }
+
+    // Everything else goes to PTY
     let bytes = key_to_bytes(key);
     if !bytes.is_empty() {
-        app.send_to_pty(&bytes);
+        app.write_to_pty(&bytes);
     }
+
     InputResult::Continue
 }
 
-/// Convert a key event to bytes for PTY
-fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
-    match key.code {
-        KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                vec![(c as u8) & 0x1f]
-            } else {
-                c.to_string().into_bytes()
+/// Handle mouse events for divider hover and dragging (squad mode only)
+pub fn handle_mouse(app: &mut App, event: MouseEvent) {
+    if !app.is_squad() {
+        return;
+    }
+
+    let (term_width, _) = app.term_size;
+    if term_width == 0 {
+        return;
+    }
+
+    // Divider x position (between leader and workers), offset by header row
+    let divider_x = (term_width as u32 * app.leader_ratio as u32 / 100) as u16;
+    let near_divider = event.column.abs_diff(divider_x) <= 2 && event.row >= 1;
+
+    match event.kind {
+        MouseEventKind::Moved => {
+            app.hover_on_divider = near_divider;
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if near_divider {
+                app.dragging_divider = true;
+                app.hover_on_divider = true;
             }
         }
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => vec![0x1b, b'[', b'A'],
-        KeyCode::Down => vec![0x1b, b'[', b'B'],
-        KeyCode::Right => vec![0x1b, b'[', b'C'],
-        KeyCode::Left => vec![0x1b, b'[', b'D'],
-        _ => vec![],
+        MouseEventKind::Drag(MouseButton::Left) if app.dragging_divider => {
+            let old_ratio = app.leader_ratio;
+            app.set_leader_ratio_from_x(event.column);
+            if app.leader_ratio != old_ratio {
+                app.apply_resize();
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if app.dragging_divider {
+                app.dragging_divider = false;
+                app.set_leader_ratio_from_x(event.column);
+                app.apply_resize();
+            }
+        }
+        _ => {}
     }
 }
 
-/// Handle input in popup mode
 fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
-    match key.code {
-        KeyCode::Esc => {
-            // ESC closes popup or goes back
-            match app.mode {
-                AppMode::Popup(PopupMenu::Main) => {
-                    app.mode = AppMode::Normal;
-                }
-                AppMode::Popup(_) => {
-                    app.back_to_main_menu();
-                }
-                _ => {}
-            }
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.menu_up();
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.menu_down();
-        }
-        KeyCode::Enter => {
-            match app.mode {
-                AppMode::Popup(PopupMenu::Main) => {
-                    app.enter_submenu();
-                    // Check if we should quit after entering submenu
-                    if app.should_quit {
-                        return InputResult::Quit;
-                    }
-                }
-                AppMode::Popup(_) => {
-                    app.select_submenu_item();
-                }
-                _ => {}
-            }
-        }
-        KeyCode::Left | KeyCode::Char('h') => {
-            // Go back in submenu
-            if !matches!(app.mode, AppMode::Popup(PopupMenu::Main)) {
-                app.back_to_main_menu();
-            }
-        }
-        KeyCode::Right | KeyCode::Char('l') => {
-            // Enter submenu (same as Enter for main menu)
-            if matches!(app.mode, AppMode::Popup(PopupMenu::Main)) {
-                app.enter_submenu();
-                if app.should_quit {
-                    return InputResult::Quit;
-                }
-            }
+    // Ctrl+P also closes popup
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+        app.toggle_popup();
+        return InputResult::Continue;
+    }
+
+    match app.mode {
+        AppMode::Popup(PopupMenu::Matrix) => handle_matrix_keys(app, key),
+        AppMode::Popup(PopupMenu::Main) => handle_main_menu_keys(app, key),
+        AppMode::Popup(PopupMenu::Provider) | AppMode::Popup(PopupMenu::Model) => {
+            handle_submenu_keys(app, key)
         }
         _ => {}
     }
 
     InputResult::Continue
+}
+
+fn handle_matrix_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.back_to_main_menu(),
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Tab | KeyCode::Left | KeyCode::Right
+        | KeyCode::Char('h') | KeyCode::Char('l') => app.matrix_col_toggle(),
+        KeyCode::Enter => {
+            app.matrix_enter();
+        }
+        _ => {}
+    }
+}
+
+fn handle_main_menu_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.toggle_popup(),
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.enter_submenu(),
+        _ => {}
+    }
+}
+
+fn handle_submenu_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+            if app.model_target.is_some() {
+                app.back_to_matrix();
+            } else {
+                app.back_to_main_menu();
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            app.select_submenu_item();
+            update_proxy_config(app);
+        }
+        _ => {}
+    }
+}
+
+/// After provider/model selection, POST config to affected panes' control APIs
+fn update_proxy_config(app: &App) {
+    let configs: Vec<(u16, String, String, Option<String>, Option<String>)> = app
+        .panes
+        .iter()
+        .filter_map(|pane| {
+            let provider = pane
+                .current_provider
+                .and_then(|i| app.providers.get(i))?;
+            Some((
+                pane.control_port,
+                provider.base_url.clone(),
+                provider.api_format.clone(),
+                provider.api_key.clone(),
+                pane.current_model.clone(),
+            ))
+        })
+        .collect();
+
+    if configs.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        for (port, base_url, api_format, api_key, model) in configs {
+            let body = serde_json::json!({
+                "target_url": base_url,
+                "api_format": api_format,
+                "api_key": api_key,
+                "model": model,
+            });
+            let _ = client
+                .post(format!("http://127.0.0.1:{}/legion/config", port))
+                .json(&body)
+                .send()
+                .await;
+        }
+    });
+}
+
+/// Convert crossterm KeyEvent to PTY-compatible bytes
+fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                vec![(c as u8).wrapping_sub(b'a').wrapping_add(1)]
+            } else {
+                c.to_string().into_bytes()
+            }
+        }
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![127],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        _ => vec![],
+    }
 }

@@ -81,9 +81,21 @@ impl ProxyServer {
 
     /// Start the proxy server
     pub async fn start(&self) -> Result<()> {
+        self.start_with_signal(None).await
+    }
+
+    /// Start the proxy server, optionally signaling when the listener is bound
+    pub async fn start_with_signal(
+        &self,
+        ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
         let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
         let listener = TcpListener::bind(addr).await?;
         info!("Proxy server listening on http://{}", addr);
+
+        if let Some(tx) = ready_tx {
+            let _ = tx.send(());
+        }
 
         let config = self.config.clone();
 

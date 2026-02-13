@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+legion-db = { path = "../legion-db" }
+
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
