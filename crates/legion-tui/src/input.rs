@@ -30,6 +30,14 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
         return InputResult::Continue;
     }
 
+    // Ctrl+T toggles dashboard overlay (squad only)
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+        if app.is_squad() {
+            app.show_dashboard = !app.show_dashboard;
+            return InputResult::Continue;
+        }
+    }
+
     // Squad-only shortcuts (not forwarded to PTY)
     if app.is_squad() {
         match key.code {

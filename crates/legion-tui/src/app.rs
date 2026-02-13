@@ -1,5 +1,6 @@
 //! TUI application state
 
+use legion_core::orchestrate::{OrchestrateEngine, WorkerState};
 use legion_db::Provider;
 
 use crate::pty::{PtyHandle, SharedParser};
@@ -92,6 +93,11 @@ pub struct App {
     pub dragging_divider: bool,   // mouse drag state
     pub hover_on_divider: bool,   // mouse hovering near divider
     pub term_size: (u16, u16),    // cached (width, height) for resize after ratio change
+
+    // Orchestration
+    pub orchestrate: Option<OrchestrateEngine>,
+    pub orchestrate_snapshot: Option<Vec<WorkerState>>,
+    pub show_dashboard: bool,
 }
 
 impl App {
@@ -114,12 +120,25 @@ impl App {
             dragging_divider: false,
             hover_on_divider: false,
             term_size: (0, 0),
+            orchestrate: None,
+            orchestrate_snapshot: None,
+            show_dashboard: false,
         }
     }
 
     /// Add a pane, spawning a Claude Code PTY inside it
-    pub fn add_pane(&mut self, rows: u16, cols: u16, proxy_port: u16, control_port: u16, label: String, dangerously_skip_permissions: bool) {
-        let pty = match PtyHandle::spawn(rows, cols, proxy_port, control_port, dangerously_skip_permissions) {
+    pub fn add_pane(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        proxy_port: u16,
+        control_port: u16,
+        label: String,
+        dangerously_skip_permissions: bool,
+        worker_id: Option<u16>,
+        orchestrate_port: Option<u16>,
+    ) {
+        let pty = match PtyHandle::spawn(rows, cols, proxy_port, control_port, dangerously_skip_permissions, worker_id, orchestrate_port) {
             Ok(handle) => Some(handle),
             Err(e) => {
                 tracing::error!("Failed to spawn Claude for pane '{}': {}", label, e);
@@ -162,6 +181,25 @@ impl App {
                 let _ = pty.write(data);
             }
         }
+    }
+
+    /// Write bytes to a specific pane's PTY (for task injection)
+    pub fn write_to_pane(&mut self, pane_index: usize, data: &[u8]) {
+        if let Some(pane) = self.panes.get_mut(pane_index) {
+            if let Some(ref mut pty) = pane.pty {
+                let _ = pty.write(data);
+            }
+        }
+    }
+
+    /// Get orchestration status for a Worker pane
+    pub fn worker_task_status(&self, pane_index: usize) -> Option<&WorkerState> {
+        if pane_index == 0 || !self.is_squad() {
+            return None;
+        }
+        let worker_id = pane_index as u16;
+        self.orchestrate_snapshot.as_ref()
+            .and_then(|snap| snap.iter().find(|w| w.worker_id == worker_id))
     }
 
     /// Get the control port of the focused pane

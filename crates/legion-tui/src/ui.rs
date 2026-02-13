@@ -9,6 +9,8 @@ use ratatui::{
 };
 use tui_term::widget::PseudoTerminal;
 
+use legion_core::orchestrate::WorkerTaskStatus;
+
 use crate::app::{App, AppMode, MainMenuItem, MatrixCol, ModelTarget, PopupMenu};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -31,6 +33,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // Draw popup overlay if in popup mode
     if let AppMode::Popup(menu) = app.mode {
         draw_popup(frame, app, menu);
+    }
+
+    // Draw dashboard overlay if toggled
+    if app.show_dashboard {
+        draw_dashboard_overlay(frame, app);
     }
 }
 
@@ -141,7 +148,23 @@ fn draw_pane(frame: &mut Frame, app: &App, index: usize, area: Rect) {
 
     let title = if app.is_squad() {
         let model = pane.current_model.as_deref().unwrap_or("--");
-        format!(" {} | {} ", pane.label, model)
+        if let Some(ws) = app.worker_task_status(index) {
+            let icon = match ws.status {
+                WorkerTaskStatus::Working => ">>",
+                WorkerTaskStatus::Done => "OK",
+                WorkerTaskStatus::Error => "ERR",
+                WorkerTaskStatus::Pending => "??",
+                WorkerTaskStatus::Stopped => "XX",
+                WorkerTaskStatus::Idle => "--",
+            };
+            let ticket_short = ws.ticket.as_deref()
+                .map(|t| if t.len() > 20 { format!("{}...", &t[..17]) } else { t.to_string() })
+                .unwrap_or_default();
+            let elapsed = format_elapsed(ws.elapsed_secs);
+            format!(" {} | {} [{}] {} [{}] ", pane.label, model, icon, ticket_short, elapsed)
+        } else {
+            format!(" {} | {} ", pane.label, model)
+        }
     } else {
         " Claude Code ".to_string()
     };
@@ -168,9 +191,19 @@ fn draw_pane(frame: &mut Frame, app: &App, index: usize, area: Rect) {
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let mode_hint = if app.is_squad() && app.mode == AppMode::Normal {
+        let progress = app.orchestrate_snapshot.as_ref().map(|snap| {
+            let total = snap.len();
+            let done = snap.iter().filter(|w| w.status == WorkerTaskStatus::Done).count();
+            format!("{}/{}", done, total)
+        }).unwrap_or_default();
         vec![
-            Span::styled(" Tab", Style::default().fg(Color::Yellow)),
+            Span::styled(format!(" Workers: {}", progress), Style::default().fg(Color::Cyan)),
+            Span::styled(" \u{2502} ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab", Style::default().fg(Color::Yellow)),
             Span::styled(": Focus ", Style::default().fg(Color::DarkGray)),
+            Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+T", Style::default().fg(Color::Yellow)),
+            Span::styled(": Dashboard ", Style::default().fg(Color::DarkGray)),
             Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
             Span::styled("Ctrl+P", Style::default().fg(Color::Yellow)),
             Span::styled(": Menu ", Style::default().fg(Color::DarkGray)),
@@ -482,6 +515,83 @@ fn draw_model_menu(frame: &mut Frame, app: &App, area: Rect) {
             area,
         );
     }
+}
+
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+fn draw_dashboard_overlay(frame: &mut Frame, app: &App) {
+    let area = centered_rect(70, 50, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Squad Progress [Ctrl+T: close] ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let mut items: Vec<ListItem> = Vec::new();
+
+    // Header
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled("  #   ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled("Status  ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled("Task                              ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled("Worker    ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled("Time", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+    ])));
+
+    if let Some(ref snapshot) = app.orchestrate_snapshot {
+        let mut total = 0usize;
+        let mut done = 0usize;
+        for (i, ws) in snapshot.iter().enumerate() {
+            total += 1;
+            let (icon, color) = match ws.status {
+                WorkerTaskStatus::Done => { done += 1; ("OK ", Color::Green) }
+                WorkerTaskStatus::Error => ("ERR", Color::Red),
+                WorkerTaskStatus::Working => (".. ", Color::Yellow),
+                WorkerTaskStatus::Pending => (">> ", Color::Cyan),
+                WorkerTaskStatus::Stopped => ("XX ", Color::DarkGray),
+                WorkerTaskStatus::Idle => ("-- ", Color::DarkGray),
+            };
+
+            let ticket = ws.ticket.as_deref().unwrap_or("-");
+            let ticket_display = if ticket.len() > 32 {
+                format!("{}...", &ticket[..29])
+            } else {
+                format!("{:<32}", ticket)
+            };
+
+            let elapsed = format_elapsed(ws.elapsed_secs);
+
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!("  #{:<3}", i + 1), Style::default().fg(Color::White)),
+                Span::styled(format!("[{}] ", icon), Style::default().fg(color)),
+                Span::styled(ticket_display, Style::default().fg(Color::White)),
+                Span::styled(format!("Worker {:<3}", ws.worker_id), Style::default().fg(Color::DarkGray)),
+                Span::styled(elapsed, Style::default().fg(Color::DarkGray)),
+            ])));
+        }
+
+        items.push(ListItem::new(Line::from(Span::raw(""))));
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("  Progress: {}/{} complete", done, total),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ])));
+    } else {
+        items.push(ListItem::new(Line::from(
+            Span::styled("  No orchestration active", Style::default().fg(Color::DarkGray))
+        )));
+    }
+
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 /// Centered rectangle helper

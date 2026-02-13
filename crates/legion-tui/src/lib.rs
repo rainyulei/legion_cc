@@ -39,7 +39,7 @@ pub async fn run(proxy_port: u16, control_port: u16) -> Result<()> {
     let pty_cols = size.width.saturating_sub(2);
 
     // Start Claude in single pane (no skip permissions - normal interactive flow)
-    app.add_pane(pty_rows, pty_cols, proxy_port, control_port, "Claude Code".into(), false);
+    app.add_pane(pty_rows, pty_cols, proxy_port, control_port, "Claude Code".into(), false, None, None);
 
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
@@ -86,17 +86,31 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     // Port assignments:
     // Leader: proxy = base_port, control = base_port + 1000
     // Worker i: proxy = base_port + i + 1, control = base_port + 1000 + i + 1
+    let orchestrate_port = base_port + 2000;
     let leader_proxy = base_port;
     let leader_control = base_port + 1000;
     // Squad mode: all panes skip permissions (auto-trust)
-    app.add_pane(leader_pty_rows, leader_pty_cols, leader_proxy, leader_control, "Leader".into(), true);
+    app.add_pane(leader_pty_rows, leader_pty_cols, leader_proxy, leader_control, "Leader".into(), true, None, Some(orchestrate_port));
 
     for i in 0..worker_count {
         let proxy = base_port + i + 1;
         let control = base_port + 1000 + i + 1;
         let label = format!("Worker {}", i + 1);
-        app.add_pane(worker_pty_rows, worker_pty_cols, proxy, control, label, true);
+        app.add_pane(worker_pty_rows, worker_pty_cols, proxy, control, label, true, Some(i + 1), Some(orchestrate_port));
     }
+
+    // Start orchestration engine + API
+    let engine = legion_core::OrchestrateEngine::new(worker_count);
+    app.orchestrate = Some(engine.clone());
+
+    let orch_api = legion_core::OrchestrateApi::new(engine, orchestrate_port);
+    let (orch_tx, orch_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Err(e) = orch_api.start_with_signal(Some(orch_tx)).await {
+            tracing::error!("Orchestrate API error on port {}: {}", orchestrate_port, e);
+        }
+    });
+    orch_rx.await.ok();
 
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
@@ -135,6 +149,11 @@ async fn run_event_loop(
     app: &mut App,
 ) -> Result<()> {
     loop {
+        // Update orchestrate snapshot for UI rendering
+        if let Some(engine) = app.orchestrate.clone() {
+            app.orchestrate_snapshot = Some(engine.all_status().await);
+        }
+
         terminal.draw(|frame| draw(frame, app))?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
@@ -152,6 +171,32 @@ async fn run_event_loop(
                     app.resize_panes(w, h);
                 }
                 _ => {}
+            }
+        }
+
+        // Poll for pending tasks and inject into idle Worker PTYs
+        // Clone engine to avoid holding an immutable borrow on app while we need mutable access
+        if let Some(engine) = app.orchestrate.clone() {
+            // Collect (pane_idx, ticket) pairs first, then inject
+            let mut injections: Vec<(usize, String)> = Vec::new();
+            if let Some(ref snapshot) = app.orchestrate_snapshot {
+                for ws in snapshot {
+                    if ws.status == legion_core::WorkerTaskStatus::Pending {
+                        let pane_idx = ws.worker_id as usize;
+                        if let Some(parser) = app.parser_at(pane_idx) {
+                            if pty::is_pty_idle(parser) {
+                                if let Some(ticket) = engine.take_pending(ws.worker_id).await {
+                                    injections.push((pane_idx, ticket));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (pane_idx, ticket) in injections {
+                app.write_to_pane(pane_idx, b"\x15");
+                app.write_to_pane(pane_idx, ticket.as_bytes());
+                app.write_to_pane(pane_idx, b"\r");
             }
         }
 

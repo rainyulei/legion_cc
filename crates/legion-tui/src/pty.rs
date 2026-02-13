@@ -28,6 +28,8 @@ impl PtyHandle {
         proxy_port: u16,
         control_port: u16,
         dangerously_skip_permissions: bool,
+        worker_id: Option<u16>,
+        orchestrate_port: Option<u16>,
     ) -> Result<Self> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -48,6 +50,12 @@ impl PtyHandle {
             format!("http://127.0.0.1:{}", proxy_port),
         );
         cmd.env("LEGION_CONTROL_PORT", control_port.to_string());
+        if let Some(wid) = worker_id {
+            cmd.env("LEGION_WORKER_ID", wid.to_string());
+        }
+        if let Some(op) = orchestrate_port {
+            cmd.env("LEGION_ORCHESTRATE_PORT", op.to_string());
+        }
 
         let child = pair
             .slave
@@ -117,4 +125,25 @@ impl PtyHandle {
         }
         Ok(())
     }
+}
+
+/// Check if a PTY shows an idle Claude Code prompt.
+/// Claude Code prompt typically ends with "❯" or ">" on the last non-empty line.
+pub fn is_pty_idle(parser: &SharedParser) -> bool {
+    if let Ok(p) = parser.lock() {
+        let screen = p.screen();
+        let (_rows, cols) = screen.size();
+        let row_texts: Vec<String> = screen.rows(0, cols).collect();
+        for row in row_texts.iter().rev() {
+            let trimmed = row.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            return trimmed.ends_with('❯')
+                || trimmed.ends_with('>')
+                || trimmed.ends_with('$')
+                || trimmed.contains("❯ ");
+        }
+    }
+    false
 }
