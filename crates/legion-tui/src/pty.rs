@@ -30,6 +30,7 @@ impl PtyHandle {
         dangerously_skip_permissions: bool,
         worker_id: Option<u16>,
         orchestrate_port: Option<u16>,
+        system_prompt: Option<&str>,
     ) -> Result<Self> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -45,11 +46,23 @@ impl PtyHandle {
         if dangerously_skip_permissions {
             cmd.arg("--dangerously-skip-permissions");
         }
+        if let Some(prompt) = system_prompt {
+            cmd.args(["--append-system-prompt", prompt]);
+        }
         cmd.env(
             "ANTHROPIC_BASE_URL",
             format!("http://127.0.0.1:{}", proxy_port),
         );
         cmd.env("LEGION_CONTROL_PORT", control_port.to_string());
+
+        // Prepend cargo bin dir to PATH so legion-* tools are discoverable
+        if let Ok(home) = std::env::var("HOME") {
+            let cargo_bin = format!("{}/.cargo/bin", home);
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            if !current_path.contains(&cargo_bin) {
+                cmd.env("PATH", format!("{}:{}", cargo_bin, current_path));
+            }
+        }
         if let Some(wid) = worker_id {
             cmd.env("LEGION_WORKER_ID", wid.to_string());
         }

@@ -40,7 +40,7 @@ pub async fn run(proxy_port: u16, control_port: u16) -> Result<()> {
     let pty_cols = size.width.saturating_sub(2);
 
     // Start Claude in single pane (no skip permissions - normal interactive flow)
-    app.add_pane(pty_rows, pty_cols, proxy_port, control_port, "Claude Code".into(), false, None, None);
+    app.add_pane(pty_rows, pty_cols, proxy_port, control_port, "Claude Code".into(), false, None, None, None);
 
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
@@ -84,10 +84,11 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     let worker_pty_rows = worker_height.saturating_sub(2);
     let worker_pty_cols = worker_width.saturating_sub(2);
 
-    // Generate CLAUDE.md files for Leader and Workers
-    if let Err(e) = claudemd::write_squad_claude_md(worker_count) {
-        tracing::warn!("Failed to write CLAUDE.md files: {}", e);
-    }
+    // Generate system prompts for Leader and Workers
+    let leader_prompt = claudemd::leader_instructions(worker_count);
+    let worker_prompts: Vec<String> = (1..=worker_count)
+        .map(|id| claudemd::worker_instructions(id))
+        .collect();
 
     // Port assignments:
     // Leader: proxy = base_port, control = base_port + 1000
@@ -96,13 +97,13 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     let leader_proxy = base_port;
     let leader_control = base_port + 1000;
     // Squad mode: all panes skip permissions (auto-trust)
-    app.add_pane(leader_pty_rows, leader_pty_cols, leader_proxy, leader_control, "Leader".into(), true, None, Some(orchestrate_port));
+    app.add_pane(leader_pty_rows, leader_pty_cols, leader_proxy, leader_control, "Leader".into(), true, None, Some(orchestrate_port), Some(&leader_prompt));
 
     for i in 0..worker_count {
         let proxy = base_port + i + 1;
         let control = base_port + 1000 + i + 1;
         let label = format!("Worker {}", i + 1);
-        app.add_pane(worker_pty_rows, worker_pty_cols, proxy, control, label, true, Some(i + 1), Some(orchestrate_port));
+        app.add_pane(worker_pty_rows, worker_pty_cols, proxy, control, label, true, Some(i + 1), Some(orchestrate_port), Some(&worker_prompts[i as usize]));
     }
 
     // Start orchestration engine + API

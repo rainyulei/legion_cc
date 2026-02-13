@@ -137,8 +137,9 @@ impl App {
         dangerously_skip_permissions: bool,
         worker_id: Option<u16>,
         orchestrate_port: Option<u16>,
+        system_prompt: Option<&str>,
     ) {
-        let pty = match PtyHandle::spawn(rows, cols, proxy_port, control_port, dangerously_skip_permissions, worker_id, orchestrate_port) {
+        let pty = match PtyHandle::spawn(rows, cols, proxy_port, control_port, dangerously_skip_permissions, worker_id, orchestrate_port, system_prompt) {
             Ok(handle) => Some(handle),
             Err(e) => {
                 tracing::error!("Failed to spawn Claude for pane '{}': {}", label, e);
