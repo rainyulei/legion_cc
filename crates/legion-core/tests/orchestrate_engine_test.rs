@@ -41,7 +41,8 @@ async fn test_report_done() {
     engine.mark_working(1).await;
     engine
         .report(1, WorkerTaskStatus::Done, Some("All good".to_string()))
-        .await;
+        .await
+        .unwrap();
 
     let ws = engine.worker_status(1).await.unwrap();
     assert_eq!(ws.status, WorkerTaskStatus::Done);
@@ -55,7 +56,8 @@ async fn test_report_error() {
     engine.mark_working(1).await;
     engine
         .report(1, WorkerTaskStatus::Error, Some("compile failed".to_string()))
-        .await;
+        .await
+        .unwrap();
 
     let ws = engine.worker_status(1).await.unwrap();
     assert_eq!(ws.status, WorkerTaskStatus::Error);

@@ -106,12 +106,14 @@ impl OrchestrateEngine {
     }
 
     /// Update a worker's status and optional summary (e.g. Done or Error).
-    pub async fn report(&self, worker_id: u16, status: WorkerTaskStatus, summary: Option<String>) {
+    pub async fn report(&self, worker_id: u16, status: WorkerTaskStatus, summary: Option<String>) -> Result<()> {
         let mut guard = self.inner.write().await;
-        if let Some(worker) = guard.get_mut(&worker_id) {
-            worker.status = status;
-            worker.summary = summary;
-        }
+        let worker = guard
+            .get_mut(&worker_id)
+            .ok_or_else(|| anyhow::anyhow!("worker {} not found", worker_id))?;
+        worker.status = status;
+        worker.summary = summary;
+        Ok(())
     }
 
     /// If the worker is Pending, atomically transition to Working and return the ticket.
