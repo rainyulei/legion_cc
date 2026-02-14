@@ -1,9 +1,10 @@
 //! TUI application state
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use legion_core::orchestrate::{OrchestrateEngine, WorkerState};
-use legion_db::Provider;
+use legion_db::{Provider, SquadSession};
 
 use crate::pty::{PtyHandle, SharedParser};
 
@@ -101,6 +102,10 @@ pub struct App {
     pub orchestrate_snapshot: Option<Vec<WorkerState>>,
     pub show_dashboard: bool,
 
+    // Session management
+    pub current_session: Option<SquadSession>,
+    pub project_path: Option<PathBuf>,
+
     // Saved per-pane configs (label → (provider_id, model))
     saved_pane_configs: HashMap<String, (String, Option<String>)>,
 }
@@ -128,6 +133,8 @@ impl App {
             orchestrate: None,
             orchestrate_snapshot: None,
             show_dashboard: false,
+            current_session: None,
+            project_path: None,
             saved_pane_configs: HashMap::new(),
         }
     }
@@ -381,6 +388,50 @@ impl App {
                     .unwrap_or(false)
             }
         }
+    }
+
+    /// Get the current session name for display
+    pub fn session_name(&self) -> &str {
+        self.current_session
+            .as_ref()
+            .map(|s| s.name.as_str())
+            .unwrap_or("(no session)")
+    }
+
+    /// Create a new session: create worktrees, save to DB
+    pub fn create_session(&mut self, name: &str, worker_count: u16) -> anyhow::Result<Vec<PathBuf>> {
+        let project_path = self.project_path.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No project path set"))?;
+
+        let paths = crate::worktree::create_session_worktrees(project_path, name, worker_count)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let session = SquadSession {
+            name: name.to_string(),
+            project_path: project_path.to_string_lossy().to_string(),
+            worker_count: worker_count as i64,
+            status: "active".to_string(),
+            created_at: now,
+            completed_at: None,
+        };
+
+        if let Ok(repo) = legion_db::open_db() {
+            repo.upsert_squad_session(&session)?;
+        }
+
+        self.current_session = Some(session);
+        Ok(paths)
+    }
+
+    /// Get worktree path for a pane in the current session
+    pub fn pane_worktree(&self, pane_label: &str) -> Option<PathBuf> {
+        let project_path = self.project_path.as_ref()?;
+        let session = self.current_session.as_ref()?;
+        Some(crate::worktree::pane_worktree_path(project_path, &session.name, pane_label))
     }
 
     // --- Menu navigation ---
