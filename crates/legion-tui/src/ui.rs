@@ -58,14 +58,28 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" \u{25cb}", Style::default().fg(Color::DarkGray))
     };
 
-    let header = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" Legion v{}", VERSION),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("        "),
+    ];
+
+    // Session name (squad mode only)
+    if app.is_squad() {
+        if let Some(ref session) = app.current_session {
+            spans.push(Span::styled("  ", Style::default()));
+            spans.push(Span::styled(
+                format!("({})", session.name),
+                Style::default().fg(Color::Green),
+            ));
+        }
+    }
+
+    spans.extend([
+        Span::raw("  "),
         Span::styled("[", Style::default().fg(Color::DarkGray)),
         Span::styled(provider_name, Style::default().fg(Color::Yellow)),
         Span::styled(" \u{2192} ", Style::default().fg(Color::DarkGray)),
@@ -73,6 +87,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("]", Style::default().fg(Color::DarkGray)),
         indicator,
     ]);
+
+    let header = Line::from(spans);
 
     frame.render_widget(Paragraph::new(header), area);
 }
