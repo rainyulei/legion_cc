@@ -1,5 +1,7 @@
 //! TUI application state
 
+use std::collections::HashMap;
+
 use legion_core::orchestrate::{OrchestrateEngine, WorkerState};
 use legion_db::Provider;
 
@@ -98,6 +100,9 @@ pub struct App {
     pub orchestrate: Option<OrchestrateEngine>,
     pub orchestrate_snapshot: Option<Vec<WorkerState>>,
     pub show_dashboard: bool,
+
+    // Saved per-pane configs (label → (provider_id, model))
+    saved_pane_configs: HashMap<String, (String, Option<String>)>,
 }
 
 impl App {
@@ -123,6 +128,7 @@ impl App {
             orchestrate: None,
             orchestrate_snapshot: None,
             show_dashboard: false,
+            saved_pane_configs: HashMap::new(),
         }
     }
 
@@ -138,22 +144,46 @@ impl App {
         worker_id: Option<u16>,
         orchestrate_port: Option<u16>,
         system_prompt: Option<&str>,
+        working_dir: Option<&std::path::Path>,
+        continue_session: bool,
     ) {
-        let pty = match PtyHandle::spawn(rows, cols, proxy_port, control_port, dangerously_skip_permissions, worker_id, orchestrate_port, system_prompt) {
+        let use_proxy = self.pane_uses_proxy(&label);
+        let pty = match PtyHandle::spawn(rows, cols, proxy_port, control_port, dangerously_skip_permissions, worker_id, orchestrate_port, system_prompt, use_proxy, working_dir, continue_session) {
             Ok(handle) => Some(handle),
             Err(e) => {
                 tracing::error!("Failed to spawn Claude for pane '{}': {}", label, e);
                 None
             }
         };
+        // Check for saved per-pane config
+        let (pane_provider, pane_model) = if let Some((saved_pid, saved_model)) = self.saved_pane_configs.get(&label) {
+            let provider_idx = self.providers.iter().position(|p| p.id == *saved_pid);
+            if provider_idx.is_some() {
+                (provider_idx, saved_model.clone())
+            } else {
+                (self.current_provider, self.current_model.clone())
+            }
+        } else {
+            (self.current_provider, self.current_model.clone())
+        };
+
         self.panes.push(Pane {
             pty,
             proxy_port,
             control_port,
             label,
-            current_provider: self.current_provider,
-            current_model: self.current_model.clone(),
+            current_provider: pane_provider,
+            current_model: pane_model,
         });
+    }
+
+    /// Kill all PTY child processes (called on exit)
+    pub fn kill_all(&mut self) {
+        for pane in &mut self.panes {
+            if let Some(ref mut pty) = pane.pty {
+                pty.kill();
+            }
+        }
     }
 
     /// Whether we're in squad (multi-pane) mode
@@ -292,18 +322,18 @@ impl App {
 
     /// Load providers from database, prepend "Native" option
     pub fn load_from_db(&mut self) {
-        // "Native" provider: bypasses proxy, uses Claude Code's own API key
-        let native = Provider {
-            id: "__native__".to_string(),
-            name: "Native".to_string(),
-            base_url: "https://api.anthropic.com".to_string(),
+        // "Default" provider: no proxy, Claude Code uses its own native auth (OAuth for Claude Max)
+        let default_provider = Provider {
+            id: "__default__".to_string(),
+            name: "Default".to_string(),
+            base_url: String::new(),
             api_key: None,
             api_format: "anthropic".to_string(),
             models: None,
             is_default: false,
             created_at: 0,
         };
-        self.providers = vec![native];
+        self.providers = vec![default_provider];
 
         if let Ok(repo) = legion_db::open_db() {
             if let Ok(mut providers) = repo.list_providers() {
@@ -316,12 +346,40 @@ impl App {
                     default.models.as_ref().and_then(|m| m.first().cloned());
                 self.provider_connected = true;
             }
+            // Load saved per-pane configs
+            if let Ok(pane_configs) = repo.list_pane_configs() {
+                for pc in pane_configs {
+                    self.saved_pane_configs.insert(
+                        pc.pane_label,
+                        (pc.provider_id, pc.model),
+                    );
+                }
+            }
         }
 
         // Default to Native (index 0) if no default provider set
         if self.current_provider.is_none() {
             self.current_provider = Some(0);
             self.provider_connected = true;
+        }
+    }
+
+    /// Get saved pane config for a given label (provider_id, model)
+    pub fn get_saved_pane_config(&self, label: &str) -> Option<&(String, Option<String>)> {
+        self.saved_pane_configs.get(label)
+    }
+
+    /// Check if a pane (by label) should use the proxy, or Default (no proxy) mode
+    pub fn pane_uses_proxy(&self, label: &str) -> bool {
+        match self.saved_pane_configs.get(label) {
+            Some((pid, _)) => pid != "__default__",
+            None => {
+                // No saved config — use app-level default
+                self.current_provider
+                    .and_then(|i| self.providers.get(i))
+                    .map(|p| p.id != "__default__")
+                    .unwrap_or(false)
+            }
         }
     }
 

@@ -40,17 +40,18 @@ pub async fn run(proxy_port: u16, control_port: u16) -> Result<()> {
     let pty_cols = size.width.saturating_sub(2);
 
     // Start Claude in single pane (no skip permissions - normal interactive flow)
-    app.add_pane(pty_rows, pty_cols, proxy_port, control_port, "Claude Code".into(), false, None, None, None);
+    app.add_pane(pty_rows, pty_cols, proxy_port, control_port, "Claude Code".into(), false, None, None, None, None, false);
 
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
 
-    // Restore terminal
+    // Kill child processes and restore terminal
+    app.kill_all();
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
 
-    result
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
 
 /// Run the squad TUI with multiple embedded Claude Code panes
@@ -96,14 +97,15 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     let orchestrate_port = base_port + 2000;
     let leader_proxy = base_port;
     let leader_control = base_port + 1000;
-    // Squad mode: all panes skip permissions (auto-trust)
-    app.add_pane(leader_pty_rows, leader_pty_cols, leader_proxy, leader_control, "Leader".into(), true, None, Some(orchestrate_port), Some(&leader_prompt));
+    // Leader: normal interactive mode (no skip permissions)
+    // Workers: auto-trust mode (skip permissions)
+    app.add_pane(leader_pty_rows, leader_pty_cols, leader_proxy, leader_control, "Leader".into(), false, None, Some(orchestrate_port), Some(&leader_prompt), None, false);
 
     for i in 0..worker_count {
         let proxy = base_port + i + 1;
         let control = base_port + 1000 + i + 1;
         let label = format!("Worker {}", i + 1);
-        app.add_pane(worker_pty_rows, worker_pty_cols, proxy, control, label, true, Some(i + 1), Some(orchestrate_port), Some(&worker_prompts[i as usize]));
+        app.add_pane(worker_pty_rows, worker_pty_cols, proxy, control, label, true, Some(i + 1), Some(orchestrate_port), Some(&worker_prompts[i as usize]), None, false);
     }
 
     // Start orchestration engine + API
@@ -122,16 +124,19 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
 
-    // Restore terminal
+    // Kill child processes and restore terminal
+    app.kill_all();
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
     let _ = terminal.show_cursor();
 
-    result
+    // Force exit — background tokio tasks (proxy/control/orchestrate servers)
+    // run infinite accept loops that would otherwise delay shutdown.
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
 
 /// Run the popup TUI only (for backward compat with `legion switch`)
-pub async fn run_popup(control_port: u16) -> Result<()> {
+pub async fn run_popup(_control_port: u16) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
