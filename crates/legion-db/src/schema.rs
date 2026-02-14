@@ -47,6 +47,22 @@ CREATE TABLE IF NOT EXISTS workers (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pane_configs (
+    pane_label TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    model TEXT,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS squad_sessions (
+    name TEXT PRIMARY KEY,
+    project_path TEXT NOT NULL,
+    worker_count INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER
+);
 "#;
 
 pub fn init_db(conn: &Connection) -> Result<()> {
