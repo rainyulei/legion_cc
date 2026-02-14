@@ -5,6 +5,7 @@ pub mod claudemd;
 pub mod input;
 pub mod pty;
 pub mod ui;
+pub mod worktree;
 
 use std::io;
 
