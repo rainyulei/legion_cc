@@ -211,8 +211,22 @@ fn handle_complete_session_keys(app: &mut App, key: KeyEvent) {
                 1 => "keep",
                 _ => "discard",
             };
-            tracing::info!("Complete session with strategy: {}", strategy);
+
+            app.kill_all();
+
+            match app.complete_current_session(strategy) {
+                Ok(true) => {
+                    tracing::info!("Session completed with strategy: {}", strategy);
+                }
+                Ok(false) => {
+                    tracing::warn!("No active session to complete");
+                }
+                Err(e) => {
+                    tracing::error!("Failed to complete session: {}", e);
+                }
+            }
             app.mode = AppMode::Normal;
+            app.should_quit = true;
         }
         _ => {}
     }

@@ -448,6 +448,62 @@ impl App {
         Some(crate::worktree::pane_worktree_path(project_path, &session.name, pane_label))
     }
 
+    /// Mark current session as completed with given merge strategy
+    pub fn complete_current_session(&mut self, strategy: &str) -> anyhow::Result<bool> {
+        let session = match self.current_session.take() {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        let project_path = match self.project_path.as_ref() {
+            Some(p) => p.clone(),
+            None => return Ok(false),
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        match strategy {
+            "merge" => {
+                let default_branch = crate::worktree::default_branch(&project_path);
+                let _ = std::process::Command::new("git")
+                    .args(["checkout", &default_branch])
+                    .current_dir(&project_path)
+                    .output();
+
+                let pane_labels = std::iter::once("Leader".to_string())
+                    .chain((1..=session.worker_count).map(|i| format!("Worker {}", i)));
+
+                for label in pane_labels {
+                    if let Err(e) = crate::worktree::merge_branch(&project_path, &session.name, &label) {
+                        tracing::error!("Merge failed for {}: {}", label, e);
+                        self.current_session = Some(session);
+                        return Err(e);
+                    }
+                }
+
+                crate::worktree::remove_session_worktrees(
+                    &project_path, &session.name, session.worker_count as u16, false,
+                )?;
+            }
+            "discard" => {
+                crate::worktree::remove_session_worktrees(
+                    &project_path, &session.name, session.worker_count as u16, true,
+                )?;
+            }
+            _ => {
+                // "keep" — do nothing to worktrees
+            }
+        }
+
+        if let Ok(repo) = legion_db::open_db() {
+            repo.complete_squad_session(&session.name, now)?;
+        }
+
+        Ok(true)
+    }
+
     pub fn load_session_list(&mut self) {
         if let Ok(repo) = legion_db::open_db() {
             self.session_list = repo.list_squad_sessions().unwrap_or_default();
