@@ -24,6 +24,8 @@ pub enum PopupMenu {
     Provider,
     Model,
     Matrix,
+    SessionList,
+    CompleteSession,
 }
 
 /// Which column is active in the matrix view
@@ -44,14 +46,18 @@ pub enum ModelTarget {
 /// Main menu items
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainMenuItem {
-    Config,
+    SwitchModels,
+    SwitchSession,
+    CompleteSession,
     Quit,
 }
 
 impl MainMenuItem {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Config => "Config",
+            Self::SwitchModels => "Switch Models",
+            Self::SwitchSession => "Switch Session",
+            Self::CompleteSession => "Complete Session",
             Self::Quit => "Quit",
         }
     }
@@ -106,6 +112,11 @@ pub struct App {
     pub current_session: Option<SquadSession>,
     pub project_path: Option<PathBuf>,
 
+    // Session list state
+    pub session_list: Vec<SquadSession>,
+    pub session_list_index: usize,
+    pub complete_merge_index: usize,
+
     // Saved per-pane configs (label → (provider_id, model))
     saved_pane_configs: HashMap<String, (String, Option<String>)>,
 }
@@ -135,6 +146,9 @@ impl App {
             show_dashboard: false,
             current_session: None,
             project_path: None,
+            session_list: Vec::new(),
+            session_list_index: 0,
+            complete_merge_index: 0,
             saved_pane_configs: HashMap::new(),
         }
     }
@@ -434,18 +448,23 @@ impl App {
         Some(crate::worktree::pane_worktree_path(project_path, &session.name, pane_label))
     }
 
+    pub fn load_session_list(&mut self) {
+        if let Ok(repo) = legion_db::open_db() {
+            self.session_list = repo.list_squad_sessions().unwrap_or_default();
+        }
+    }
+
     // --- Menu navigation ---
 
     pub fn main_menu_items() -> &'static [MainMenuItem] {
-        &[MainMenuItem::Config, MainMenuItem::Quit]
+        &[MainMenuItem::SwitchModels, MainMenuItem::SwitchSession, MainMenuItem::CompleteSession, MainMenuItem::Quit]
     }
 
     pub fn toggle_popup(&mut self) {
         match self.mode {
             AppMode::Normal => {
-                self.mode = AppMode::Popup(PopupMenu::Matrix);
-                self.matrix_row = 0;
-                self.matrix_col = MatrixCol::Provider;
+                self.mode = AppMode::Popup(PopupMenu::Main);
+                self.menu_index = 0;
             }
             AppMode::Popup(_) => {
                 self.mode = AppMode::Normal;
@@ -458,10 +477,19 @@ impl App {
             let items = Self::main_menu_items();
             if self.menu_index < items.len() {
                 match items[self.menu_index] {
-                    MainMenuItem::Config => {
+                    MainMenuItem::SwitchModels => {
                         self.mode = AppMode::Popup(PopupMenu::Matrix);
                         self.matrix_row = 0;
                         self.matrix_col = MatrixCol::Provider;
+                    }
+                    MainMenuItem::SwitchSession => {
+                        self.load_session_list();
+                        self.mode = AppMode::Popup(PopupMenu::SessionList);
+                        self.session_list_index = 0;
+                    }
+                    MainMenuItem::CompleteSession => {
+                        self.mode = AppMode::Popup(PopupMenu::CompleteSession);
+                        self.complete_merge_index = 0;
                     }
                     MainMenuItem::Quit => {
                         self.should_quit = true;
@@ -555,11 +583,15 @@ impl App {
                 self.target_provider_models().map(|m| m.len()).unwrap_or(0)
             }
             AppMode::Popup(PopupMenu::Matrix) => self.matrix_row_count(),
+            AppMode::Popup(PopupMenu::SessionList) => self.session_list.len() + 1,
+            AppMode::Popup(PopupMenu::CompleteSession) => 3,
             _ => return,
         };
         let idx = match self.mode {
             AppMode::Popup(PopupMenu::Main) => &mut self.menu_index,
             AppMode::Popup(PopupMenu::Matrix) => &mut self.matrix_row,
+            AppMode::Popup(PopupMenu::SessionList) => &mut self.session_list_index,
+            AppMode::Popup(PopupMenu::CompleteSession) => &mut self.complete_merge_index,
             _ => &mut self.submenu_index,
         };
         *idx = if *idx > 0 { *idx - 1 } else { len.saturating_sub(1) };
@@ -573,11 +605,15 @@ impl App {
                 self.target_provider_models().map(|m| m.len()).unwrap_or(0)
             }
             AppMode::Popup(PopupMenu::Matrix) => self.matrix_row_count(),
+            AppMode::Popup(PopupMenu::SessionList) => self.session_list.len() + 1,
+            AppMode::Popup(PopupMenu::CompleteSession) => 3,
             _ => return,
         };
         let idx = match self.mode {
             AppMode::Popup(PopupMenu::Main) => &mut self.menu_index,
             AppMode::Popup(PopupMenu::Matrix) => &mut self.matrix_row,
+            AppMode::Popup(PopupMenu::SessionList) => &mut self.session_list_index,
+            AppMode::Popup(PopupMenu::CompleteSession) => &mut self.complete_merge_index,
             _ => &mut self.submenu_index,
         };
         *idx = if *idx < len.saturating_sub(1) { *idx + 1 } else { 0 };

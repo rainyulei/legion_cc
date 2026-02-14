@@ -128,6 +128,8 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::Provider) | AppMode::Popup(PopupMenu::Model) => {
             handle_submenu_keys(app, key)
         }
+        AppMode::Popup(PopupMenu::SessionList) => handle_session_list_keys(app, key),
+        AppMode::Popup(PopupMenu::CompleteSession) => handle_complete_session_keys(app, key),
         _ => {}
     }
 
@@ -136,7 +138,9 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
 
 fn handle_matrix_keys(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc => app.toggle_popup(),
+        KeyCode::Esc => {
+            app.mode = AppMode::Popup(PopupMenu::Main);
+        }
         KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
         KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
         KeyCode::Tab | KeyCode::Left | KeyCode::Right
@@ -168,6 +172,47 @@ fn handle_submenu_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
             app.select_submenu_item();
             update_proxy_config(app);
+            save_pane_configs(app);
+        }
+        _ => {}
+    }
+}
+
+fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Popup(PopupMenu::Main);
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Enter => {
+            if app.session_list_index >= app.session_list.len() {
+                tracing::info!("New session requested");
+            } else {
+                let session = &app.session_list[app.session_list_index];
+                tracing::info!("Switch to session: {}", session.name);
+            }
+            app.mode = AppMode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn handle_complete_session_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Popup(PopupMenu::Main);
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Enter => {
+            let strategy = match app.complete_merge_index {
+                0 => "merge",
+                1 => "keep",
+                _ => "discard",
+            };
+            tracing::info!("Complete session with strategy: {}", strategy);
+            app.mode = AppMode::Normal;
         }
         _ => {}
     }
@@ -182,6 +227,10 @@ fn update_proxy_config(app: &App) {
             let provider = pane
                 .current_provider
                 .and_then(|i| app.providers.get(i))?;
+            // Default mode: no proxy involved, skip config update
+            if provider.id == "__default__" {
+                return None;
+            }
             Some((
                 pane.control_port,
                 provider.base_url.clone(),
@@ -212,6 +261,30 @@ fn update_proxy_config(app: &App) {
                 .await;
         }
     });
+}
+
+/// After provider/model selection, persist each pane's config to the database
+fn save_pane_configs(app: &App) {
+    if let Ok(repo) = legion_db::open_db() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        for pane in &app.panes {
+            if let Some(provider) = pane.current_provider.and_then(|i| app.providers.get(i)) {
+                let config = legion_db::PaneConfig {
+                    pane_label: pane.label.clone(),
+                    provider_id: provider.id.clone(),
+                    model: pane.current_model.clone(),
+                    updated_at: now,
+                };
+                if let Err(e) = repo.upsert_pane_config(&config) {
+                    tracing::warn!("Failed to save pane config for '{}': {}", pane.label, e);
+                }
+            }
+        }
+    }
 }
 
 /// Convert crossterm KeyEvent to PTY-compatible bytes

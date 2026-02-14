@@ -257,6 +257,8 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::Matrix => draw_matrix(frame, app, area),
         PopupMenu::Provider => draw_provider_menu(frame, app, area),
         PopupMenu::Model => draw_model_menu(frame, app, area),
+        PopupMenu::SessionList => draw_session_list(frame, app, area),
+        PopupMenu::CompleteSession => draw_complete_session(frame, app, area),
     }
 }
 
@@ -274,14 +276,15 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
             let selected = i == app.menu_index;
             let prefix = if selected { "> " } else { "  " };
             let value = match item {
-                MainMenuItem::Config => {
+                MainMenuItem::SwitchModels => {
                     let n = app.panes.len();
-                    if n == 0 {
-                        "[no panes]".to_string()
-                    } else {
-                        format!("[{} pane{}]", n, if n == 1 { "" } else { "s" })
-                    }
+                    if n == 0 { "[no panes]".to_string() }
+                    else { format!("[{} pane{}]", n, if n == 1 { "" } else { "s" }) }
                 }
+                MainMenuItem::SwitchSession => {
+                    format!("[{}]", app.session_name())
+                }
+                MainMenuItem::CompleteSession => String::new(),
                 MainMenuItem::Quit => String::new(),
             };
 
@@ -310,10 +313,11 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    // Separator before Quit
+    // Separator before the last item (Quit)
+    let quit_idx = items.len() - 1;
     let mut final_items = Vec::new();
     for (i, item) in items.into_iter().enumerate() {
-        if i == 1 {
+        if i == quit_idx {
             final_items.push(ListItem::new(Line::from(Span::styled(
                 "  \u{2500}".repeat(12),
                 Style::default().fg(Color::DarkGray),
@@ -515,6 +519,91 @@ fn draw_model_menu(frame: &mut Frame, app: &App, area: Rect) {
             area,
         );
     }
+}
+
+fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Sessions [ESC] ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let current_name = app.current_session.as_ref().map(|s| s.name.as_str());
+
+    for (i, session) in app.session_list.iter().enumerate() {
+        let selected = i == app.session_list_index;
+        let prefix = if selected { "> " } else { "  " };
+        let icon = if current_name == Some(session.name.as_str()) {
+            "\u{25cf} "
+        } else if session.status == "completed" {
+            "\u{2713} "
+        } else {
+            "\u{25cb} "
+        };
+        let style = if selected {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if session.status == "completed" {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let pane_count = 1 + session.worker_count;
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw(prefix.to_string()),
+            Span::styled(icon, style),
+            Span::styled(session.name.clone(), style),
+            Span::styled(format!("  {} panes", pane_count), Style::default().fg(Color::DarkGray)),
+        ])));
+    }
+
+    let new_selected = app.session_list_index >= app.session_list.len();
+    let new_prefix = if new_selected { "> " } else { "  " };
+    let new_style = if new_selected {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    items.push(ListItem::new(Line::from(vec![
+        Span::raw(new_prefix.to_string()),
+        Span::styled("[+] New Session", new_style),
+    ])));
+
+    frame.render_widget(List::new(items).block(block), area);
+}
+
+fn draw_complete_session(frame: &mut Frame, app: &App, area: Rect) {
+    let session_name = app.session_name();
+    let block = Block::default()
+        .title(format!(" Complete '{}' [ESC] ", session_name))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let options = ["Merge to main", "Keep worktrees", "Discard changes"];
+    let descriptions = [
+        "Merge all pane branches into main, then clean up",
+        "Mark completed but keep worktrees for manual handling",
+        "Delete all worktrees and branches (destructive!)",
+    ];
+
+    let items: Vec<ListItem> = options.iter().zip(descriptions.iter()).enumerate()
+        .map(|(i, (opt, desc))| {
+            let selected = i == app.complete_merge_index;
+            let prefix = if selected { "> " } else { "  " };
+            let style = if selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(vec![
+                Line::from(vec![Span::raw(prefix), Span::styled(*opt, style)]),
+                Line::from(Span::styled(format!("    {}", desc), Style::default().fg(Color::DarkGray))),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 fn format_elapsed(secs: u64) -> String {
