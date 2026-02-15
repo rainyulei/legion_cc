@@ -616,16 +616,10 @@ impl App {
         let leader_width = (term_width as u32 * self.leader_ratio as u32 / 100) as u16;
         let leader_pty_rows = content_height.saturating_sub(2);
         let leader_pty_cols = leader_width.saturating_sub(2);
-        let worker_width = term_width.saturating_sub(leader_width).saturating_sub(1);
-        let worker_height = if worker_count > 0 { content_height / worker_count } else { content_height };
-        let worker_pty_rows = worker_height.saturating_sub(2);
-        let worker_pty_cols = worker_width.saturating_sub(2);
+        // (Worker PTY sizes no longer needed — workers use SDK mode)
 
-        // Generate system prompts
+        // Generate system prompts (leader only — workers get prompts via SDK dispatch)
         let leader_prompt = crate::claudemd::leader_instructions(worker_count);
-        let worker_prompts: Vec<String> = (1..=worker_count)
-            .map(|id| crate::claudemd::worker_instructions(id))
-            .collect();
 
         // Port assignments
         let base_port = self.base_port;
@@ -638,17 +632,24 @@ impl App {
             Some(worktree_paths[0].as_path()), is_resume,
         );
 
-        // Spawn worker panes
+        // Workers: create panes without PTY (SDK will be used when ticket assigned)
         for i in 0..worker_count {
             let proxy = base_port + i + 1;
             let control = base_port + 1000 + i + 1;
             let label = format!("Worker {}", i + 1);
-            self.add_pane(
-                worker_pty_rows, worker_pty_cols, proxy, control,
-                label, true, Some(i + 1), Some(orchestrate_port),
-                Some(&worker_prompts[i as usize]),
-                Some(worktree_paths[1 + i as usize].as_path()), is_resume,
-            );
+            self.panes.push(Pane {
+                pty: None,
+                proxy_port: proxy,
+                control_port: control,
+                label,
+                current_provider: self.current_provider,
+                current_model: self.current_model.clone(),
+                spawned_with_continue: false,
+                sdk_task: None,
+                sdk_parser: None,
+                sdk_entries: Vec::new(),
+                current_ticket_id: None,
+            });
         }
 
         // Track next worker ID for dynamic add

@@ -4,6 +4,7 @@ pub mod app;
 pub mod claudemd;
 pub mod input;
 pub mod pty;
+pub mod sdk;
 pub mod ui;
 pub mod worktree;
 
@@ -16,6 +17,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+
+use legion_core::proxy::{ProxyControlApi, ProxyServer};
 
 use app::App;
 use input::{handle_key, handle_mouse, InputResult};
@@ -61,10 +64,6 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     let project_path = detect_project_path()
         .ok_or_else(|| anyhow::anyhow!("Not in a git repository — squad mode requires git"))?;
 
-    // Session selection (before TUI starts)
-    let (session_name, actual_workers, is_resume) =
-        select_session_interactive(&project_path, worker_count)?;
-
     // Setup terminal with mouse support for divider dragging
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -75,84 +74,24 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     // Create app and load providers from DB
     let mut app = App::new();
     app.load_from_db();
-    app.project_path = Some(project_path.clone());
-
-    // Create or verify worktrees
-    let worktree_paths = if is_resume {
-        let mut paths = Vec::new();
-        for i in 0..=actual_workers {
-            let label = if i == 0 { "Leader".to_string() } else { format!("Worker {}", i) };
-            let wt = worktree::pane_worktree_path(&project_path, &session_name, &label);
-            if !worktree::worktree_exists(&wt) {
-                tracing::warn!("Worktree missing for {}, recreating", label);
-                let _ = worktree::create_worktree(&project_path, &session_name, &label);
-            }
-            paths.push(wt);
-        }
-        if let Ok(repo) = legion_db::open_db() {
-            app.current_session = repo.get_squad_session(&session_name).ok().flatten();
-        }
-        paths
-    } else {
-        app.create_session(&session_name, actual_workers)?
-    };
+    app.project_path = Some(project_path);
+    app.base_port = base_port;
+    app.requested_workers = worker_count;
 
     // Cache terminal size
     let size = terminal.size()?;
     app.term_size = (size.width, size.height);
 
-    // Calculate PTY sizes based on layout
-    let content_height = size.height.saturating_sub(2);
-    let leader_width = (size.width as u32 * app.leader_ratio as u32 / 100) as u16;
-    let leader_pty_rows = content_height.saturating_sub(2);
-    let leader_pty_cols = leader_width.saturating_sub(2);
-    let worker_width = size.width.saturating_sub(leader_width).saturating_sub(1);
-    let worker_height = content_height / actual_workers;
-    let worker_pty_rows = worker_height.saturating_sub(2);
-    let worker_pty_cols = worker_width.saturating_sub(2);
-
-    // Generate system prompts
-    let leader_prompt = claudemd::leader_instructions(actual_workers);
-    let worker_prompts: Vec<String> = (1..=actual_workers)
-        .map(|id| claudemd::worker_instructions(id))
-        .collect();
-
-    // Port assignments
-    let orchestrate_port = base_port + 2000;
-    let leader_proxy = base_port;
-    let leader_control = base_port + 1000;
-
-    // Spawn panes with worktree paths
-    app.add_pane(
-        leader_pty_rows, leader_pty_cols, leader_proxy, leader_control,
-        "Leader".into(), false, None, Some(orchestrate_port), Some(&leader_prompt),
-        Some(worktree_paths[0].as_path()), is_resume,
-    );
-
-    for i in 0..actual_workers {
-        let proxy = base_port + i + 1;
-        let control = base_port + 1000 + i + 1;
-        let label = format!("Worker {}", i + 1);
-        app.add_pane(
-            worker_pty_rows, worker_pty_cols, proxy, control,
-            label, true, Some(i + 1), Some(orchestrate_port),
-            Some(&worker_prompts[i as usize]),
-            Some(worktree_paths[1 + i as usize].as_path()), is_resume,
-        );
+    // Show session selection popup on startup (no pre-TUI text prompts)
+    app.load_session_list();
+    let has_active = app.session_list.iter().any(|s| s.status == "active");
+    if has_active {
+        app.mode = app::AppMode::Popup(app::PopupMenu::SessionList);
+        app.session_list_index = 0;
+    } else {
+        app.mode = app::AppMode::Popup(app::PopupMenu::NewSessionInput);
+        app.session_name_input = app.default_session_name();
     }
-
-    // Start orchestration engine + API
-    let engine = legion_core::OrchestrateEngine::new(actual_workers);
-    app.orchestrate = Some(engine.clone());
-
-    let orch_api = legion_core::OrchestrateApi::new(engine, orchestrate_port);
-    let (orch_tx, orch_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        if let Err(e) = orch_api.start_with_signal(Some(orch_tx)).await {
-            tracing::error!("Orchestrate API error on port {}: {}", orchestrate_port, e);
-        }
-    });
-    orch_rx.await.ok();
 
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app).await;
@@ -201,58 +140,38 @@ fn detect_project_path() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Pre-TUI session selection (runs before alternate screen)
-fn select_session_interactive(_project_path: &std::path::Path, default_workers: u16) -> Result<(String, u16, bool)> {
-    let sessions: Vec<legion_db::SquadSession> = legion_db::open_db()
-        .and_then(|repo| repo.list_active_squad_sessions())
-        .unwrap_or_default();
-
-    if sessions.is_empty() {
-        eprint!("Session name: ");
-        let mut name = String::new();
-        std::io::stdin().read_line(&mut name)?;
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            anyhow::bail!("Session name cannot be empty");
-        }
-        return Ok((name, default_workers, false));
-    }
-
-    eprintln!("\n  Active sessions:");
-    for (i, s) in sessions.iter().enumerate() {
-        let panes = 1 + s.worker_count;
-        eprintln!("  {}. {} ({} panes)", i + 1, s.name, panes);
-    }
-    eprintln!("  {}. [New Session]", sessions.len() + 1);
-    eprint!("\n  Select [1-{}]: ", sessions.len() + 1);
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let choice: usize = input.trim().parse().unwrap_or(0);
-
-    if choice >= 1 && choice <= sessions.len() {
-        let session = &sessions[choice - 1];
-        Ok((session.name.clone(), session.worker_count as u16, true))
-    } else {
-        eprint!("  Session name: ");
-        let mut name = String::new();
-        std::io::stdin().read_line(&mut name)?;
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            anyhow::bail!("Session name cannot be empty");
-        }
-        Ok((name, default_workers, false))
-    }
-}
-
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
     loop {
-        // Update orchestrate snapshot for UI rendering
-        if let Some(engine) = app.orchestrate.clone() {
-            app.orchestrate_snapshot = Some(engine.all_status().await);
+        // Start orchestration API if a session was just spawned
+        if let Some(orch_port) = app.pending_orchestrate_port.take() {
+            if let Some(engine) = app.orchestrate.clone() {
+                let orch_api = legion_core::OrchestrateApi::new(engine, orch_port);
+                tokio::spawn(async move {
+                    if let Err(e) = orch_api.start_with_signal(None).await {
+                        tracing::error!("Orchestrate API error on port {}: {}", orch_port, e);
+                    }
+                });
+            }
+        }
+
+        // Check if any --continue panes failed and need respawn
+        app.check_continue_fallback();
+
+        // Handle pending add worker
+        if app.pending_add_worker {
+            app.pending_add_worker = false;
+            handle_add_worker(app).await;
+        }
+
+        // Handle pending remove worker
+        if let Some((pane_index, strategy)) = app.pending_remove_worker.take() {
+            match app.remove_single_worker(pane_index, &strategy) {
+                Ok(()) => tracing::info!("Worker removed successfully"),
+                Err(e) => tracing::error!("Failed to remove worker: {}", e),
+            }
         }
 
         terminal.draw(|frame| draw(frame, app))?;
@@ -275,29 +194,85 @@ async fn run_event_loop(
             }
         }
 
-        // Poll for pending tasks and inject into idle Worker PTYs
-        // Clone engine to avoid holding an immutable borrow on app while we need mutable access
+        // --- SDK dispatch: idle workers pull from queue ---
         if let Some(engine) = app.orchestrate.clone() {
-            // Collect (pane_idx, ticket) pairs first, then inject
-            let mut injections: Vec<(usize, String)> = Vec::new();
-            if let Some(ref snapshot) = app.orchestrate_snapshot {
-                for ws in snapshot {
-                    if ws.status == legion_core::WorkerTaskStatus::Pending {
-                        let pane_idx = ws.worker_id as usize;
-                        if let Some(parser) = app.parser_at(pane_idx) {
-                            if pty::is_pty_idle(parser) {
-                                if let Some(ticket) = engine.take_pending(ws.worker_id).await {
-                                    injections.push((pane_idx, ticket));
-                                }
+            // Update ticket snapshots for UI
+            app.ticket_snapshot = Some(engine.all_tickets().await);
+            app.queue_stats = Some(engine.queue_stats().await);
+
+            let wc = engine.worker_count().await;
+
+            for wi in 1..=wc as usize {
+                if wi >= app.panes.len() { break; }
+
+                // Drain new SDK entries
+                let drained = app.panes[wi].sdk_task.as_mut()
+                    .map(|sdk| sdk.drain_entries())
+                    .unwrap_or_default();
+                app.panes[wi].sdk_entries.extend(drained);
+
+                // Check if SDK finished — collect info before any mutation
+                let finished_info = {
+                    let pane = &app.panes[wi];
+                    if let Some(ref sdk) = pane.sdk_task {
+                        if sdk.is_finished() {
+                            let result_text = sdk.result_text().unwrap_or_default();
+                            let ticket_id = pane.current_ticket_id.unwrap_or(0);
+                            Some((ticket_id, result_text))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((ticket_id, result_text)) = finished_info {
+                    let promise_found = crate::sdk::detect_promise(&result_text);
+
+                    if promise_found {
+                        // Success — report to engine
+                        let summary = Some(crate::sdk::extract_feedback(&result_text));
+                        engine.report_iteration(ticket_id, true, summary).await;
+                        tracing::info!("Worker {} ticket {} completed (promise found)", wi, ticket_id);
+                    } else {
+                        // Failed — check if retry needed
+                        let feedback = crate::sdk::extract_feedback(&result_text);
+                        let should_retry = engine.report_iteration(ticket_id, false, Some(feedback.clone())).await;
+
+                        if should_retry {
+                            // Get updated ticket info for retry
+                            if let Some(ts) = engine.worker_ticket(wi as u16).await {
+                                tracing::info!(
+                                    "Worker {} ticket {} retrying (iter {})",
+                                    wi, ticket_id, ts.iteration
+                                );
+                                let prompt = ts.prompt.clone();
+                                let team_mode = ts.team_mode.clone();
+                                let iteration = ts.iteration;
+                                // Clean up old SDK
+                                app.panes[wi].sdk_task = None;
+                                // Start new iteration
+                                app.start_sdk_task(wi, ticket_id, &prompt, &team_mode, iteration, Some(&feedback));
+                                continue;
                             }
+                        } else {
+                            tracing::warn!("Worker {} ticket {} failed (max iterations)", wi, ticket_id);
                         }
                     }
+
+                    // Clean up finished SDK
+                    app.panes[wi].sdk_task = None;
+                    app.panes[wi].current_ticket_id = None;
                 }
-            }
-            for (pane_idx, ticket) in injections {
-                app.write_to_pane(pane_idx, b"\x15");
-                app.write_to_pane(pane_idx, ticket.as_bytes());
-                app.write_to_pane(pane_idx, b"\r");
+
+                // If worker is idle and no SDK running, try to take next ticket
+                if app.panes[wi].sdk_task.is_none() {
+                    if let Some((ticket_id, prompt, team_mode)) = engine.take_next(wi as u16).await {
+                        tracing::info!("Worker {} taking ticket {}", wi, ticket_id);
+                        app.start_sdk_task(wi, ticket_id, &prompt, &team_mode, 1, None);
+                    }
+                }
             }
         }
 
@@ -306,4 +281,82 @@ async fn run_event_loop(
         }
     }
     Ok(())
+}
+
+/// Spawn a new worker: create proxy+control servers, worktree, PTY, add pane
+async fn handle_add_worker(app: &mut App) {
+    let worker_id = app.next_worker_id;
+    app.next_worker_id += 1;
+
+    let label = format!("Worker {}", worker_id);
+    let base_port = app.base_port;
+    let proxy_port = base_port + worker_id;
+    let control_port = base_port + 1000 + worker_id;
+    tracing::info!("Adding worker '{}': proxy={}, control={}", label, proxy_port, control_port);
+
+    // Create and start proxy server
+    let proxy = ProxyServer::new(proxy_port);
+
+    // Apply current provider config to the new proxy
+    if let Some(provider) = app.current_provider.and_then(|i| app.providers.get(i)) {
+        if provider.id != "__default__" {
+            let config = legion_core::ProxyConfig {
+                target_url: Some(provider.base_url.clone()),
+                api_key: provider.api_key.clone(),
+                api_format: Some(provider.api_format.clone()),
+                model: app.current_model.clone(),
+            };
+            proxy.update_config(config).await;
+        }
+    }
+
+    let (proxy_tx, proxy_rx) = tokio::sync::oneshot::channel();
+    let proxy_config_ref = proxy.config_ref();
+    tokio::spawn(async move {
+        if let Err(e) = proxy.start_with_signal(Some(proxy_tx)).await {
+            tracing::error!("Proxy error on port {}: {}", proxy_port, e);
+        }
+    });
+
+    let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+    let control_api = ProxyControlApi::new(proxy_config_ref, control_port);
+    tokio::spawn(async move {
+        if let Err(e) = control_api.start_with_signal(Some(control_tx)).await {
+            tracing::error!("Control API error on port {}: {}", control_port, e);
+        }
+    });
+
+    // Wait briefly for servers to be ready
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        proxy_rx.await.ok();
+        control_rx.await.ok();
+    }).await;
+
+    // Create worktree for the new worker
+    if let (Some(ref project_path), Some(ref session)) = (&app.project_path, &app.current_session) {
+        if let Err(e) = worktree::create_worktree(project_path, &session.name, &label) {
+            tracing::error!("Failed to create worktree for '{}': {}", label, e);
+            return;
+        }
+    }
+
+    // Workers: create pane without PTY (SDK will be used when ticket assigned)
+    app.panes.push(app::Pane {
+        pty: None,
+        proxy_port,
+        control_port,
+        label: label.clone(),
+        current_provider: app.current_provider,
+        current_model: app.current_model.clone(),
+        spawned_with_continue: false,
+        sdk_task: None,
+        sdk_parser: None,
+        sdk_entries: Vec::new(),
+        current_ticket_id: None,
+    });
+
+    // Resize all panes to accommodate the new worker
+    app.apply_resize();
+
+    tracing::info!("Worker '{}' added successfully", label);
 }
