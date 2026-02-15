@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use legion_core::orchestrate::{OrchestrateEngine, WorkerState};
+use legion_core::orchestrate::OrchestrateEngine;
 use legion_db::{Provider, SquadSession};
 
 use crate::pty::{PtyHandle, SharedParser};
@@ -26,6 +26,9 @@ pub enum PopupMenu {
     Matrix,
     SessionList,
     CompleteSession,
+    NewSessionInput,
+    RemoveWorkerList,
+    RemoveWorkerConfirm,
 }
 
 /// Which column is active in the matrix view
@@ -47,6 +50,8 @@ pub enum ModelTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainMenuItem {
     SwitchModels,
+    AddWorker,
+    RemoveWorker,
     SwitchSession,
     CompleteSession,
     Quit,
@@ -56,12 +61,17 @@ impl MainMenuItem {
     pub fn label(&self) -> &'static str {
         match self {
             Self::SwitchModels => "Switch Models",
+            Self::AddWorker => "Add Worker",
+            Self::RemoveWorker => "Remove Worker",
             Self::SwitchSession => "Switch Session",
             Self::CompleteSession => "Complete Session",
             Self::Quit => "Quit",
         }
     }
 }
+
+/// Maximum number of workers (not including leader)
+pub const MAX_WORKERS: u16 = 8;
 
 /// A single pane in the TUI - each runs its own Claude Code instance
 pub struct Pane {
@@ -71,6 +81,21 @@ pub struct Pane {
     pub label: String,
     pub current_provider: Option<usize>,
     pub current_model: Option<String>,
+    /// If true, pane was spawned with --continue; monitor for fallback
+    pub spawned_with_continue: bool,
+
+    // SDK execution state (workers only)
+    pub sdk_task: Option<crate::sdk::SdkHandle>,
+    pub sdk_parser: Option<crate::pty::SharedParser>,
+    pub sdk_entries: Vec<crate::sdk::ProgressEntry>,
+    pub current_ticket_id: Option<usize>,
+}
+
+impl Pane {
+    /// Get the parser for this pane (prefer SDK parser for workers, fallback to PTY for leader)
+    pub fn parser(&self) -> Option<&SharedParser> {
+        self.sdk_parser.as_ref().or_else(|| self.pty.as_ref().map(|pty| &pty.parser))
+    }
 }
 
 /// Full TUI application state
@@ -105,8 +130,11 @@ pub struct App {
 
     // Orchestration
     pub orchestrate: Option<OrchestrateEngine>,
-    pub orchestrate_snapshot: Option<Vec<WorkerState>>,
-    pub show_dashboard: bool,
+
+    // Right panel (embedded task board)
+    pub right_panel_focused: bool,
+    pub ticket_snapshot: Option<Vec<legion_core::TicketSnapshot>>,
+    pub queue_stats: Option<(usize, usize, usize, usize, usize)>,
 
     // Session management
     pub current_session: Option<SquadSession>,
@@ -117,8 +145,26 @@ pub struct App {
     pub session_list_index: usize,
     pub complete_merge_index: usize,
 
+    // Deferred session spawning (for in-TUI session selection)
+    pub session_name_input: String,
+    pub base_port: u16,
+    pub requested_workers: u16,
+    pub pending_orchestrate_port: Option<u16>,
+
+    // Dynamic worker management
+    pub pending_add_worker: bool,
+    pub pending_remove_worker: Option<(usize, String)>, // (pane index, strategy: "merge"/"keep"/"discard")
+    pub next_worker_id: u16,
+    pub remove_worker_target: usize,
+    pub remove_worker_strategy_index: usize,
+
     // Saved per-pane configs (label → (provider_id, model))
     saved_pane_configs: HashMap<String, (String, Option<String>)>,
+
+    // Kanban board state (Ctrl+T dashboard)
+    pub kanban_selected: usize,         // selected worker index in kanban view (0-based, workers only)
+    pub kanban_detail: bool,            // whether showing detail view for selected worker
+    pub kanban_detail_scroll: usize,    // scroll offset in detail view
 }
 
 impl App {
@@ -142,14 +188,27 @@ impl App {
             hover_on_divider: false,
             term_size: (0, 0),
             orchestrate: None,
-            orchestrate_snapshot: None,
-            show_dashboard: false,
+            right_panel_focused: false,
+            ticket_snapshot: None,
+            queue_stats: None,
             current_session: None,
             project_path: None,
             session_list: Vec::new(),
             session_list_index: 0,
             complete_merge_index: 0,
+            session_name_input: String::new(),
+            base_port: 0,
+            requested_workers: 0,
+            pending_orchestrate_port: None,
+            pending_add_worker: false,
+            pending_remove_worker: None,
+            next_worker_id: 1,
+            remove_worker_target: 0,
+            remove_worker_strategy_index: 0,
             saved_pane_configs: HashMap::new(),
+            kanban_selected: 0,
+            kanban_detail: false,
+            kanban_detail_scroll: 0,
         }
     }
 
@@ -195,14 +254,22 @@ impl App {
             label,
             current_provider: pane_provider,
             current_model: pane_model,
+            spawned_with_continue: continue_session,
+            sdk_task: None,
+            sdk_parser: None,
+            sdk_entries: Vec::new(),
+            current_ticket_id: None,
         });
     }
 
-    /// Kill all PTY child processes (called on exit)
+    /// Kill all PTY and SDK child processes (called on exit)
     pub fn kill_all(&mut self) {
         for pane in &mut self.panes {
             if let Some(ref mut pty) = pane.pty {
                 pty.kill();
+            }
+            if let Some(ref mut sdk) = pane.sdk_task {
+                sdk.kill();
             }
         }
     }
@@ -215,15 +282,13 @@ impl App {
     /// Get shared parser ref for rendering the focused pane
     pub fn parser(&self) -> Option<&SharedParser> {
         self.panes.get(self.focused_pane)
-            .and_then(|pane| pane.pty.as_ref())
-            .map(|pty| &pty.parser)
+            .and_then(|pane| pane.parser())
     }
 
     /// Get shared parser ref for a specific pane
     pub fn parser_at(&self, index: usize) -> Option<&SharedParser> {
         self.panes.get(index)
-            .and_then(|pane| pane.pty.as_ref())
-            .map(|pty| &pty.parser)
+            .and_then(|pane| pane.parser())
     }
 
     /// Send bytes to the focused pane's PTY
@@ -242,16 +307,6 @@ impl App {
                 let _ = pty.write(data);
             }
         }
-    }
-
-    /// Get orchestration status for a Worker pane
-    pub fn worker_task_status(&self, pane_index: usize) -> Option<&WorkerState> {
-        if pane_index == 0 || !self.is_squad() {
-            return None;
-        }
-        let worker_id = pane_index as u16;
-        self.orchestrate_snapshot.as_ref()
-            .and_then(|snap| snap.iter().find(|w| w.worker_id == worker_id))
     }
 
     /// Get the control port of the focused pane
@@ -510,10 +565,202 @@ impl App {
         }
     }
 
+    /// Generate a default session name like "session-1", "session-2", etc.
+    pub fn default_session_name(&self) -> String {
+        let mut n = 1u32;
+        let existing: std::collections::HashSet<&str> = self.session_list.iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        loop {
+            let candidate = format!("session-{}", n);
+            if !existing.contains(candidate.as_str()) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Start a session: create/verify worktrees, spawn PTY panes, set up orchestration
+    pub fn start_session(&mut self, name: &str, worker_count: u16, is_resume: bool) -> anyhow::Result<()> {
+        // Kill existing panes if switching sessions
+        self.kill_all();
+        self.panes.clear();
+        self.focused_pane = 0;
+
+        let project_path = self.project_path.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No project path"))?
+            .clone();
+
+        // Create or verify worktrees
+        let worktree_paths = if is_resume {
+            let mut paths = Vec::new();
+            for i in 0..=worker_count {
+                let label = if i == 0 { "Leader".to_string() } else { format!("Worker {}", i) };
+                let wt = crate::worktree::pane_worktree_path(&project_path, name, &label);
+                if !crate::worktree::worktree_exists(&wt) {
+                    let _ = crate::worktree::create_worktree(&project_path, name, &label);
+                }
+                paths.push(wt);
+            }
+            if let Ok(repo) = legion_db::open_db() {
+                self.current_session = repo.get_squad_session(name).ok().flatten();
+            }
+            paths
+        } else {
+            self.create_session(name, worker_count)?
+        };
+
+        // Calculate PTY sizes from cached terminal dimensions
+        let (term_width, term_height) = self.term_size;
+        let content_height = term_height.saturating_sub(2);
+        let leader_width = (term_width as u32 * self.leader_ratio as u32 / 100) as u16;
+        let leader_pty_rows = content_height.saturating_sub(2);
+        let leader_pty_cols = leader_width.saturating_sub(2);
+        let worker_width = term_width.saturating_sub(leader_width).saturating_sub(1);
+        let worker_height = if worker_count > 0 { content_height / worker_count } else { content_height };
+        let worker_pty_rows = worker_height.saturating_sub(2);
+        let worker_pty_cols = worker_width.saturating_sub(2);
+
+        // Generate system prompts
+        let leader_prompt = crate::claudemd::leader_instructions(worker_count);
+        let worker_prompts: Vec<String> = (1..=worker_count)
+            .map(|id| crate::claudemd::worker_instructions(id))
+            .collect();
+
+        // Port assignments
+        let base_port = self.base_port;
+        let orchestrate_port = base_port + 2000;
+
+        // Spawn leader pane (pass --continue on resume; fallback handles failure)
+        self.add_pane(
+            leader_pty_rows, leader_pty_cols, base_port, base_port + 1000,
+            "Leader".into(), false, None, Some(orchestrate_port), Some(&leader_prompt),
+            Some(worktree_paths[0].as_path()), is_resume,
+        );
+
+        // Spawn worker panes
+        for i in 0..worker_count {
+            let proxy = base_port + i + 1;
+            let control = base_port + 1000 + i + 1;
+            let label = format!("Worker {}", i + 1);
+            self.add_pane(
+                worker_pty_rows, worker_pty_cols, proxy, control,
+                label, true, Some(i + 1), Some(orchestrate_port),
+                Some(&worker_prompts[i as usize]),
+                Some(worktree_paths[1 + i as usize].as_path()), is_resume,
+            );
+        }
+
+        // Track next worker ID for dynamic add
+        self.next_worker_id = worker_count + 1;
+
+        // Set up orchestration engine (API will be started by event loop)
+        let engine = legion_core::OrchestrateEngine::new(worker_count);
+        self.orchestrate = Some(engine);
+        self.pending_orchestrate_port = Some(orchestrate_port);
+
+        Ok(())
+    }
+
+    /// Check if any pane spawned with --continue failed, and respawn without it
+    pub fn check_continue_fallback(&mut self) {
+        let worker_count = if self.panes.len() > 1 { (self.panes.len() - 1) as u16 } else { 0 };
+
+        // Collect indices that need respawn
+        let mut respawn: Vec<usize> = Vec::new();
+        for (i, pane) in self.panes.iter().enumerate() {
+            if !pane.spawned_with_continue { continue; }
+            let has_error = pane.pty.as_ref()
+                .and_then(|pty| pty.parser.lock().ok())
+                .map(|p| {
+                    let screen = p.screen();
+                    let (_, cols) = screen.size();
+                    screen.rows(0, cols).any(|row| row.contains("No conversation found"))
+                })
+                .unwrap_or(false);
+            if has_error {
+                respawn.push(i);
+            }
+        }
+
+        for i in respawn {
+            let label = self.panes[i].label.clone();
+            let proxy_port = self.panes[i].proxy_port;
+            let control_port = self.panes[i].control_port;
+            tracing::info!("Pane '{}': --continue failed, respawning without it", label);
+
+            // Kill existing PTY
+            if let Some(ref mut pty) = self.panes[i].pty {
+                pty.kill();
+            }
+
+            // Calculate PTY size from layout
+            let (tw, th) = self.term_size;
+            let ch = th.saturating_sub(2);
+            let (rows, cols) = if worker_count > 0 {
+                if i == 0 {
+                    let lw = (tw as u32 * self.leader_ratio as u32 / 100) as u16;
+                    (ch.saturating_sub(2), lw.saturating_sub(2))
+                } else {
+                    let lw = (tw as u32 * self.leader_ratio as u32 / 100) as u16;
+                    let ww = tw.saturating_sub(lw).saturating_sub(1);
+                    let wh = ch / worker_count;
+                    (wh.saturating_sub(2), ww.saturating_sub(2))
+                }
+            } else {
+                (ch.saturating_sub(2), tw.saturating_sub(2))
+            };
+
+            // Derive spawn params
+            let orchestrate_port = self.base_port + 2000;
+            let worker_id: Option<u16> = if i > 0 { Some(i as u16) } else { None };
+            let skip_perms = i > 0;
+            let prompt = if i == 0 {
+                crate::claudemd::leader_instructions(worker_count)
+            } else {
+                crate::claudemd::worker_instructions(i as u16)
+            };
+            let use_proxy = self.pane_uses_proxy(&label);
+            let working_dir = self.pane_worktree(&label);
+
+            match crate::pty::PtyHandle::spawn(
+                rows, cols, proxy_port, control_port,
+                skip_perms, worker_id, Some(orchestrate_port),
+                Some(&prompt), use_proxy,
+                working_dir.as_deref(), false, // no --continue
+            ) {
+                Ok(handle) => self.panes[i].pty = Some(handle),
+                Err(e) => {
+                    tracing::error!("Failed to respawn pane '{}': {}", label, e);
+                    self.panes[i].pty = None;
+                }
+            }
+            self.panes[i].spawned_with_continue = false;
+        }
+    }
+
     // --- Menu navigation ---
 
-    pub fn main_menu_items() -> &'static [MainMenuItem] {
-        &[MainMenuItem::SwitchModels, MainMenuItem::SwitchSession, MainMenuItem::CompleteSession, MainMenuItem::Quit]
+    pub fn main_menu_items(&self) -> Vec<MainMenuItem> {
+        let mut items = vec![MainMenuItem::SwitchModels];
+        if self.is_squad() {
+            let wc = self.panes.len().saturating_sub(1) as u16;
+            if wc < MAX_WORKERS {
+                items.push(MainMenuItem::AddWorker);
+            }
+            if wc > 0 {
+                items.push(MainMenuItem::RemoveWorker);
+            }
+        }
+        items.push(MainMenuItem::SwitchSession);
+        items.push(MainMenuItem::CompleteSession);
+        items.push(MainMenuItem::Quit);
+        items
+    }
+
+    /// Number of worker panes (excludes leader)
+    pub fn worker_count(&self) -> usize {
+        if self.is_squad() { self.panes.len() - 1 } else { 0 }
     }
 
     pub fn toggle_popup(&mut self) {
@@ -523,20 +770,31 @@ impl App {
                 self.menu_index = 0;
             }
             AppMode::Popup(_) => {
-                self.mode = AppMode::Normal;
+                // Don't close popup if no panes exist (startup session selection)
+                if !self.panes.is_empty() {
+                    self.mode = AppMode::Normal;
+                }
             }
         }
     }
 
     pub fn enter_submenu(&mut self) {
         if let AppMode::Popup(PopupMenu::Main) = self.mode {
-            let items = Self::main_menu_items();
+            let items = self.main_menu_items();
             if self.menu_index < items.len() {
                 match items[self.menu_index] {
                     MainMenuItem::SwitchModels => {
                         self.mode = AppMode::Popup(PopupMenu::Matrix);
                         self.matrix_row = 0;
                         self.matrix_col = MatrixCol::Provider;
+                    }
+                    MainMenuItem::AddWorker => {
+                        self.pending_add_worker = true;
+                        self.mode = AppMode::Normal;
+                    }
+                    MainMenuItem::RemoveWorker => {
+                        self.remove_worker_target = 0;
+                        self.mode = AppMode::Popup(PopupMenu::RemoveWorkerList);
                     }
                     MainMenuItem::SwitchSession => {
                         self.load_session_list();
@@ -633,7 +891,7 @@ impl App {
 
     pub fn menu_up(&mut self) {
         let len = match self.mode {
-            AppMode::Popup(PopupMenu::Main) => Self::main_menu_items().len(),
+            AppMode::Popup(PopupMenu::Main) => self.main_menu_items().len(),
             AppMode::Popup(PopupMenu::Provider) => self.providers.len(),
             AppMode::Popup(PopupMenu::Model) => {
                 self.target_provider_models().map(|m| m.len()).unwrap_or(0)
@@ -641,6 +899,8 @@ impl App {
             AppMode::Popup(PopupMenu::Matrix) => self.matrix_row_count(),
             AppMode::Popup(PopupMenu::SessionList) => self.session_list.len() + 1,
             AppMode::Popup(PopupMenu::CompleteSession) => 3,
+            AppMode::Popup(PopupMenu::RemoveWorkerList) => self.worker_count(),
+            AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => 3,
             _ => return,
         };
         let idx = match self.mode {
@@ -648,6 +908,8 @@ impl App {
             AppMode::Popup(PopupMenu::Matrix) => &mut self.matrix_row,
             AppMode::Popup(PopupMenu::SessionList) => &mut self.session_list_index,
             AppMode::Popup(PopupMenu::CompleteSession) => &mut self.complete_merge_index,
+            AppMode::Popup(PopupMenu::RemoveWorkerList) => &mut self.remove_worker_target,
+            AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => &mut self.remove_worker_strategy_index,
             _ => &mut self.submenu_index,
         };
         *idx = if *idx > 0 { *idx - 1 } else { len.saturating_sub(1) };
@@ -655,7 +917,7 @@ impl App {
 
     pub fn menu_down(&mut self) {
         let len = match self.mode {
-            AppMode::Popup(PopupMenu::Main) => Self::main_menu_items().len(),
+            AppMode::Popup(PopupMenu::Main) => self.main_menu_items().len(),
             AppMode::Popup(PopupMenu::Provider) => self.providers.len(),
             AppMode::Popup(PopupMenu::Model) => {
                 self.target_provider_models().map(|m| m.len()).unwrap_or(0)
@@ -663,6 +925,8 @@ impl App {
             AppMode::Popup(PopupMenu::Matrix) => self.matrix_row_count(),
             AppMode::Popup(PopupMenu::SessionList) => self.session_list.len() + 1,
             AppMode::Popup(PopupMenu::CompleteSession) => 3,
+            AppMode::Popup(PopupMenu::RemoveWorkerList) => self.worker_count(),
+            AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => 3,
             _ => return,
         };
         let idx = match self.mode {
@@ -670,6 +934,8 @@ impl App {
             AppMode::Popup(PopupMenu::Matrix) => &mut self.matrix_row,
             AppMode::Popup(PopupMenu::SessionList) => &mut self.session_list_index,
             AppMode::Popup(PopupMenu::CompleteSession) => &mut self.complete_merge_index,
+            AppMode::Popup(PopupMenu::RemoveWorkerList) => &mut self.remove_worker_target,
+            AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => &mut self.remove_worker_strategy_index,
             _ => &mut self.submenu_index,
         };
         *idx = if *idx < len.saturating_sub(1) { *idx + 1 } else { 0 };
@@ -785,5 +1051,118 @@ impl App {
             Some(ModelTarget::AllPanes) => "All Panes",
             None => "All",
         }
+    }
+
+    /// Start an SDK task on a worker pane
+    pub fn start_sdk_task(
+        &mut self,
+        pane_index: usize,
+        ticket_id: usize,
+        prompt: &str,
+        team_mode: &legion_core::TeamMode,
+        iteration: u16,
+        feedback: Option<&str>,
+    ) {
+        // Compute values before mutable borrow
+        let working_dir = self.pane_worktree(&self.panes[pane_index].label.clone());
+        let use_proxy = self.pane_uses_proxy(&self.panes[pane_index].label.clone());
+        let proxy_port = self.panes[pane_index].proxy_port;
+
+        // Create SDK parser
+        let (term_w, term_h) = self.term_size;
+        let lw = (term_w as u32 * self.leader_ratio as u32 / 100) as u16;
+        let ww = term_w.saturating_sub(lw).saturating_sub(1);
+        let parser = std::sync::Arc::new(std::sync::Mutex::new(
+            vt100::Parser::new(term_h.saturating_sub(4), ww.saturating_sub(2), 1000)
+        ));
+
+        // Generate system prompt based on team mode
+        let sys_prompt = match team_mode {
+            legion_core::TeamMode::TechLeadTeam => {
+                let worker_id = pane_index as u16;
+                crate::claudemd::worker_instructions(worker_id)
+            }
+            legion_core::TeamMode::Solo => {
+                "You are a solo developer. Follow TDD: write failing tests first, then implement. Run tests to verify. Output <promise>DONE</promise> when complete.".to_string()
+            }
+            legion_core::TeamMode::Custom(desc) => {
+                format!("{}\n\nOutput <promise>DONE</promise> when complete.", desc)
+            }
+        };
+
+        let wd = working_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        match crate::sdk::SdkHandle::spawn(
+            &wd, prompt, parser.clone(), use_proxy, proxy_port,
+            Some(&sys_prompt), iteration, feedback,
+        ) {
+            Ok(handle) => {
+                let pane = &mut self.panes[pane_index];
+                pane.sdk_task = Some(handle);
+                pane.sdk_parser = Some(parser);
+                pane.current_ticket_id = Some(ticket_id);
+                if iteration == 1 {
+                    pane.sdk_entries.clear();
+                }
+                tracing::info!("SDK task started for pane {} (ticket {}, iter {})", pane_index, ticket_id, iteration);
+            }
+            Err(e) => {
+                tracing::error!("Failed to start SDK task for pane {}: {}", pane_index, e);
+            }
+        }
+    }
+
+    /// Remove a single worker: kill PTY, handle git worktree, remove pane
+    pub fn remove_single_worker(&mut self, pane_index: usize, strategy: &str) -> anyhow::Result<()> {
+        if pane_index == 0 || pane_index >= self.panes.len() {
+            return Err(anyhow::anyhow!("Invalid pane index for removal"));
+        }
+
+        let label = self.panes[pane_index].label.clone();
+
+        // Kill PTY
+        if let Some(ref mut pty) = self.panes[pane_index].pty {
+            pty.kill();
+        }
+
+        // Kill SDK task
+        if let Some(ref mut sdk) = self.panes[pane_index].sdk_task {
+            sdk.kill();
+        }
+
+        // Handle git worktree
+        if let (Some(ref project_path), Some(ref session)) = (&self.project_path, &self.current_session) {
+            match strategy {
+                "merge" => {
+                    let default_branch = crate::worktree::default_branch(project_path);
+                    let _ = std::process::Command::new("git")
+                        .args(["checkout", &default_branch])
+                        .current_dir(project_path)
+                        .output();
+                    crate::worktree::merge_branch(project_path, &session.name, &label)?;
+                    let _ = crate::worktree::remove_worktree(project_path, &session.name, &label, false);
+                }
+                "discard" => {
+                    let _ = crate::worktree::remove_worktree(project_path, &session.name, &label, true);
+                }
+                _ => {
+                    // "keep" — leave worktree as-is
+                }
+            }
+        }
+
+        // Remove pane
+        self.panes.remove(pane_index);
+
+        // Adjust focused pane
+        if self.focused_pane >= self.panes.len() {
+            self.focused_pane = self.panes.len().saturating_sub(1);
+        }
+
+        // Resize remaining panes
+        self.apply_resize();
+
+        tracing::info!("Removed worker '{}' with strategy '{}'", label, strategy);
+        Ok(())
     }
 }
