@@ -32,6 +32,9 @@ pub fn pane_branch_name(session_name: &str, pane_label: &str) -> String {
 }
 
 /// Create a git worktree for a pane
+///
+/// If the worktree already exists, returns its path.
+/// If the branch already exists (leftover from incomplete cleanup), reuses it.
 pub fn create_worktree(
     project_path: &Path,
     session_name: &str,
@@ -40,28 +43,39 @@ pub fn create_worktree(
     let wt_path = pane_worktree_path(project_path, session_name, pane_label);
     let branch = pane_branch_name(session_name, pane_label);
 
+    // Already exists — reuse
+    if worktree_exists(&wt_path) {
+        return Ok(wt_path);
+    }
+
     if let Some(parent) = wt_path.parent() {
         std::fs::create_dir_all(parent).context("Failed to create worktree parent directory")?;
     }
 
+    // Try creating with new branch
     let output = Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            &wt_path.to_string_lossy(),
-            "-b",
-            &branch,
-        ])
+        .args(["worktree", "add", &wt_path.to_string_lossy(), "-b", &branch])
         .current_dir(project_path)
         .output()
         .context("Failed to run git worktree add")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git worktree add failed: {}", stderr.trim());
+    if output.status.success() {
+        return Ok(wt_path);
     }
 
-    Ok(wt_path)
+    // Branch might already exist (leftover) — try using existing branch
+    let output2 = Command::new("git")
+        .args(["worktree", "add", &wt_path.to_string_lossy(), &branch])
+        .current_dir(project_path)
+        .output()
+        .context("Failed to run git worktree add with existing branch")?;
+
+    if output2.status.success() {
+        return Ok(wt_path);
+    }
+
+    let stderr = String::from_utf8_lossy(&output2.stderr);
+    anyhow::bail!("git worktree add failed: {}", stderr.trim())
 }
 
 /// Check if a worktree path exists and is valid

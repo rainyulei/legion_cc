@@ -58,6 +58,10 @@ impl PtyHandle {
         if dangerously_skip_permissions {
             cmd.arg("--dangerously-skip-permissions");
         }
+        // Workers: prevent Claude Code from asking user questions
+        if worker_id.is_some() {
+            cmd.args(["--disallowedTools", "AskUserQuestion"]);
+        }
         if let Some(prompt) = system_prompt {
             cmd.args(["--append-system-prompt", prompt]);
         }
@@ -171,22 +175,195 @@ impl PtyHandle {
 }
 
 /// Check if a PTY shows an idle Claude Code prompt.
-/// Claude Code prompt typically ends with "❯" or ">" on the last non-empty line.
+///
+/// Strategy: scan the **bottom half** of the visible screen for a line starting
+/// with `❯` (U+276F). Only checking the bottom half avoids false positives from
+/// old prompts in scrollback that haven't been pushed off screen yet.
+///
+/// Claude Code's bottom area (in narrow panes, status wraps into many lines):
+///   ❯ Try "fix lint errors"        ← prompt / hint line
+///   ──────────────────────          ← separator
+///   rainlei@MacBook-Pro-4          ← user info (may wrap!)
+///   worker-1                       ← continuation
+///   legion/session-2/worker-1      ← continuation
+///   ⏵⏵ bypass permissions on ...   ← permissions
+///   Claude in Chrome enabled       ← plugins
 pub fn is_pty_idle(parser: &SharedParser) -> bool {
     if let Ok(p) = parser.lock() {
         let screen = p.screen();
-        let (_rows, cols) = screen.size();
+        let (rows, cols) = screen.size();
+        // Only check the bottom half of the screen to avoid old prompts in scrollback
+        let start_row = rows / 2;
         let row_texts: Vec<String> = screen.rows(0, cols).collect();
-        for row in row_texts.iter().rev() {
+        for row in row_texts.iter().skip(start_row as usize) {
             let trimmed = row.trim();
-            if trimmed.is_empty() {
-                continue;
+            if trimmed.starts_with('❯') {
+                return true;
             }
-            return trimmed.ends_with('❯')
-                || trimmed.ends_with('>')
-                || trimmed.ends_with('$')
-                || trimmed.contains("❯ ");
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a SharedParser and feed it lines of text
+    fn make_screen(rows: u16, cols: u16, lines: &[&str]) -> SharedParser {
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let mut p = parser.lock().unwrap();
+        for (i, line) in lines.iter().enumerate() {
+            // Move cursor to row i, col 0
+            p.process(format!("\x1b[{};1H{}", i + 1, line).as_bytes());
+        }
+        drop(p);
+        parser
+    }
+
+    #[test]
+    fn test_idle_wide_pane() {
+        // Wide pane: status bar fits on fewer lines, ❯ is near bottom
+        let screen = make_screen(20, 80, &[
+            "",
+            "  Welcome back Rain!",
+            "",
+            "  Some previous output...",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "───────────────────────────────",
+            "❯ Try \"fix lint errors\"",
+            "───────────────────────────────",
+            "  rainlei@MacBook-Pro-4 worker-1 legion/session-1/worker-1",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            "",
+            "",
+        ]);
+        assert!(is_pty_idle(&screen), "Should detect idle in wide pane");
+    }
+
+    #[test]
+    fn test_idle_narrow_pane_wrapped_status() {
+        // Narrow pane: status bar wraps, ❯ is many lines above bottom
+        let screen = make_screen(20, 30, &[
+            "",
+            "  Welcome back!",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "──────────────────────",
+            "❯ Try \"fix lint errors\"",
+            "──────────────────────",
+            "  rainlei@MacBook-Pro-4",
+            "  worker-1",
+            "  legion/session-2/worker-1",
+            "  ⏵⏵ bypass permissions on",
+            "  (shift+tab to cycle)",
+            "  Claude in Chrome enabled",
+            "",
+        ]);
+        assert!(is_pty_idle(&screen), "Should detect idle in narrow pane with wrapped status");
+    }
+
+    #[test]
+    fn test_not_idle_claude_working() {
+        // Claude is actively outputting, no ❯ in bottom half
+        let screen = make_screen(20, 80, &[
+            "❯ create hello.py",                 // old prompt - top half
+            "",
+            "⏺ I'll create hello.py for you.",
+            "",
+            "⏺ Write(hello.py)",
+            "  def hello():",
+            "      print(\"hello world\")",
+            "",
+            "⏺ Running tests...",
+            "",
+            "  $ python hello.py",               // bottom half starts here (row 10)
+            "  hello world",
+            "",
+            "⏺ The file has been created.",
+            "",
+            "  Still working on next step...",
+            "",
+            "",
+            "",
+            "",
+        ]);
+        assert!(!is_pty_idle(&screen), "Should NOT detect idle when Claude is working (old ❯ in top half only)");
+    }
+
+    #[test]
+    fn test_not_idle_empty_screen() {
+        let screen = make_screen(20, 80, &[]);
+        assert!(!is_pty_idle(&screen), "Empty screen should not be idle");
+    }
+
+    #[test]
+    fn test_not_idle_gt_in_output() {
+        // AI outputs > (greater-than), should NOT trigger
+        let screen = make_screen(20, 80, &[
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "> This is a blockquote",
+            ">> Nested quote",
+            "  result > 0",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]);
+        assert!(!is_pty_idle(&screen), "Regular > should not trigger idle detection");
+    }
+
+    #[test]
+    fn test_idle_prompt_with_input() {
+        // Worker just received input, ❯ shows the typed text
+        let screen = make_screen(20, 80, &[
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "───────────────────────────────",
+            "❯ ",
+            "───────────────────────────────",
+            "  rainlei@MacBook-Pro-4 worker-1",
+            "  ⏵⏵ bypass permissions on",
+            "",
+            "",
+        ]);
+        assert!(is_pty_idle(&screen), "Empty prompt ❯ should be idle");
+    }
 }

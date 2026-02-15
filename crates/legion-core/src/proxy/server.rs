@@ -2,11 +2,15 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, Either, Full, StreamBody};
+use hyper::body::Frame;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
@@ -15,7 +19,17 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use super::transform::{anthropic_to_openai, openai_to_anthropic};
+use super::transform::{anthropic_to_openai, openai_to_anthropic, wrap_anthropic_json_as_sse};
+use crate::copilot::{self, CopilotTokenInfo};
+
+/// A boxed stream of frames for SSE passthrough
+type BoxStream = Pin<Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>>;
+
+/// Response body: either fully buffered or a streaming SSE body
+type ProxyBody = Either<Full<Bytes>, StreamBody<BoxStream>>;
+
+/// Cached Copilot API token (short-lived, auto-refreshed from gho_* OAuth token)
+type CopilotTokenCache = Arc<RwLock<Option<CopilotTokenInfo>>>;
 
 /// Configuration for the proxy server
 #[derive(Debug, Clone, Default)]
@@ -45,6 +59,7 @@ impl ProxyConfig {
 /// HTTP proxy server that intercepts and forwards requests
 pub struct ProxyServer {
     config: Arc<RwLock<ProxyConfig>>,
+    copilot_cache: CopilotTokenCache,
     port: u16,
 }
 
@@ -53,6 +68,7 @@ impl ProxyServer {
     pub fn new(port: u16) -> Self {
         Self {
             config: Arc::new(RwLock::new(ProxyConfig::new())),
+            copilot_cache: Arc::new(RwLock::new(None)),
             port,
         }
     }
@@ -72,6 +88,11 @@ impl ProxyServer {
     /// Get a reference to the config for sharing with handlers
     pub fn config_ref(&self) -> Arc<RwLock<ProxyConfig>> {
         self.config.clone()
+    }
+
+    /// Get a reference to the Copilot token cache
+    pub fn copilot_cache_ref(&self) -> CopilotTokenCache {
+        self.copilot_cache.clone()
     }
 
     /// Get the port this server is configured to run on
@@ -98,16 +119,19 @@ impl ProxyServer {
         }
 
         let config = self.config.clone();
+        let copilot_cache = self.copilot_cache.clone();
 
         loop {
             let (stream, remote_addr) = listener.accept().await?;
             let io = TokioIo::new(stream);
             let config = config.clone();
+            let copilot_cache = copilot_cache.clone();
 
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let config = config.clone();
-                    async move { handle_request(req, config).await }
+                    let copilot_cache = copilot_cache.clone();
+                    async move { handle_request(req, config, copilot_cache).await }
                 });
 
                 if let Err(err) = http1::Builder::new()
@@ -121,11 +145,21 @@ impl ProxyServer {
     }
 }
 
+/// Build an error response with a fully buffered body
+fn error_response(status: StatusCode, body: String) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Either::Left(Full::new(Bytes::from(body))))
+        .unwrap()
+}
+
 /// Handle an incoming HTTP request
 async fn handle_request(
     req: Request<Incoming>,
     config: Arc<RwLock<ProxyConfig>>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+    copilot_cache: CopilotTokenCache,
+) -> Result<Response<ProxyBody>, Infallible> {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let path = uri.path().to_string();
@@ -140,25 +174,35 @@ async fn handle_request(
         Some(url) => url.clone(),
         None => {
             warn!("No target URL configured, returning 503");
-            return Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(
-                    r#"{"error": {"type": "service_unavailable", "message": "No backend configured"}}"#,
-                )))
-                .unwrap());
+            return Ok(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error": {"type": "service_unavailable", "message": "No backend configured"}}"#.into(),
+            ));
         }
     };
 
-    // Only proxy POST requests to the messages endpoint
+    // For github_copilot format: resolve the short-lived API token and effective base URL
+    let copilot_resolved = if proxy_config.api_format.as_deref() == Some("github_copilot") {
+        match resolve_copilot_token(&proxy_config, &copilot_cache).await {
+            Ok(info) => Some(info),
+            Err(e) => {
+                error!("Failed to resolve Copilot token: {}", e);
+                return Ok(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!(r#"{{"error": {{"type": "copilot_auth_error", "message": "{}"}}}}"#, e),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Only proxy POST requests
     if method != Method::POST {
-        return Ok(Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from(
-                r#"{"error": {"type": "method_not_allowed", "message": "Only POST requests are supported"}}"#,
-            )))
-            .unwrap());
+        return Ok(error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            r#"{"error": {"type": "method_not_allowed", "message": "Only POST requests are supported"}}"#.into(),
+        ));
     }
 
     // Collect the request body
@@ -166,44 +210,91 @@ async fn handle_request(
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             error!("Failed to read request body: {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(format!(
-                    r#"{{"error": {{"type": "bad_request", "message": "Failed to read request body: {}"}}}}"#,
-                    e
-                ))))
-                .unwrap());
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                format!(r#"{{"error": {{"type": "bad_request", "message": "Failed to read request body: {}"}}}}"#, e),
+            ));
         }
     };
 
     // Transform request if needed
+    // Both openai_chat and github_copilot use OpenAI format
+    let is_openai_compat = matches!(
+        proxy_config.api_format.as_deref(),
+        Some("openai_chat") | Some("github_copilot")
+    );
+
     let (request_body, content_type) = match proxy_config.api_format.as_deref() {
-        Some("openai_chat") => {
+        Some("openai_chat") | Some("github_copilot") => {
             match anthropic_to_openai(&body_bytes, proxy_config.model.as_deref()) {
-                Ok(transformed) => (transformed, "application/json"),
+                Ok(transformed) => {
+                    // Force stream=false — we'll wrap the buffered response as Anthropic SSE
+                    let final_body = match serde_json::from_slice::<serde_json::Value>(&transformed) {
+                        Ok(mut v) => {
+                            v["stream"] = serde_json::Value::Bool(false);
+                            serde_json::to_vec(&v).unwrap_or(transformed)
+                        }
+                        Err(_) => transformed,
+                    };
+                    (final_body, "application/json")
+                }
                 Err(e) => {
                     error!("Failed to transform request: {}", e);
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .header("Content-Type", "application/json")
-                        .body(Full::new(Bytes::from(format!(
-                            r#"{{"error": {{"type": "bad_request", "message": "Failed to transform request: {}"}}}}"#,
-                            e
-                        ))))
-                        .unwrap());
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!(r#"{{"error": {{"type": "bad_request", "message": "Failed to transform request: {}"}}}}"#, e),
+                    ));
                 }
             }
         }
-        _ => (body_bytes.to_vec(), "application/json"),
+        _ => {
+            // For anthropic/anthropic_bearer: rewrite model if override is configured
+            if let Some(ref model_override) = proxy_config.model {
+                match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                    Ok(mut body) => {
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.insert("model".to_string(), serde_json::Value::String(model_override.clone()));
+                        }
+                        (serde_json::to_vec(&body).unwrap_or_else(|_| body_bytes.to_vec()), "application/json")
+                    }
+                    Err(_) => (body_bytes.to_vec(), "application/json"),
+                }
+            } else {
+                (body_bytes.to_vec(), "application/json")
+            }
+        }
     };
 
     // Build the target URL
-    let full_url = if target_url.ends_with('/') {
-        format!("{}{}", target_url.trim_end_matches('/'), path)
+    // For OpenAI-compatible formats: rewrite Anthropic endpoint to OpenAI endpoint
+    let is_copilot = proxy_config.api_format.as_deref() == Some("github_copilot");
+    let effective_path = if is_openai_compat && path.contains("/v1/messages") {
+        if is_copilot {
+            // Copilot API uses /chat/completions (no /v1 prefix)
+            path.replace("/v1/messages", "/chat/completions")
+        } else {
+            path.replace("/v1/messages", "/v1/chat/completions")
+        }
     } else {
-        format!("{}{}", target_url, path)
+        path.clone()
     };
+
+    // For github_copilot: use the base_url from token exchange (may differ from config)
+    let effective_base_url = if let Some(ref info) = copilot_resolved {
+        &info.base_url
+    } else {
+        target_url.as_str()
+    };
+
+    let mut full_url = format!(
+        "{}/{}",
+        effective_base_url.trim_end_matches('/'),
+        effective_path.trim_start_matches('/')
+    );
+    // Deduplicate version prefix: base_url may already contain /v1
+    while full_url.contains("/v1/v1") {
+        full_url = full_url.replace("/v1/v1", "/v1");
+    }
 
     debug!("Forwarding request to {}", full_url);
 
@@ -214,20 +305,47 @@ async fn handle_request(
         .header("Content-Type", content_type)
         .body(request_body);
 
-    // Add API key if configured
-    if let Some(api_key) = &proxy_config.api_key {
-        // Use appropriate header based on target format
-        match proxy_config.api_format.as_deref() {
-            Some("openai_chat") => {
-                request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+    // Add authentication and identity headers based on target format
+    match proxy_config.api_format.as_deref() {
+        Some("github_copilot") => {
+            // GitHub Copilot: use the resolved short-lived token, not the gho_* OAuth token
+            if let Some(ref info) = copilot_resolved {
+                request_builder = request_builder
+                    .header("Authorization", format!("Bearer {}", info.token))
+                    .header("Copilot-Integration-Id", "vscode-chat")
+                    .header("Editor-Version", "vscode/1.99.0")
+                    .header("Editor-Plugin-Version", "copilot-chat/0.27.0");
             }
-            Some("anthropic_bearer") => {
-                // Copilot, OpenCode Zen, etc. — Anthropic format but Bearer auth
-                request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
-                request_builder = request_builder.header("anthropic-version", "2023-06-01");
+        }
+        Some("openai_chat") => {
+            if let Some(api_key) = &proxy_config.api_key {
+                // OpenAI-compatible: Bearer auth + OpenCode Zen identity headers
+                request_builder = request_builder
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("User-Agent", "opencode/stable/1.1.63/cli")
+                    .header("x-opencode-project", "legion")
+                    .header("x-opencode-session", "legion-proxy")
+                    .header("x-opencode-request", "legion-user")
+                    .header("x-opencode-client", "cli");
             }
-            _ => {
-                // Native Anthropic — x-api-key auth
+        }
+        Some("anthropic_bearer") => {
+            if let Some(api_key) = &proxy_config.api_key {
+                // Anthropic protocol with Bearer auth (e.g. third-party Anthropic-compatible APIs)
+                request_builder = request_builder
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14")
+                    .header("User-Agent", "opencode/stable/1.1.63/cli")
+                    .header("x-opencode-project", "legion")
+                    .header("x-opencode-session", "legion-proxy")
+                    .header("x-opencode-request", "legion-user")
+                    .header("x-opencode-client", "cli");
+            }
+        }
+        _ => {
+            if let Some(api_key) = &proxy_config.api_key {
+                // Standard Anthropic — x-api-key auth
                 request_builder = request_builder.header("x-api-key", api_key);
                 request_builder = request_builder.header("anthropic-version", "2023-06-01");
             }
@@ -239,55 +357,142 @@ async fn handle_request(
         Ok(resp) => resp,
         Err(e) => {
             error!("Failed to forward request: {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(format!(
-                    r#"{{"error": {{"type": "upstream_error", "message": "Failed to connect to backend: {}"}}}}"#,
-                    e
-                ))))
-                .unwrap());
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!(r#"{{"error": {{"type": "upstream_error", "message": "Failed to connect to backend: {}"}}}}"#, e),
+            ));
         }
     };
 
     let status = response.status();
-    debug!("Received {} response from upstream", status);
+    let upstream_content_type = response.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let is_sse = upstream_content_type.contains("text/event-stream");
 
-    // Get response body
+    debug!("Received {} response from upstream (sse={})", status, is_sse);
+
+    // --- SSE passthrough for anthropic/anthropic_bearer streaming responses ---
+    if is_sse && !is_openai_compat {
+        let stream = response.bytes_stream().map(|result| {
+            match result {
+                Ok(bytes) => Ok::<_, Infallible>(Frame::data(bytes)),
+                Err(e) => {
+                    warn!("SSE streaming chunk error: {}", e);
+                    Ok(Frame::data(Bytes::new()))
+                }
+            }
+        });
+        let boxed: BoxStream = Box::pin(stream);
+
+        return Ok(Response::builder()
+            .status(status)
+            .header("Content-Type", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .body(Either::Right(StreamBody::new(boxed)))
+            .unwrap());
+    }
+
+    // --- Buffered response path ---
     let response_body = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             error!("Failed to read response body: {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(format!(
-                    r#"{{"error": {{"type": "upstream_error", "message": "Failed to read backend response: {}"}}}}"#,
-                    e
-                ))))
-                .unwrap());
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!(r#"{{"error": {{"type": "upstream_error", "message": "Failed to read backend response: {}"}}}}"#, e),
+            ));
         }
     };
 
-    // Transform response if needed (only for successful responses)
-    let final_body = if status.is_success() && proxy_config.api_format.as_deref() == Some("openai_chat") {
+    // For openai_chat: transform OpenAI JSON → Anthropic JSON → Anthropic SSE
+    if is_openai_compat && status.is_success() {
         match openai_to_anthropic(&response_body) {
-            Ok(transformed) => Bytes::from(transformed),
+            Ok(anthropic_json) => {
+                match wrap_anthropic_json_as_sse(&anthropic_json) {
+                    Ok(sse_bytes) => {
+                        return Ok(Response::builder()
+                            .status(status)
+                            .header("Content-Type", "text/event-stream")
+                            .header("Cache-Control", "no-cache")
+                            .body(Either::Left(Full::new(Bytes::from(sse_bytes))))
+                            .unwrap());
+                    }
+                    Err(e) => {
+                        warn!("Failed to wrap response as SSE, returning JSON: {}", e);
+                        return Ok(Response::builder()
+                            .status(status)
+                            .header("Content-Type", "application/json")
+                            .body(Either::Left(Full::new(Bytes::from(anthropic_json))))
+                            .unwrap());
+                    }
+                }
+            }
             Err(e) => {
-                warn!("Failed to transform response, returning as-is: {}", e);
-                response_body
+                warn!("Failed to transform OpenAI response, returning as-is: {}", e);
             }
         }
-    } else {
-        response_body
-    };
+    }
 
-    // Build response
+    // Default: pass through the buffered response
     Ok(Response::builder()
         .status(status)
-        .header("Content-Type", "application/json")
-        .body(Full::new(final_body))
+        .header("Content-Type", upstream_content_type)
+        .body(Either::Left(Full::new(response_body)))
         .unwrap())
+}
+
+/// Resolve a valid Copilot API token, refreshing from the gho_* OAuth token if expired.
+///
+/// When token exchange fails (e.g. 404 for certain token types), falls back to using
+/// the gho_* token directly as the API token (same behavior as OpenCode/ccswitch).
+async fn resolve_copilot_token(
+    config: &ProxyConfig,
+    cache: &CopilotTokenCache,
+) -> anyhow::Result<CopilotTokenInfo> {
+    // Check if cached token is still valid (with 60s buffer)
+    {
+        let cached = cache.read().await;
+        if let Some(ref info) = *cached {
+            if info.expires_at > Instant::now() + Duration::from_secs(60) {
+                return Ok(info.clone());
+            }
+            debug!("Copilot token expired, refreshing...");
+        }
+    }
+
+    // Need to exchange/refresh
+    let gho_token = config
+        .api_key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("No GitHub OAuth token (gho_*) configured for Copilot"))?;
+
+    let info = match copilot::exchange_copilot_token(gho_token).await {
+        Ok(info) => {
+            info!("Copilot token exchanged, base_url: {}, expires in {}s",
+                info.base_url,
+                info.expires_at.duration_since(Instant::now()).as_secs()
+            );
+            info
+        }
+        Err(e) => {
+            // Fallback: use gho_* token directly (some token types don't support exchange)
+            warn!("Copilot token exchange failed ({}), using gho token directly", e);
+            CopilotTokenInfo {
+                token: gho_token.to_string(),
+                base_url: copilot::DEFAULT_COPILOT_API_BASE.to_string(),
+                expires_at: Instant::now() + Duration::from_secs(60 * 60),
+            }
+        }
+    };
+
+    // Cache the resolved token
+    let mut cached = cache.write().await;
+    *cached = Some(info.clone());
+
+    Ok(info)
 }
 
 #[cfg(test)]

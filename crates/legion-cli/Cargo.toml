@@ -2,6 +2,7 @@
 name = "legion-cli"
 version.workspace = true
 edition.workspace = true
+default-run = "legion"
 
 [[bin]]
 name = "legion"

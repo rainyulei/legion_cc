@@ -179,6 +179,87 @@ pub fn openai_to_anthropic(body: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("Failed to serialize Anthropic response: {}", e))
 }
 
+/// Wrap a non-streaming Anthropic Messages API JSON response as SSE events.
+///
+/// Used when we forced stream=false on the upstream (openai_chat) but Claude Code
+/// expects a streaming (SSE) response in Anthropic format.
+pub fn wrap_anthropic_json_as_sse(anthropic_json: &[u8]) -> Result<Vec<u8>> {
+    let msg: Value = serde_json::from_slice(anthropic_json)
+        .map_err(|e| anyhow!("Failed to parse Anthropic response for SSE wrapping: {}", e))?;
+
+    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("msg_unknown");
+    let model = msg.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("assistant");
+    let stop_reason = msg.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("end_turn");
+    let usage = msg.get("usage").cloned().unwrap_or(json!({"input_tokens": 0, "output_tokens": 0}));
+    let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let mut sse = String::new();
+
+    // message_start
+    let message_start = json!({
+        "type": "message_start",
+        "message": {
+            "id": id,
+            "type": "message",
+            "role": role,
+            "content": [],
+            "model": model,
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+        }
+    });
+    sse.push_str(&format!("event: message_start\ndata: {}\n\n", serde_json::to_string(&message_start).unwrap()));
+
+    // Process content blocks
+    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+        for (i, block) in content.iter().enumerate() {
+            let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+            if block_type == "text" {
+                let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+
+                // content_block_start
+                let block_start = json!({
+                    "type": "content_block_start",
+                    "index": i,
+                    "content_block": {"type": "text", "text": ""}
+                });
+                sse.push_str(&format!("event: content_block_start\ndata: {}\n\n", serde_json::to_string(&block_start).unwrap()));
+
+                // content_block_delta (send all text at once)
+                let delta = json!({
+                    "type": "content_block_delta",
+                    "index": i,
+                    "delta": {"type": "text_delta", "text": text}
+                });
+                sse.push_str(&format!("event: content_block_delta\ndata: {}\n\n", serde_json::to_string(&delta).unwrap()));
+
+                // content_block_stop
+                let block_stop = json!({
+                    "type": "content_block_stop",
+                    "index": i
+                });
+                sse.push_str(&format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&block_stop).unwrap()));
+            }
+        }
+    }
+
+    // message_delta
+    let msg_delta = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+        "usage": {"output_tokens": output_tokens}
+    });
+    sse.push_str(&format!("event: message_delta\ndata: {}\n\n", serde_json::to_string(&msg_delta).unwrap()));
+
+    // message_stop
+    sse.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+
+    Ok(sse.into_bytes())
+}
+
 /// Generate a simple UUID v4-like string (not cryptographically secure)
 fn uuid_v4_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};

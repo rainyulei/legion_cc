@@ -31,7 +31,8 @@ portable-pty = "0.8"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
 ureq = "3"
 
 # Database
@@ -43,6 +44,9 @@ serde_json = "1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# Platform
+libc = "0.2"
 
 # Utils
 anyhow = "1"

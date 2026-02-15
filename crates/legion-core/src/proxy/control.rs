@@ -146,28 +146,22 @@ async fn handle_update_config(
         }
     };
 
-    #[derive(serde::Deserialize)]
-    struct ConfigUpdate {
-        target_url: Option<String>,
-        api_key: Option<String>,
-        api_format: Option<String>,
-        model: Option<String>,
-    }
-
-    match serde_json::from_slice::<ConfigUpdate>(&body_bytes) {
-        Ok(update) => {
+    // Parse as Value to distinguish "field absent" (don't change) from "field: null" (clear)
+    match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        Ok(value) => {
             let mut cfg = config.write().await;
-            if let Some(url) = update.target_url {
-                cfg.target_url = Some(url);
+            if let Some(v) = value.get("target_url") {
+                cfg.target_url = v.as_str().map(|s| s.to_string());
             }
-            if let Some(key) = update.api_key {
-                cfg.api_key = Some(key);
+            if value.get("api_key").is_some() {
+                // "api_key": "sk-xxx" → Some("sk-xxx"), "api_key": null → None (clears old key)
+                cfg.api_key = value["api_key"].as_str().map(|s| s.to_string());
             }
-            if let Some(fmt) = update.api_format {
-                cfg.api_format = Some(fmt);
+            if let Some(v) = value.get("api_format") {
+                cfg.api_format = v.as_str().map(|s| s.to_string());
             }
-            if let Some(model) = update.model {
-                cfg.model = Some(model);
+            if let Some(v) = value.get("model") {
+                cfg.model = v.as_str().map(|s| s.to_string());
             }
             info!("Proxy config updated via control API");
             Ok(json_response(StatusCode::OK, r#"{"ok": true}"#))

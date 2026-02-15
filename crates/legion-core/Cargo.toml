@@ -19,3 +19,4 @@ tracing.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 bytes = "1"
+futures-util.workspace = true

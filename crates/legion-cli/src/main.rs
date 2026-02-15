@@ -53,6 +53,22 @@ enum Commands {
         #[arg(long)]
         from: Option<PathBuf>,
     },
+
+    /// GitHub Copilot integration
+    Copilot {
+        #[command(subcommand)]
+        action: CopilotAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CopilotAction {
+    /// Login via GitHub OAuth device flow
+    Login,
+    /// List available Copilot models
+    Models,
+    /// Full setup: login (if needed) → exchange token → fetch models → save to DB
+    Setup,
 }
 
 fn setup_logging(to_file: bool) {
@@ -113,6 +129,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Import { from }) => {
             cmd_import(from)?;
+        }
+        Some(Commands::Copilot { action }) => {
+            cmd_copilot(action).await?;
         }
         None => {
             cmd_start(18080, 19080, false).await?;
@@ -217,7 +236,7 @@ fn cmd_import(from: Option<PathBuf>) -> Result<()> {
             name: "GitHub Copilot".into(),
             base_url: "https://api.githubcopilot.com".into(),
             api_key: copilot_token.clone(),
-            api_format: "anthropic_bearer".into(),
+            api_format: "github_copilot".into(),
             models: None, // fetched dynamically below
             is_default: false,
             created_at: now,
@@ -338,22 +357,169 @@ fn fetch_models_from_api(url: &str, token: &str) -> Result<Vec<String>> {
     Ok(models)
 }
 
+async fn cmd_copilot(action: CopilotAction) -> Result<()> {
+    use legion_core::copilot;
+
+    match action {
+        CopilotAction::Login => {
+            // Try to read existing token first
+            if let Some(token) = copilot::read_github_token_from_opencode() {
+                println!("Found existing GitHub token from OpenCode: gho_{}...", &token[4..12.min(token.len())]);
+                println!("Use 'legion copilot setup' to exchange and save.");
+                return Ok(());
+            }
+
+            println!("Starting GitHub OAuth device flow...");
+            let device = copilot::request_device_code().await?;
+            println!("\nPlease visit: {}", device.verification_uri);
+            println!("Enter code: {}\n", device.user_code);
+
+            // Try to open browser
+            let _ = std::process::Command::new("open")
+                .arg(&device.verification_uri)
+                .spawn();
+
+            println!("Waiting for authorization...");
+            let token = copilot::poll_for_access_token(&device.device_code, device.interval).await?;
+            println!("Authorized! Token: gho_{}...", &token[4..12.min(token.len())]);
+
+            // Save to DB
+            let repo = legion_db::open_db()?;
+            if let Ok(Some(mut provider)) = repo.get_provider("github-copilot") {
+                provider.api_key = Some(token);
+                repo.upsert_provider(&provider)?;
+                println!("Token saved to github-copilot provider.");
+            } else {
+                println!("Run 'legion import' first to create the github-copilot provider.");
+            }
+        }
+
+        CopilotAction::Models => {
+            let repo = legion_db::open_db()?;
+            let provider = repo.get_provider("github-copilot")?
+                .ok_or_else(|| anyhow::anyhow!("github-copilot provider not found. Run 'legion import' first."))?;
+
+            let gho_token = provider.api_key
+                .ok_or_else(|| anyhow::anyhow!("No GitHub token configured. Run 'legion copilot login' first."))?;
+
+            println!("Exchanging token...");
+            let token_info = copilot::exchange_copilot_token(&gho_token).await?;
+            println!("Base URL: {}", token_info.base_url);
+
+            println!("Fetching models...");
+            let models = copilot::fetch_models(&token_info.token, &token_info.base_url).await?;
+            println!("\n{} models available:", models.len());
+            for model in &models {
+                println!("  - {}", model);
+            }
+        }
+
+        CopilotAction::Setup => {
+            // Step 1: Get or obtain GitHub token
+            let repo = legion_db::open_db()?;
+            let provider = repo.get_provider("github-copilot")?;
+
+            let gho_token = if let Some(ref p) = provider {
+                if let Some(ref key) = p.api_key {
+                    println!("Using existing GitHub token from DB.");
+                    key.clone()
+                } else {
+                    try_get_or_login_token().await?
+                }
+            } else {
+                try_get_or_login_token().await?
+            };
+
+            // Step 2: Exchange + fetch models
+            println!("Running full setup...");
+            let (token_info, models) = copilot::full_setup(&gho_token).await?;
+            println!("Base URL: {}", token_info.base_url);
+            println!("{} models available:", models.len());
+            for model in &models {
+                println!("  - {}", model);
+            }
+
+            // Step 3: Save to DB
+            let now = chrono::Utc::now().timestamp();
+            let provider = legion_db::Provider {
+                id: "github-copilot".into(),
+                name: "GitHub Copilot".into(),
+                base_url: token_info.base_url,
+                api_key: Some(gho_token),
+                api_format: "github_copilot".into(),
+                models: Some(models),
+                is_default: false,
+                created_at: now,
+            };
+            repo.upsert_provider(&provider)?;
+            println!("\nGitHub Copilot provider saved to DB.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Try to get token from OpenCode auth.json, or run device flow login
+async fn try_get_or_login_token() -> Result<String> {
+    use legion_core::copilot;
+
+    if let Some(token) = copilot::read_github_token_from_opencode() {
+        println!("Found GitHub token from OpenCode.");
+        return Ok(token);
+    }
+
+    println!("No token found. Starting GitHub OAuth device flow...");
+    let device = copilot::request_device_code().await?;
+    println!("\nPlease visit: {}", device.verification_uri);
+    println!("Enter code: {}\n", device.user_code);
+
+    let _ = std::process::Command::new("open")
+        .arg(&device.verification_uri)
+        .spawn();
+
+    println!("Waiting for authorization...");
+    let token = copilot::poll_for_access_token(&device.device_code, device.interval).await?;
+    println!("Authorized!");
+    Ok(token)
+}
+
 async fn cmd_squad(workers: u16, base_port: u16) -> Result<()> {
-    // Load default provider config from DB
-    let default_config = if let Ok(repo) = legion_db::open_db() {
+    // Load default provider config and per-pane saved configs from DB
+    let mut default_config = None;
+    let mut pane_configs: std::collections::HashMap<String, legion_core::ProxyConfig> =
+        std::collections::HashMap::new();
+
+    if let Ok(repo) = legion_db::open_db() {
+        // Load default provider
         if let Ok(Some(provider)) = repo.get_default_provider() {
-            Some(legion_core::ProxyConfig {
+            default_config = Some(legion_core::ProxyConfig {
                 target_url: Some(provider.base_url.clone()),
                 api_key: provider.api_key.clone(),
                 api_format: Some(provider.api_format.clone()),
                 model: provider.models.as_ref().and_then(|m| m.first().cloned()),
-            })
-        } else {
-            None
+            });
         }
-    } else {
-        None
-    };
+        // Load per-pane saved configs
+        if let Ok(saved) = repo.list_pane_configs() {
+            for pc in saved {
+                // Look up provider by ID to get full config
+                if let Ok(Some(provider)) = repo.get_provider(&pc.provider_id) {
+                    pane_configs.insert(
+                        pc.pane_label,
+                        legion_core::ProxyConfig {
+                            target_url: Some(provider.base_url.clone()),
+                            api_key: provider.api_key.clone(),
+                            api_format: Some(provider.api_format.clone()),
+                            model: pc.model,
+                        },
+                    );
+                } else if pc.provider_id == "__default__" {
+                    // Default mode: no proxy, Claude Code uses its own native auth
+                    // Don't insert into pane_configs — proxy won't be used
+                }
+            }
+        }
+    }
 
     // Port assignments:
     // Leader: proxy = base_port, control = base_port + 1000
@@ -365,10 +531,19 @@ async fn cmd_squad(workers: u16, base_port: u16) -> Result<()> {
         let proxy_port = if idx == 0 { base_port } else { base_port + idx };
         let control_port = if idx == 0 { base_port + 1000 } else { base_port + 1000 + idx };
 
+        // Determine pane label for config lookup
+        let pane_label = if idx == 0 {
+            "Leader".to_string()
+        } else {
+            format!("Worker {}", idx)
+        };
+
         let proxy = ProxyServer::new(proxy_port);
 
-        // Apply default config to each proxy
-        if let Some(ref config) = default_config {
+        // Apply per-pane saved config, falling back to default
+        if let Some(config) = pane_configs.get(&pane_label) {
+            proxy.update_config(config.clone()).await;
+        } else if let Some(ref config) = default_config {
             proxy.update_config(config.clone()).await;
         }
 
