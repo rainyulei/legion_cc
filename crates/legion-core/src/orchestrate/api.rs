@@ -13,7 +13,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
-use super::engine::{OrchestrateEngine, WorkerTaskStatus};
+use super::engine::OrchestrateEngine;
 
 /// HTTP API server that exposes the OrchestrateEngine to CLI tools.
 pub struct OrchestrateApi {
@@ -79,9 +79,9 @@ async fn handle_request(
 
     match (method, path.as_str()) {
         (Method::GET, "/legion/orchestrate/status") => handle_status(engine).await,
-        (Method::POST, "/legion/orchestrate/dispatch") => handle_dispatch(req, engine).await,
+        (Method::POST, "/legion/orchestrate/submit") => handle_submit(req, engine).await,
+        (Method::POST, "/legion/orchestrate/dispatch") => handle_dispatch_compat(req, engine).await,
         (Method::POST, "/legion/orchestrate/report") => handle_report(req, engine).await,
-        (Method::POST, "/legion/orchestrate/stop") => handle_stop(req, engine).await,
         (Method::POST, "/legion/orchestrate/stop-all") => handle_stop_all(engine).await,
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
@@ -90,16 +90,125 @@ async fn handle_request(
     }
 }
 
-/// GET /legion/orchestrate/status — return all worker states.
+/// POST /legion/orchestrate/submit — Leader submits a new ticket to the queue.
+async fn handle_submit(
+    req: Request<Incoming>,
+    engine: OrchestrateEngine,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    use http_body_util::BodyExt;
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            error!("Failed to read submit body: {}", e);
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                r#"{"error": "failed to read body"}"#,
+            ));
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct SubmitRequest {
+        ticket: String,
+        #[serde(default)]
+        team_mode: Option<super::engine::TeamMode>,
+        #[serde(default = "default_max_iter")]
+        max_iterations: u16,
+    }
+    fn default_max_iter() -> u16 {
+        5
+    }
+
+    match serde_json::from_slice::<SubmitRequest>(&body_bytes) {
+        Ok(req) => {
+            let mode = req.team_mode.unwrap_or_default();
+            let id = engine
+                .submit_ticket(req.ticket, mode, req.max_iterations)
+                .await;
+            Ok(json_response(
+                StatusCode::OK,
+                &format!(r#"{{"ticket_id": {}}}"#, id),
+            ))
+        }
+        Err(e) => {
+            error!("Invalid submit JSON: {}", e);
+            Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &format!(r#"{{"error": "{}"}}"#, e),
+            ))
+        }
+    }
+}
+
+/// Backward compat: dispatch assigns ticket to queue (ignores worker_id).
+async fn handle_dispatch_compat(
+    req: Request<Incoming>,
+    engine: OrchestrateEngine,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    use http_body_util::BodyExt;
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                r#"{"error": "bad body"}"#,
+            ))
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct DispatchRequest {
+        ticket: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        worker_id: Option<u16>,
+    }
+
+    match serde_json::from_slice::<DispatchRequest>(&body_bytes) {
+        Ok(req) => {
+            let id = engine
+                .submit_ticket(req.ticket, super::engine::TeamMode::default(), 5)
+                .await;
+            Ok(json_response(
+                StatusCode::OK,
+                &format!(
+                    r#"{{"ticket_id": {}, "status": "dispatched"}}"#,
+                    id
+                ),
+            ))
+        }
+        Err(e) => Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &format!(r#"{{"error": "{}"}}"#, e),
+        )),
+    }
+}
+
+/// GET /legion/orchestrate/status — return all ticket states and queue stats.
 async fn handle_status(engine: OrchestrateEngine) -> Result<Response<Full<Bytes>>, Infallible> {
-    let workers = engine.all_status().await;
+    let tickets = engine.all_tickets().await;
+    let (total, queued, working, done, error_count) = engine.queue_stats().await;
 
     #[derive(serde::Serialize)]
     struct StatusResponse {
-        workers: Vec<super::engine::WorkerState>,
+        tickets: Vec<super::engine::TicketSnapshot>,
+        total: usize,
+        queued: usize,
+        working: usize,
+        done: usize,
+        error: usize,
     }
 
-    let resp = StatusResponse { workers };
+    let resp = StatusResponse {
+        tickets,
+        total,
+        queued,
+        working,
+        done,
+        error: error_count,
+    };
     match serde_json::to_string(&resp) {
         Ok(json) => Ok(json_response(StatusCode::OK, &json)),
         Err(e) => {
@@ -112,49 +221,7 @@ async fn handle_status(engine: OrchestrateEngine) -> Result<Response<Full<Bytes>
     }
 }
 
-/// POST /legion/orchestrate/dispatch — assign a ticket to a worker.
-async fn handle_dispatch(
-    req: Request<Incoming>,
-    engine: OrchestrateEngine,
-) -> Result<Response<Full<Bytes>>, Infallible> {
-    use http_body_util::BodyExt;
-
-    let body_bytes = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            error!("Failed to read dispatch request body: {}", e);
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                r#"{"error": "failed to read body"}"#,
-            ));
-        }
-    };
-
-    #[derive(serde::Deserialize)]
-    struct DispatchRequest {
-        worker_id: u16,
-        ticket: String,
-    }
-
-    match serde_json::from_slice::<DispatchRequest>(&body_bytes) {
-        Ok(req) => match engine.dispatch(req.worker_id, req.ticket).await {
-            Ok(()) => Ok(json_response(StatusCode::OK, r#"{"status": "dispatched"}"#)),
-            Err(e) => Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &format!(r#"{{"error": "{}"}}"#, e),
-            )),
-        },
-        Err(e) => {
-            error!("Invalid dispatch JSON: {}", e);
-            Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &format!(r#"{{"error": "invalid json: {}"}}"#, e),
-            ))
-        }
-    }
-}
-
-/// POST /legion/orchestrate/report — worker reports completion status.
+/// POST /legion/orchestrate/report — worker reports iteration completion status.
 async fn handle_report(
     req: Request<Incoming>,
     engine: OrchestrateEngine,
@@ -164,7 +231,7 @@ async fn handle_report(
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            error!("Failed to read report request body: {}", e);
+            error!("Failed to read report body: {}", e);
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
                 r#"{"error": "failed to read body"}"#,
@@ -181,68 +248,23 @@ async fn handle_report(
 
     match serde_json::from_slice::<ReportRequest>(&body_bytes) {
         Ok(req) => {
-            let task_status = match req.status.as_str() {
-                "done" => WorkerTaskStatus::Done,
-                "error" => WorkerTaskStatus::Error,
-                other => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        &format!(r#"{{"error": "invalid status: {}"}}"#, other),
-                    ));
-                }
-            };
-
-            match engine.report(req.worker_id, task_status, req.summary).await {
-                Ok(()) => Ok(json_response(StatusCode::OK, r#"{"status": "ok"}"#)),
-                Err(e) => Ok(json_response(
+            let success = req.status == "done";
+            if let Some(ticket) = engine.worker_ticket(req.worker_id).await {
+                let _should_retry =
+                    engine.report_iteration(ticket.id, success, req.summary).await;
+                Ok(json_response(StatusCode::OK, r#"{"status": "ok"}"#))
+            } else {
+                Ok(json_response(
                     StatusCode::BAD_REQUEST,
-                    &format!(r#"{{"error": "{}"}}"#, e),
-                )),
+                    r#"{"error": "worker has no active ticket"}"#,
+                ))
             }
         }
         Err(e) => {
             error!("Invalid report JSON: {}", e);
             Ok(json_response(
                 StatusCode::BAD_REQUEST,
-                &format!(r#"{{"error": "invalid json: {}"}}"#, e),
-            ))
-        }
-    }
-}
-
-/// POST /legion/orchestrate/stop — stop a single worker.
-async fn handle_stop(
-    req: Request<Incoming>,
-    engine: OrchestrateEngine,
-) -> Result<Response<Full<Bytes>>, Infallible> {
-    use http_body_util::BodyExt;
-
-    let body_bytes = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            error!("Failed to read stop request body: {}", e);
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                r#"{"error": "failed to read body"}"#,
-            ));
-        }
-    };
-
-    #[derive(serde::Deserialize)]
-    struct StopRequest {
-        worker_id: u16,
-    }
-
-    match serde_json::from_slice::<StopRequest>(&body_bytes) {
-        Ok(req) => {
-            engine.stop_worker(req.worker_id).await;
-            Ok(json_response(StatusCode::OK, r#"{"status": "stopped"}"#))
-        }
-        Err(e) => {
-            error!("Invalid stop JSON: {}", e);
-            Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &format!(r#"{{"error": "invalid json: {}"}}"#, e),
+                &format!(r#"{{"error": "{}"}}"#, e),
             ))
         }
     }
