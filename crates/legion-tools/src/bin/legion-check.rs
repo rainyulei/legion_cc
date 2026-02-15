@@ -1,7 +1,7 @@
-//! legion-check — Leader views all Worker status
+//! legion-check — View ticket queue status
 //!
 //! Usage: legion-check
-//! GETs /legion/orchestrate/status and pretty-prints a status board.
+//! GETs /legion/orchestrate/status and pretty-prints the ticket queue.
 
 use std::env;
 use std::process;
@@ -44,73 +44,99 @@ fn main() {
         }
     };
 
-    let workers = match parsed.get("workers").and_then(|w| w.as_array()) {
-        Some(w) => w,
+    // Extract queue stats
+    let total = parsed.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let queued = parsed.get("queued").and_then(|v| v.as_u64()).unwrap_or(0);
+    let working = parsed.get("working").and_then(|v| v.as_u64()).unwrap_or(0);
+    let done = parsed.get("done").and_then(|v| v.as_u64()).unwrap_or(0);
+    let error = parsed.get("error").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    println!("=== Ticket Queue ===");
+    println!(
+        "Total: {}  |  Queued: {}  |  Working: {}  |  Done: {}  |  Error: {}",
+        total, queued, working, done, error
+    );
+    println!();
+
+    let tickets = match parsed.get("tickets").and_then(|t| t.as_array()) {
+        Some(t) => t,
         None => {
-            eprintln!("Error: unexpected response format");
-            process::exit(1);
+            // No tickets array — maybe empty queue
+            println!("No tickets.");
+            return;
         }
     };
 
-    let mut completed = 0u32;
-    let total = workers.len() as u32;
+    if tickets.is_empty() {
+        println!("No tickets.");
+        return;
+    }
 
-    println!("=== Squad Status ===");
+    // Group tickets by status
+    let status_order = ["queued", "working", "done", "error"];
 
-    for w in workers {
-        let id = w.get("worker_id").and_then(|v| v.as_u64()).unwrap_or(0);
-        let status_str = w
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let ticket = w
-            .get("ticket")
-            .and_then(|v| v.as_str())
-            .unwrap_or("-");
-        let elapsed = w.get("elapsed_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+    for &group in &status_order {
+        let group_tickets: Vec<&serde_json::Value> = tickets
+            .iter()
+            .filter(|t| {
+                t.get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    == group
+            })
+            .collect();
 
-        let badge = match status_str {
-            "done" => {
-                completed += 1;
-                "OK"
-            }
+        if group_tickets.is_empty() {
+            continue;
+        }
+
+        let badge = match group {
+            "queued" => "QUEUED",
             "working" => "WORKING",
-            "pending" => "PENDING",
-            "error" => {
-                completed += 1;
-                "ERROR"
-            }
-            "stopped" => "STOPPED",
-            "idle" => "IDLE",
+            "done" => "DONE",
+            "error" => "ERROR",
             other => other,
         };
 
-        let display_ticket = if ticket == "-" || ticket.is_empty() {
-            "-".to_string()
-        } else if ticket.len() > 40 {
-            format!("{}...", &ticket[..37])
-        } else {
-            ticket.to_string()
-        };
+        println!("--- {} ({}) ---", badge, group_tickets.len());
 
-        println!(
-            "  Worker {}: [{}] \"{}\" ({}s)",
-            id, badge, display_ticket, elapsed
-        );
+        for t in &group_tickets {
+            let ticket_id = t
+                .get("ticket_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let ticket_text = t
+                .get("ticket")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            let worker = t.get("worker_id").and_then(|v| v.as_u64());
+            let elapsed = t.get("elapsed_secs").and_then(|v| v.as_u64()).unwrap_or(0);
 
-        // Show summary if available
-        if let Some(summary) = w.get("summary").and_then(|v| v.as_str()) {
-            if !summary.is_empty() {
-                println!("           Summary: {}", summary);
+            let display_ticket = if ticket_text.chars().count() > 50 {
+                let truncated: String = ticket_text.chars().take(47).collect();
+                format!("{}...", truncated)
+            } else {
+                ticket_text.to_string()
+            };
+
+            let worker_str = match worker {
+                Some(w) => format!(" worker={}", w),
+                None => String::new(),
+            };
+
+            println!(
+                "  [{}] \"{}\"{}  ({}s)",
+                ticket_id, display_ticket, worker_str, elapsed
+            );
+
+            // Show summary if available
+            if let Some(summary) = t.get("summary").and_then(|v| v.as_str()) {
+                if !summary.is_empty() {
+                    println!("         Summary: {}", summary);
+                }
             }
         }
 
-        // Show result file if available
-        let result_path = format!("/tmp/legion/results/worker-{}.md", id);
-        if std::path::Path::new(&result_path).exists() {
-            println!("           Result: {}", result_path);
-        }
+        println!();
     }
-
-    println!("Completed: {}/{}", completed, total);
 }

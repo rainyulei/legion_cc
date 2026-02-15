@@ -1,7 +1,8 @@
-//! legion-dispatch — Leader sends task to Worker
+//! legion-dispatch — Submit a ticket to the orchestrate queue
 //!
 //! Usage: legion-dispatch <worker_id> "ticket text"
-//! POSTs to /legion/orchestrate/dispatch with {"worker_id": N, "ticket": "..."}
+//! POSTs to /legion/orchestrate/submit with {"ticket": "...", "team_mode": "tech_lead_team"}
+//! (worker_id is kept for CLI compat but ignored by queue)
 
 use std::env;
 use std::process;
@@ -32,11 +33,11 @@ fn main() {
     let ticket = args[2..].join(" ");
 
     let port = get_orchestrate_port();
-    let url = format!("http://127.0.0.1:{}/legion/orchestrate/dispatch", port);
+    let url = format!("http://127.0.0.1:{}/legion/orchestrate/submit", port);
 
     let body = serde_json::json!({
-        "worker_id": worker_id,
         "ticket": ticket,
+        "team_mode": "tech_lead_team",
     });
 
     match ureq::post(&url)
@@ -51,7 +52,13 @@ fn main() {
                 .unwrap_or_default();
 
             if status.is_success() {
-                println!("Dispatched to worker {}: {}", worker_id, ticket);
+                println!("Submitted ticket (via worker_id {}): {}", worker_id, ticket);
+                // Print ticket ID if returned
+                if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&body_str) {
+                    if let Some(id) = resp.get("ticket_id").and_then(|v| v.as_str()) {
+                        println!("Ticket ID: {}", id);
+                    }
+                }
             } else {
                 eprintln!("Error (HTTP {}): {}", status.as_u16(), body_str);
                 process::exit(1);
