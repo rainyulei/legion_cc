@@ -32,6 +32,9 @@ pub enum PopupMenu {
     ConnectProvider,
     ProviderApiKeyInput,
     MaxRetries,
+    RetryForm,
+    DeleteConfirm,
+    ClearConfirm,
 }
 
 /// Which column is active in the matrix view
@@ -245,6 +248,14 @@ pub struct App {
     pub connect_provider_index: usize,       // selected template index
     pub api_key_input: String,               // text input buffer for API key
     pub default_max_iterations: u16,         // default retry count for new tickets
+
+    // Retry form state
+    pub retry_target_id: usize,
+    pub retry_form_fields: [String; 4],      // [prompt, context, criteria, feedback]
+    pub retry_form_focus: u8,                // 0-3 for which field is focused
+
+    // Delete confirm state
+    pub delete_confirm_id: usize,
 }
 
 impl App {
@@ -294,6 +305,10 @@ impl App {
             connect_provider_index: 0,
             api_key_input: String::new(),
             default_max_iterations: 5,
+            retry_target_id: 0,
+            retry_form_fields: [String::new(), String::new(), String::new(), String::new()],
+            retry_form_focus: 0,
+            delete_confirm_id: 0,
         }
     }
 
@@ -1232,12 +1247,18 @@ impl App {
 
         let wd = working_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        // Per-ticket log buffer: reuse for retry iterations, create new for new ticket
-        let existing_log = if iteration > 1 {
-            self.ticket_logs.get(&ticket_id).cloned()
-        } else {
-            None
-        };
+        // Per-ticket log buffer: reuse for retry iterations (and retries), create new for fresh ticket
+        let existing_log = self.ticket_logs.get(&ticket_id).cloned();
+        // If we have existing log and starting a fresh run (iteration 1), add retry separator
+        if iteration == 1 {
+            if let Some(ref buf) = existing_log {
+                if let Ok(mut logs) = buf.lock() {
+                    if !logs.is_empty() {
+                        logs.push(format!("\n--- Retry ---\n"));
+                    }
+                }
+            }
+        }
 
         match crate::sdk::SdkHandle::spawn(
             &wd, &structured_prompt, parser.clone(), use_proxy, proxy_port,

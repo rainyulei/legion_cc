@@ -370,7 +370,14 @@ impl OrchestrateEngine {
     }
 
     /// Retry a failed ticket: reset Error → Queued for re-execution
-    pub async fn retry_ticket(&self, ticket_id: usize) -> bool {
+    /// Retry a failed ticket, optionally updating its fields.
+    pub async fn retry_ticket(
+        &self, ticket_id: usize,
+        new_prompt: Option<String>,
+        new_context: Option<Option<String>>,
+        new_criteria: Option<Option<String>>,
+        feedback: Option<String>,
+    ) -> bool {
         let mut guard = self.inner.write().await;
         let ticket = match guard.tickets.iter_mut().find(|t| t.id == ticket_id) {
             Some(t) => t,
@@ -379,10 +386,19 @@ impl OrchestrateEngine {
         if ticket.status != TicketStatus::Error {
             return false;
         }
+        if let Some(p) = new_prompt {
+            ticket.prompt = p;
+        }
+        if let Some(c) = new_context {
+            ticket.context = c;
+        }
+        if let Some(k) = new_criteria {
+            ticket.criteria = k;
+        }
+        ticket.feedback = feedback;
         ticket.status = TicketStatus::Queued;
         ticket.assigned_worker = None;
         ticket.iteration = 0;
-        ticket.feedback = None;
         ticket.summary = None;
         ticket.started_at = None;
         let snap = ticket.clone();

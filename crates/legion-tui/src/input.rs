@@ -68,47 +68,43 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
                 return InputResult::Continue;
             }
             KeyCode::Char('r') => {
-                // Retry selected Error ticket
-                if let Some(engine) = app.orchestrate.clone() {
-                    let selected = app.board_selected;
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            if engine.retry_ticket(selected).await {
-                                app.ticket_logs.remove(&selected);
-                                tracing::info!("Retrying ticket {}", selected);
-                            }
-                        });
-                    });
+                // Open retry form for selected Error ticket
+                if let Some(ref tickets) = app.ticket_snapshot {
+                    if let Some(t) = tickets.iter().find(|t| t.id == app.board_selected) {
+                        if t.status == legion_core::orchestrate::engine::TicketStatus::Error {
+                            app.retry_target_id = t.id;
+                            app.retry_form_fields = [
+                                t.prompt.clone(),
+                                t.context.clone().unwrap_or_default(),
+                                t.criteria.clone().unwrap_or_default(),
+                                String::new(), // feedback
+                            ];
+                            app.retry_form_focus = 3; // default focus on feedback
+                            app.mode = AppMode::Popup(PopupMenu::RetryForm);
+                        }
+                    }
                 }
                 return InputResult::Continue;
             }
             KeyCode::Char('d') => {
-                // Delete selected Done/Error ticket
-                if let Some(engine) = app.orchestrate.clone() {
-                    let selected = app.board_selected;
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            if engine.delete_ticket(selected).await {
-                                app.ticket_logs.remove(&selected);
-                                tracing::info!("Deleted ticket {}", selected);
-                            }
-                        });
-                    });
+                // Open delete confirm for selected Done/Error ticket
+                if let Some(ref tickets) = app.ticket_snapshot {
+                    if let Some(t) = tickets.iter().find(|t| t.id == app.board_selected) {
+                        if matches!(t.status, legion_core::orchestrate::engine::TicketStatus::Done | legion_core::orchestrate::engine::TicketStatus::Error) {
+                            app.delete_confirm_id = t.id;
+                            app.mode = AppMode::Popup(PopupMenu::DeleteConfirm);
+                        }
+                    }
                 }
                 return InputResult::Continue;
             }
             KeyCode::Char('D') => {
-                // Clear all Done+Error tickets
-                if let Some(engine) = app.orchestrate.clone() {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            let removed = engine.clear_completed().await;
-                            for id in &removed {
-                                app.ticket_logs.remove(id);
-                            }
-                            tracing::info!("Cleared {} completed tickets", removed.len());
-                        });
-                    });
+                // Open clear confirm popup
+                if let Some(ref tickets) = app.ticket_snapshot {
+                    let has_completed = tickets.iter().any(|t| matches!(t.status, legion_core::orchestrate::engine::TicketStatus::Done | legion_core::orchestrate::engine::TicketStatus::Error));
+                    if has_completed {
+                        app.mode = AppMode::Popup(PopupMenu::ClearConfirm);
+                    }
                 }
                 return InputResult::Continue;
             }
@@ -241,6 +237,9 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::ConnectProvider) => handle_connect_provider_keys(app, key),
         AppMode::Popup(PopupMenu::ProviderApiKeyInput) => handle_api_key_input_keys(app, key),
         AppMode::Popup(PopupMenu::MaxRetries) => handle_max_retries_keys(app, key),
+        AppMode::Popup(PopupMenu::RetryForm) => handle_retry_form_keys(app, key),
+        AppMode::Popup(PopupMenu::DeleteConfirm) => handle_delete_confirm_keys(app, key),
+        AppMode::Popup(PopupMenu::ClearConfirm) => handle_clear_confirm_keys(app, key),
         _ => {}
     }
 
@@ -615,6 +614,94 @@ fn save_pane_configs(app: &App) {
 }
 
 /// Convert crossterm KeyEvent to PTY-compatible bytes
+fn handle_retry_form_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Tab => {
+            app.retry_form_focus = (app.retry_form_focus + 1) % 4;
+        }
+        KeyCode::BackTab => {
+            app.retry_form_focus = if app.retry_form_focus == 0 { 3 } else { app.retry_form_focus - 1 };
+        }
+        KeyCode::Enter => {
+            // Submit retry
+            if let Some(engine) = app.orchestrate.clone() {
+                let tid = app.retry_target_id;
+                let new_prompt = Some(app.retry_form_fields[0].clone());
+                let new_context = Some(if app.retry_form_fields[1].is_empty() { None } else { Some(app.retry_form_fields[1].clone()) });
+                let new_criteria = Some(if app.retry_form_fields[2].is_empty() { None } else { Some(app.retry_form_fields[2].clone()) });
+                let feedback = if app.retry_form_fields[3].is_empty() { None } else { Some(app.retry_form_fields[3].clone()) };
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        if engine.retry_ticket(tid, new_prompt, new_context, new_criteria, feedback).await {
+                            // Don't remove ticket_logs — preserve old logs, new ones will append
+                            tracing::info!("Retrying ticket {} with updated fields", tid);
+                        }
+                    });
+                });
+            }
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Backspace => {
+            let idx = app.retry_form_focus as usize;
+            app.retry_form_fields[idx].pop();
+        }
+        KeyCode::Char(c) => {
+            let idx = app.retry_form_focus as usize;
+            app.retry_form_fields[idx].push(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_delete_confirm_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Enter | KeyCode::Char('y') => {
+            if let Some(engine) = app.orchestrate.clone() {
+                let tid = app.delete_confirm_id;
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        if engine.delete_ticket(tid).await {
+                            app.ticket_logs.remove(&tid);
+                            tracing::info!("Deleted ticket {}", tid);
+                        }
+                    });
+                });
+            }
+            app.mode = AppMode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn handle_clear_confirm_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Enter | KeyCode::Char('y') => {
+            if let Some(engine) = app.orchestrate.clone() {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let removed = engine.clear_completed().await;
+                        for id in &removed {
+                            app.ticket_logs.remove(id);
+                        }
+                        tracing::info!("Cleared {} completed tickets", removed.len());
+                    });
+                });
+            }
+            app.mode = AppMode::Normal;
+        }
+        _ => {}
+    }
+}
+
 fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 

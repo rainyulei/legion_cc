@@ -693,7 +693,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 // --- Popup overlay ---
 
 fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
-    let area = centered_rect(60, 60, frame.area());
+    let (pw, ph) = match menu {
+        PopupMenu::RetryForm => (70, 80),
+        PopupMenu::DeleteConfirm | PopupMenu::ClearConfirm => (50, 30),
+        _ => (60, 60),
+    };
+    let area = centered_rect(pw, ph, frame.area());
     frame.render_widget(Clear, area);
 
     match menu {
@@ -709,6 +714,9 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::ConnectProvider => draw_connect_provider(frame, app, area),
         PopupMenu::ProviderApiKeyInput => draw_api_key_input(frame, app, area),
         PopupMenu::MaxRetries => draw_max_retries(frame, app, area),
+        PopupMenu::RetryForm => draw_retry_form(frame, app, area),
+        PopupMenu::DeleteConfirm => draw_delete_confirm(frame, app, area),
+        PopupMenu::ClearConfirm => draw_clear_confirm(frame, app, area),
     }
 }
 
@@ -1327,4 +1335,135 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(v[1])[1]
+}
+
+fn draw_retry_form(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(format!(" Retry Ticket #{} [ESC] ", app.retry_target_id))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let field_labels = ["Prompt", "Context", "Criteria", "Feedback"];
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (i, label) in field_labels.iter().enumerate() {
+        let is_focused = app.retry_form_focus as usize == i;
+        let label_style = if is_focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {}:", label),
+            label_style,
+        )));
+
+        // Show field value (truncated to fit) with cursor if focused
+        let val = &app.retry_form_fields[i];
+        let max_width = inner.width.saturating_sub(6) as usize;
+        let display = if val.len() > max_width {
+            format!("...{}", &val[val.len() - max_width + 3..])
+        } else {
+            val.clone()
+        };
+        let field_text = if is_focused {
+            format!("  {}\u{2588}", display)
+        } else {
+            format!("  {}", display)
+        };
+        let border_style = if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        lines.push(Line::from(Span::styled(field_text, border_style)));
+        lines.push(Line::from(Span::raw("")));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("  [Tab]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Switch  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Confirm  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+}
+
+fn draw_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let title = app.ticket_snapshot.as_ref()
+        .and_then(|ts| ts.iter().find(|t| t.id == app.delete_confirm_id))
+        .map(|t| t.title.clone())
+        .unwrap_or_else(|| format!("#{}", app.delete_confirm_id));
+
+    let block = Block::default()
+        .title(format!(" Delete Ticket #{} ", app.delete_confirm_id))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(Span::raw("")),
+        Line::from(Span::styled(
+            format!("  Delete \"{}\" ?", truncate_str(&title, inner.width.saturating_sub(14) as usize)),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled("  [Enter/y]", Style::default().fg(Color::Yellow)),
+            Span::styled(" Confirm  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
+            Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_clear_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let count = app.ticket_snapshot.as_ref()
+        .map(|ts| ts.iter().filter(|t| matches!(t.status, legion_core::orchestrate::engine::TicketStatus::Done | legion_core::orchestrate::engine::TicketStatus::Error)).count())
+        .unwrap_or(0);
+
+    let block = Block::default()
+        .title(" Clear Completed ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(Span::raw("")),
+        Line::from(Span::styled(
+            format!("  Clear {} completed/failed ticket{} ?", count, if count == 1 { "" } else { "s" }),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled("  [Enter/y]", Style::default().fg(Color::Yellow)),
+            Span::styled(" Confirm  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
+            Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max.saturating_sub(3)])
+    }
 }
