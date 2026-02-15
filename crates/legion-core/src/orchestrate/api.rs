@@ -118,18 +118,19 @@ async fn handle_submit(
         criteria: Option<String>,
         #[serde(default)]
         team_mode: Option<super::engine::TeamMode>,
-        #[serde(default = "default_max_iter")]
-        max_iterations: u16,
-    }
-    fn default_max_iter() -> u16 {
-        5
+        #[serde(default)]
+        max_iterations: Option<u16>,
     }
 
     match serde_json::from_slice::<SubmitRequest>(&body_bytes) {
         Ok(req) => {
             let mode = req.team_mode.unwrap_or_default();
+            let max_iter = match req.max_iterations {
+                Some(n) if n > 0 => n,
+                _ => engine.default_max_iterations().await,
+            };
             let id = engine
-                .submit_ticket(req.title, req.ticket, req.context, req.criteria, mode, req.max_iterations)
+                .submit_ticket(req.title, req.ticket, req.context, req.criteria, mode, max_iter)
                 .await;
             Ok(json_response(
                 StatusCode::OK,

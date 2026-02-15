@@ -166,6 +166,14 @@ async fn run_event_loop(
             handle_add_worker(app).await;
         }
 
+        // Sync max iterations to engine
+        if app.pending_sync_max_iterations {
+            app.pending_sync_max_iterations = false;
+            if let Some(ref engine) = app.orchestrate {
+                engine.set_default_max_iterations(app.default_max_iterations).await;
+            }
+        }
+
         // Handle pending remove worker
         if let Some((pane_index, strategy)) = app.pending_remove_worker.take() {
             match app.remove_single_worker(pane_index, &strategy) {

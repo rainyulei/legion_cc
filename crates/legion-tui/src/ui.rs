@@ -706,6 +706,9 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::NewSessionInput => draw_new_session_input(frame, app, area),
         PopupMenu::RemoveWorkerList => draw_remove_worker_list(frame, app, area),
         PopupMenu::RemoveWorkerConfirm => draw_remove_worker_confirm(frame, app, area),
+        PopupMenu::ConnectProvider => draw_connect_provider(frame, app, area),
+        PopupMenu::ProviderApiKeyInput => draw_api_key_input(frame, app, area),
+        PopupMenu::MaxRetries => draw_max_retries(frame, app, area),
     }
 }
 
@@ -738,6 +741,13 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 MainMenuItem::SwitchSession => {
                     format!("[{}]", app.session_name())
+                }
+                MainMenuItem::ConnectProvider => {
+                    let connected = app.providers.len();
+                    format!("[{} connected]", connected)
+                }
+                MainMenuItem::MaxRetries => {
+                    format!("[{}]", app.default_max_iterations)
                 }
                 MainMenuItem::CompleteSession => String::new(),
                 MainMenuItem::Quit => String::new(),
@@ -1169,6 +1179,137 @@ fn format_elapsed(secs: u64) -> String {
 }
 
 /// Centered rectangle helper
+fn draw_connect_provider(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::app::PROVIDER_TEMPLATES;
+    let block = Block::default()
+        .title(" Connect Provider [ESC] ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let items: Vec<ListItem> = PROVIDER_TEMPLATES
+        .iter()
+        .enumerate()
+        .map(|(i, tmpl)| {
+            let selected = i == app.connect_provider_index;
+            let prefix = if selected { "> " } else { "  " };
+            let connected = app.is_provider_connected(tmpl.id);
+            let badge = if connected { " \u{25cf}" } else { "" }; // ● dot
+
+            let style = if selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else if connected {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{}{}", prefix, tmpl.name), style),
+                Span::styled(badge, Style::default().fg(Color::Green)),
+                Span::styled(format!("  {}", tmpl.api_format), Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items).block(block);
+    frame.render_widget(list, area);
+}
+
+fn draw_api_key_input(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::app::PROVIDER_TEMPLATES;
+    let tmpl = &PROVIDER_TEMPLATES[app.connect_provider_index];
+
+    let block = Block::default()
+        .title(format!(" {} - API Key [ESC] ", tmpl.name))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("  Provider: {}", tmpl.name),
+        Style::default().fg(Color::White),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  Base URL: {}", tmpl.base_url),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  Format:   {}", tmpl.api_format),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  Env var:  ${}", tmpl.env_var),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(Span::styled(
+        "  API Key:",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+
+    // Show masked key with cursor
+    let masked: String = if app.api_key_input.is_empty() {
+        "\u{2588}".to_string() // block cursor
+    } else {
+        let visible_len = app.api_key_input.len().min(4);
+        let masked_len = app.api_key_input.len().saturating_sub(4);
+        format!("{}{}\u{2588}",
+            "\u{2022}".repeat(masked_len), // bullets
+            &app.api_key_input[masked_len..masked_len + visible_len], // last 4 chars visible
+        )
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  {}", masked),
+        Style::default().fg(Color::Yellow),
+    )));
+
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(Span::styled(
+        "  [Enter] Save  [Esc] Cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_max_retries(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(format!(" Max Retries (current: {}) [ESC] ", app.default_max_iterations))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let items: Vec<ListItem> = (1..=10)
+        .map(|n| {
+            let selected = app.submenu_index == (n - 1);
+            let is_current = n as u16 == app.default_max_iterations;
+            let prefix = if selected { "> " } else { "  " };
+            let badge = if is_current { " \u{25cf}" } else { "" };
+
+            let style = if selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else if is_current {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{}{} retries", prefix, n), style),
+                Span::styled(badge, Style::default().fg(Color::Green)),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items).block(block);
+    frame.render_widget(list, area);
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let v = Layout::default()
         .direction(Direction::Vertical)

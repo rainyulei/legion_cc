@@ -238,6 +238,9 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::NewSessionInput) => handle_new_session_input_keys(app, key),
         AppMode::Popup(PopupMenu::RemoveWorkerList) => handle_remove_worker_list_keys(app, key),
         AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => handle_remove_worker_confirm_keys(app, key),
+        AppMode::Popup(PopupMenu::ConnectProvider) => handle_connect_provider_keys(app, key),
+        AppMode::Popup(PopupMenu::ProviderApiKeyInput) => handle_api_key_input_keys(app, key),
+        AppMode::Popup(PopupMenu::MaxRetries) => handle_max_retries_keys(app, key),
         _ => {}
     }
 
@@ -429,6 +432,82 @@ fn handle_remove_worker_confirm_keys(app: &mut App, key: KeyEvent) {
             let pane_index = app.remove_worker_target + 1;
             app.pending_remove_worker = Some((pane_index, strategy.to_string()));
             app.mode = AppMode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn handle_connect_provider_keys(app: &mut App, key: KeyEvent) {
+    let template_count = crate::app::PROVIDER_TEMPLATES.len();
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Popup(PopupMenu::Main);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.connect_provider_index > 0 {
+                app.connect_provider_index -= 1;
+            } else {
+                app.connect_provider_index = template_count.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.connect_provider_index = (app.connect_provider_index + 1) % template_count;
+        }
+        KeyCode::Enter => {
+            // Enter API key input for selected template
+            let tmpl = &crate::app::PROVIDER_TEMPLATES[app.connect_provider_index];
+            // Pre-fill from env var if available
+            app.api_key_input = std::env::var(tmpl.env_var).unwrap_or_default();
+            app.mode = AppMode::Popup(PopupMenu::ProviderApiKeyInput);
+        }
+        _ => {}
+    }
+}
+
+fn handle_api_key_input_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.api_key_input.clear();
+            app.mode = AppMode::Popup(PopupMenu::ConnectProvider);
+        }
+        KeyCode::Enter => {
+            // Save provider with API key
+            let idx = app.connect_provider_index;
+            let key_text = app.api_key_input.clone();
+            app.save_provider_from_template(idx, &key_text);
+            app.api_key_input.clear();
+            app.mode = AppMode::Popup(PopupMenu::ConnectProvider);
+        }
+        KeyCode::Backspace => {
+            app.api_key_input.pop();
+        }
+        KeyCode::Char(c) => {
+            app.api_key_input.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_max_retries_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Popup(PopupMenu::Main);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.submenu_index > 0 {
+                app.submenu_index -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.submenu_index < 9 {
+                app.submenu_index += 1;
+            }
+        }
+        KeyCode::Enter => {
+            app.default_max_iterations = (app.submenu_index as u16) + 1;
+            app.pending_sync_max_iterations = true;
+            app.mode = AppMode::Popup(PopupMenu::Main);
+            tracing::info!("Max retries set to {}", app.default_max_iterations);
         }
         _ => {}
     }

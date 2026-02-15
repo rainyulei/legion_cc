@@ -29,6 +29,9 @@ pub enum PopupMenu {
     NewSessionInput,
     RemoveWorkerList,
     RemoveWorkerConfirm,
+    ConnectProvider,
+    ProviderApiKeyInput,
+    MaxRetries,
 }
 
 /// Which column is active in the matrix view
@@ -50,6 +53,8 @@ pub enum ModelTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainMenuItem {
     SwitchModels,
+    ConnectProvider,
+    MaxRetries,
     AddWorker,
     RemoveWorker,
     SwitchSession,
@@ -61,6 +66,8 @@ impl MainMenuItem {
     pub fn label(&self) -> &'static str {
         match self {
             Self::SwitchModels => "Switch Models",
+            Self::ConnectProvider => "Connect Provider",
+            Self::MaxRetries => "Max Retries",
             Self::AddWorker => "Add Worker",
             Self::RemoveWorker => "Remove Worker",
             Self::SwitchSession => "Switch Session",
@@ -69,6 +76,68 @@ impl MainMenuItem {
         }
     }
 }
+
+/// Predefined provider templates
+#[derive(Debug, Clone)]
+pub struct ProviderTemplate {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub base_url: &'static str,
+    pub api_format: &'static str,
+    pub models: &'static [&'static str],
+    pub env_var: &'static str,
+}
+
+pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
+    ProviderTemplate {
+        id: "anthropic",
+        name: "Anthropic",
+        base_url: "https://api.anthropic.com",
+        api_format: "anthropic",
+        models: &["claude-opus-4-6", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"],
+        env_var: "ANTHROPIC_API_KEY",
+    },
+    ProviderTemplate {
+        id: "openai",
+        name: "OpenAI",
+        base_url: "https://api.openai.com/v1",
+        api_format: "openai_chat",
+        models: &["gpt-4o", "gpt-4o-mini", "o3", "o3-mini"],
+        env_var: "OPENAI_API_KEY",
+    },
+    ProviderTemplate {
+        id: "github_copilot",
+        name: "GitHub Copilot",
+        base_url: "https://api.githubcopilot.com",
+        api_format: "anthropic_bearer",
+        models: &["claude-sonnet-4-5-20250929", "claude-opus-4-6", "gpt-4o"],
+        env_var: "GITHUB_TOKEN",
+    },
+    ProviderTemplate {
+        id: "openrouter",
+        name: "OpenRouter",
+        base_url: "https://openrouter.ai/api/v1",
+        api_format: "openai_chat",
+        models: &["anthropic/claude-opus-4-6", "openai/gpt-4o", "google/gemini-2.5-pro"],
+        env_var: "OPENROUTER_API_KEY",
+    },
+    ProviderTemplate {
+        id: "google_gemini",
+        name: "Google Gemini",
+        base_url: "https://generativelanguage.googleapis.com/v1beta",
+        api_format: "openai_chat",
+        models: &["gemini-2.5-pro", "gemini-2.5-flash"],
+        env_var: "GOOGLE_API_KEY",
+    },
+    ProviderTemplate {
+        id: "deepseek",
+        name: "DeepSeek",
+        base_url: "https://api.deepseek.com/v1",
+        api_format: "openai_chat",
+        models: &["deepseek-chat", "deepseek-reasoner"],
+        env_var: "DEEPSEEK_API_KEY",
+    },
+];
 
 /// Maximum number of workers (not including leader)
 pub const MAX_WORKERS: u16 = 8;
@@ -155,6 +224,7 @@ pub struct App {
 
     // Dynamic worker management
     pub pending_add_worker: bool,
+    pub pending_sync_max_iterations: bool,
     pub pending_remove_worker: Option<(usize, String)>, // (pane index, strategy: "merge"/"keep"/"discard")
     pub next_worker_id: u16,
     pub remove_worker_target: usize,
@@ -170,6 +240,11 @@ pub struct App {
 
     // Per-ticket log buffers (ticket_id → log lines)
     pub ticket_logs: HashMap<usize, std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+
+    // Connect Provider state
+    pub connect_provider_index: usize,       // selected template index
+    pub api_key_input: String,               // text input buffer for API key
+    pub default_max_iterations: u16,         // default retry count for new tickets
 }
 
 impl App {
@@ -206,6 +281,7 @@ impl App {
             requested_workers: 0,
             pending_orchestrate_port: None,
             pending_add_worker: false,
+            pending_sync_max_iterations: false,
             pending_remove_worker: None,
             next_worker_id: 1,
             remove_worker_target: 0,
@@ -215,6 +291,9 @@ impl App {
             board_detail_open: false,
             board_detail_scroll: 0,
             ticket_logs: HashMap::new(),
+            connect_provider_index: 0,
+            api_key_input: String::new(),
+            default_max_iterations: 5,
         }
     }
 
@@ -438,6 +517,36 @@ impl App {
     /// Get saved pane config for a given label (provider_id, model)
     pub fn get_saved_pane_config(&self, label: &str) -> Option<&(String, Option<String>)> {
         self.saved_pane_configs.get(label)
+    }
+
+    /// Save a provider from template + API key to DB, then reload providers
+    pub fn save_provider_from_template(&mut self, template_index: usize, api_key: &str) {
+        if template_index >= PROVIDER_TEMPLATES.len() { return; }
+        let tmpl = &PROVIDER_TEMPLATES[template_index];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let provider = Provider {
+            id: tmpl.id.to_string(),
+            name: tmpl.name.to_string(),
+            base_url: tmpl.base_url.to_string(),
+            api_key: if api_key.is_empty() { None } else { Some(api_key.to_string()) },
+            api_format: tmpl.api_format.to_string(),
+            models: Some(tmpl.models.iter().map(|m| m.to_string()).collect()),
+            is_default: false,
+            created_at: now,
+        };
+        if let Ok(repo) = legion_db::open_db() {
+            let _ = repo.upsert_provider(&provider);
+        }
+        // Reload providers
+        self.load_from_db();
+    }
+
+    /// Check if a provider template is already connected (exists in providers list)
+    pub fn is_provider_connected(&self, template_id: &str) -> bool {
+        self.providers.iter().any(|p| p.id == template_id)
     }
 
     /// Check if a pane (by label) should use the proxy, or Default (no proxy) mode
@@ -758,8 +867,9 @@ impl App {
     // --- Menu navigation ---
 
     pub fn main_menu_items(&self) -> Vec<MainMenuItem> {
-        let mut items = vec![MainMenuItem::SwitchModels];
+        let mut items = vec![MainMenuItem::SwitchModels, MainMenuItem::ConnectProvider];
         if self.is_squad() {
+            items.push(MainMenuItem::MaxRetries);
             let wc = self.panes.len().saturating_sub(1) as u16;
             if wc < MAX_WORKERS {
                 items.push(MainMenuItem::AddWorker);
@@ -803,6 +913,14 @@ impl App {
                         self.mode = AppMode::Popup(PopupMenu::Matrix);
                         self.matrix_row = 0;
                         self.matrix_col = MatrixCol::Provider;
+                    }
+                    MainMenuItem::ConnectProvider => {
+                        self.connect_provider_index = 0;
+                        self.mode = AppMode::Popup(PopupMenu::ConnectProvider);
+                    }
+                    MainMenuItem::MaxRetries => {
+                        self.submenu_index = (self.default_max_iterations as usize).saturating_sub(1);
+                        self.mode = AppMode::Popup(PopupMenu::MaxRetries);
                     }
                     MainMenuItem::AddWorker => {
                         self.pending_add_worker = true;

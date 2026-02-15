@@ -75,6 +75,7 @@ struct EngineInner {
     tickets: Vec<TaskTicket>,
     next_ticket_id: usize,
     worker_count: u16,
+    default_max_iterations: u16,
 }
 
 /// Thread-safe orchestration engine that tracks a shared task queue.
@@ -94,10 +95,19 @@ impl OrchestrateEngine {
                 tickets: Vec::new(),
                 next_ticket_id: 1,
                 worker_count,
+                default_max_iterations: 5,
             })),
             db: None,
             session_name: None,
         }
+    }
+
+    pub async fn set_default_max_iterations(&self, n: u16) {
+        self.inner.write().await.default_max_iterations = n;
+    }
+
+    pub async fn default_max_iterations(&self) -> u16 {
+        self.inner.read().await.default_max_iterations
     }
 
     pub fn with_db(worker_count: u16, repo: Arc<Mutex<Repository>>, session_name: String) -> Self {
@@ -151,6 +161,7 @@ impl OrchestrateEngine {
                 tickets,
                 next_ticket_id: next_id,
                 worker_count,
+                default_max_iterations: 5,
             })),
             db: Some(repo),
             session_name: Some(session_name),
