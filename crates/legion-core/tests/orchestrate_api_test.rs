@@ -1,4 +1,4 @@
-use legion_core::{OrchestrateEngine, OrchestrateApi, WorkerTaskStatus};
+use legion_core::{OrchestrateEngine, OrchestrateApi, TicketStatus};
 use tokio::sync::oneshot;
 
 /// Helper: create an engine + API on the given port, start in background, wait until ready.
@@ -19,7 +19,7 @@ fn base_url(port: u16) -> String {
 }
 
 #[tokio::test]
-async fn test_status_endpoint() {
+async fn test_status_endpoint_empty() {
     let _engine = start_api(2, 30080).await;
 
     let client = reqwest::Client::new();
@@ -31,28 +31,47 @@ async fn test_status_endpoint() {
 
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    let workers = body["workers"].as_array().unwrap();
-    assert_eq!(workers.len(), 2);
-
-    // Both should be idle
-    for w in workers {
-        assert_eq!(w["status"].as_str().unwrap(), "idle");
-    }
-    // Sorted by worker_id
-    assert_eq!(workers[0]["worker_id"].as_u64().unwrap(), 1);
-    assert_eq!(workers[1]["worker_id"].as_u64().unwrap(), 2);
+    let tickets = body["tickets"].as_array().unwrap();
+    assert!(tickets.is_empty());
+    assert_eq!(body["total"].as_u64().unwrap(), 0);
 }
 
 #[tokio::test]
-async fn test_dispatch_endpoint() {
+async fn test_submit_endpoint() {
     let engine = start_api(2, 30081).await;
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{}/legion/orchestrate/dispatch", base_url(30081)))
+        .post(format!("{}/legion/orchestrate/submit", base_url(30081)))
+        .json(&serde_json::json!({
+            "ticket": "fix-bug-123",
+            "team_mode": "tech_lead_team"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ticket_id"].as_u64().unwrap(), 1);
+
+    // Verify engine state
+    let all = engine.all_tickets().await;
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].status, TicketStatus::Queued);
+    assert_eq!(all[0].prompt, "fix-bug-123");
+}
+
+#[tokio::test]
+async fn test_dispatch_compat_endpoint() {
+    let engine = start_api(2, 30086).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/legion/orchestrate/dispatch", base_url(30086)))
         .json(&serde_json::json!({
             "worker_id": 1,
-            "ticket": "fix-bug-123"
+            "ticket": "compat-task"
         }))
         .send()
         .await
@@ -61,20 +80,21 @@ async fn test_dispatch_endpoint() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"].as_str().unwrap(), "dispatched");
+    assert!(body["ticket_id"].as_u64().is_some());
 
-    // Verify engine state changed
-    let state = engine.worker_status(1).await.unwrap();
-    assert_eq!(state.status, WorkerTaskStatus::Pending);
-    assert_eq!(state.ticket.as_deref(), Some("fix-bug-123"));
+    // Verify ticket was queued
+    let all = engine.all_tickets().await;
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].prompt, "compat-task");
 }
 
 #[tokio::test]
 async fn test_report_endpoint() {
     let engine = start_api(2, 30082).await;
 
-    // Setup: dispatch and mark working first
-    engine.dispatch(1, "task-abc".to_string()).await.unwrap();
-    engine.mark_working(1).await;
+    // Setup: submit ticket and take it
+    engine.submit_ticket("task-abc".into(), legion_core::TeamMode::default(), 5).await;
+    engine.take_next(1).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -93,49 +113,21 @@ async fn test_report_endpoint() {
     assert_eq!(body["status"].as_str().unwrap(), "ok");
 
     // Verify engine state
-    let state = engine.worker_status(1).await.unwrap();
-    assert_eq!(state.status, WorkerTaskStatus::Done);
-    assert_eq!(state.summary.as_deref(), Some("All tests passed"));
-}
-
-#[tokio::test]
-async fn test_stop_endpoint() {
-    let engine = start_api(2, 30083).await;
-
-    // Setup: dispatch and mark working
-    engine.dispatch(1, "task-xyz".to_string()).await.unwrap();
-    engine.mark_working(1).await;
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/legion/orchestrate/stop", base_url(30083)))
-        .json(&serde_json::json!({
-            "worker_id": 1
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"].as_str().unwrap(), "stopped");
-
-    // Verify engine state
-    let state = engine.worker_status(1).await.unwrap();
-    assert_eq!(state.status, WorkerTaskStatus::Stopped);
+    let all = engine.all_tickets().await;
+    assert_eq!(all[0].status, TicketStatus::Done);
+    assert_eq!(all[0].summary.as_deref(), Some("All tests passed"));
 }
 
 #[tokio::test]
 async fn test_stop_all_endpoint() {
     let engine = start_api(3, 30084).await;
 
-    // Setup: dispatch and mark all working
-    for id in 1..=3u16 {
-        engine
-            .dispatch(id, format!("task-{}", id))
-            .await
-            .unwrap();
-        engine.mark_working(id).await;
+    // Setup: submit and take tickets
+    for i in 1..=3u16 {
+        engine.submit_ticket(format!("task-{}", i), legion_core::TeamMode::default(), 5).await;
+    }
+    for i in 1..=3u16 {
+        engine.take_next(i).await;
     }
 
     let client = reqwest::Client::new();
@@ -152,10 +144,10 @@ async fn test_stop_all_endpoint() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"].as_str().unwrap(), "all_stopped");
 
-    // Verify all workers stopped
-    let states = engine.all_status().await;
-    for state in &states {
-        assert_eq!(state.status, WorkerTaskStatus::Stopped);
+    // Verify all tickets errored (stopped)
+    let all = engine.all_tickets().await;
+    for t in &all {
+        assert_eq!(t.status, TicketStatus::Error);
     }
 }
 
