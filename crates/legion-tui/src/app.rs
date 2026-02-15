@@ -362,26 +362,14 @@ impl App {
         let content_height = term_height.saturating_sub(2); // header + footer
 
         if self.is_squad() {
-            let worker_count = (self.panes.len() - 1) as u16;
-
             // Leader: leader_ratio% width, full content height
+            // Workers are SDK-based (no PTY), so only the leader pane needs resize.
             let leader_width = (term_width as u32 * self.leader_ratio as u32 / 100) as u16;
             let leader_rows = content_height.saturating_sub(2);
             let leader_cols = leader_width.saturating_sub(2);
             if let Some(pane) = self.panes.get_mut(0) {
                 if let Some(ref mut pty) = pane.pty {
                     let _ = pty.resize(leader_rows, leader_cols);
-                }
-            }
-
-            // Workers: remaining width minus 1 for divider column, vertically split
-            let worker_width = term_width.saturating_sub(leader_width).saturating_sub(1);
-            let worker_height = if worker_count > 0 { content_height / worker_count } else { 0 };
-            let worker_rows = worker_height.saturating_sub(2);
-            let worker_cols = worker_width.saturating_sub(2);
-            for i in 1..self.panes.len() {
-                if let Some(ref mut pty) = self.panes[i].pty {
-                    let _ = pty.resize(worker_rows, worker_cols);
                 }
             }
         } else {
@@ -1113,7 +1101,7 @@ impl App {
         }
     }
 
-    /// Remove a single worker: kill PTY, handle git worktree, remove pane
+    /// Remove a single worker: kill SDK task, handle git worktree, remove pane
     pub fn remove_single_worker(&mut self, pane_index: usize, strategy: &str) -> anyhow::Result<()> {
         if pane_index == 0 || pane_index >= self.panes.len() {
             return Err(anyhow::anyhow!("Invalid pane index for removal"));

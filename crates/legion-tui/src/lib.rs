@@ -283,7 +283,7 @@ async fn run_event_loop(
     Ok(())
 }
 
-/// Spawn a new worker: create proxy+control servers, worktree, PTY, add pane
+/// Spawn a new worker: create proxy+control servers, worktree, add pane (SDK-based)
 async fn handle_add_worker(app: &mut App) {
     let worker_id = app.next_worker_id;
     app.next_worker_id += 1;

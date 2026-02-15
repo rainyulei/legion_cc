@@ -302,7 +302,7 @@ fn ticket_list_item<'a>(ticket: &TicketSnapshot, app: &App) -> ListItem<'a> {
     ]))
 }
 
-/// Ticket detail view: show worker PTY or ticket info
+/// Ticket detail view: show worker SDK output or ticket info
 fn draw_ticket_detail(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.right_panel_focused;
     let border_color = if is_focused { Color::Blue } else { Color::DarkGray };
