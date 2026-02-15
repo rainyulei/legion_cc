@@ -4,9 +4,10 @@ pub mod ipc;
 pub mod squad;
 pub mod launcher;
 pub mod orchestrate;
+pub mod copilot;
 
 pub use proxy::{ProxyConfig, ProxyControlApi, ProxyServer};
 pub use session::{ClaudeSession, discover_sessions, get_session_display_name, get_claude_dir};
 pub use ipc::{Message, Risk, WorkerStatus, PendingQuestion, IpcClient, get_socket_path, serialize_message, deserialize_message};
 pub use launcher::ClaudeLauncher;
-pub use orchestrate::{OrchestrateApi, OrchestrateEngine, WorkerState, WorkerTaskStatus};
+pub use orchestrate::{OrchestrateApi, OrchestrateEngine, TicketSnapshot, TicketStatus, TeamMode};
