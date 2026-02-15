@@ -63,6 +63,32 @@ CREATE TABLE IF NOT EXISTS squad_sessions (
     created_at INTEGER NOT NULL,
     completed_at INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY,
+    session_name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    context TEXT,
+    criteria TEXT,
+    status TEXT NOT NULL DEFAULT 'queued',
+    assigned_worker INTEGER,
+    team_mode TEXT NOT NULL DEFAULT 'tech_lead_team',
+    iteration INTEGER NOT NULL DEFAULT 0,
+    max_iterations INTEGER NOT NULL DEFAULT 5,
+    feedback TEXT,
+    summary TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ticket_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL,
+    session_name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 "#;
 
 pub fn init_db(conn: &Connection) -> Result<()> {

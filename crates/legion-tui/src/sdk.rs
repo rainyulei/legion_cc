@@ -26,10 +26,14 @@ pub struct SdkHandle {
     pub success: Arc<Mutex<Option<bool>>>,
     /// Stores the Result text from the SDK output for promise detection
     pub result_text: Arc<Mutex<Option<String>>>,
+    /// Full log buffer — all formatted output lines, never truncated
+    pub log_buffer: Arc<Mutex<Vec<String>>>,
 }
 
 impl SdkHandle {
     /// Spawn Claude Code in SDK stream-json mode
+    ///
+    /// `existing_log_buffer` — pass in the previous iteration's log buffer to preserve history.
     pub fn spawn(
         working_dir: &Path,
         prompt: &str,
@@ -39,6 +43,7 @@ impl SdkHandle {
         system_prompt: Option<&str>,
         iteration: u16,
         feedback: Option<&str>,
+        existing_log_buffer: Option<Arc<Mutex<Vec<String>>>>,
     ) -> anyhow::Result<Self> {
         // Build the effective prompt with feedback from previous iterations
         let effective_prompt = if iteration > 1 {
@@ -95,6 +100,15 @@ impl SdkHandle {
         let finished = Arc::new(Mutex::new(false));
         let success = Arc::new(Mutex::new(None));
         let result_text = Arc::new(Mutex::new(None));
+        let log_buffer: Arc<Mutex<Vec<String>>> = existing_log_buffer.unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
+        // Add iteration separator if this is a retry
+        if iteration > 1 {
+            if let Ok(mut buf) = log_buffer.lock() {
+                buf.push(String::new());
+                buf.push(format!("━━━ Iteration {} ━━━", iteration));
+                buf.push(String::new());
+            }
+        }
 
         // Clear parser for fresh display
         {
@@ -115,6 +129,7 @@ impl SdkHandle {
         let finished_clone = Arc::clone(&finished);
         let success_clone = Arc::clone(&success);
         let result_text_clone = Arc::clone(&result_text);
+        let log_buffer_clone = Arc::clone(&log_buffer);
         let entry_tx_clone = entry_tx.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
@@ -130,9 +145,18 @@ impl SdkHandle {
                 match serde_json::from_str::<ClaudeJson>(trimmed) {
                     Ok(msg) => {
                         let (formatted, entry) = process_message(&msg, start.elapsed().as_secs());
-                        if let Some(text) = formatted {
+                        if let Some(ref text) = formatted {
                             if let Ok(mut p) = parser_clone.lock() {
                                 p.process(text.as_bytes());
+                            }
+                            // Append clean text to log buffer (strip ANSI codes)
+                            let clean = strip_ansi(text);
+                            if !clean.trim().is_empty() {
+                                if let Ok(mut buf) = log_buffer_clone.lock() {
+                                    for line in clean.lines() {
+                                        buf.push(line.to_string());
+                                    }
+                                }
                             }
                         }
                         if let Some(e) = entry {
@@ -187,6 +211,7 @@ impl SdkHandle {
 
         // Spawn stderr reader
         let parser_clone2 = Arc::clone(&parser);
+        let log_buffer_clone2 = Arc::clone(&log_buffer);
         tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
@@ -196,6 +221,9 @@ impl SdkHandle {
                     if let Ok(mut p) = parser_clone2.lock() {
                         let text = format!("\x1b[31m{}\x1b[0m\r\n", truncate(trimmed, 120));
                         p.process(text.as_bytes());
+                    }
+                    if let Ok(mut buf) = log_buffer_clone2.lock() {
+                        buf.push(format!("[stderr] {}", trimmed));
                     }
                 }
             }
@@ -207,6 +235,7 @@ impl SdkHandle {
             finished,
             success,
             result_text,
+            log_buffer,
         })
     }
 
@@ -344,13 +373,18 @@ fn process_message(msg: &ClaudeJson, elapsed_secs: u64) -> (Option<String>, Opti
     match msg {
         ClaudeJson::System { model, session_id, .. } => {
             let model_str = model.as_deref().unwrap_or("unknown");
-            let formatted = format!(
-                "\x1b[90m[{}s] Model: {} | Session: {}\x1b[0m\r\n",
-                elapsed_secs,
-                model_str,
-                session_id.as_deref().unwrap_or("-"),
-            );
-            (Some(formatted), None)
+            // Only display system message if model is known (skip duplicate init messages)
+            if model_str == "unknown" {
+                (None, None)
+            } else {
+                let formatted = format!(
+                    "\x1b[90m[{}s] Model: {} | Session: {}\x1b[0m\r\n",
+                    elapsed_secs,
+                    model_str,
+                    &session_id.as_deref().unwrap_or("-")[..8.min(session_id.as_deref().unwrap_or("-").len())],
+                );
+                (Some(formatted), None)
+            }
         }
         ClaudeJson::Assistant { message, .. } => {
             let content = extract_assistant_content(message);
@@ -368,16 +402,16 @@ fn process_message(msg: &ClaudeJson, elapsed_secs: u64) -> (Option<String>, Opti
 
             if is_thinking {
                 let formatted = format!(
-                    "\x1b[90m[{}s]\x1b[0m \x1b[2;33m💭 Thinking...\x1b[0m\r\n\x1b[2;90m{}\x1b[0m\r\n",
+                    "\x1b[90m[{}s]\x1b[0m \x1b[2;33m💭 Thinking:\x1b[0m\r\n{}\r\n",
                     elapsed_secs,
-                    truncate(&content, 200),
+                    wrap_text(&content, 120),
                 );
                 (Some(formatted), Some(ProgressEntry::Thinking(content)))
             } else {
                 let formatted = format!(
                     "\x1b[90m[{}s]\x1b[0m \x1b[1;37m📝 Assistant:\x1b[0m\r\n{}\r\n",
                     elapsed_secs,
-                    wrap_text(&content, 100),
+                    wrap_text(&content, 120),
                 );
                 (Some(formatted), Some(ProgressEntry::Message(content)))
             }
@@ -386,11 +420,11 @@ fn process_message(msg: &ClaudeJson, elapsed_secs: u64) -> (Option<String>, Opti
             let summary = extract_tool_summary(tool_name, tool_data.as_ref());
             let icon = tool_icon(tool_name);
             let formatted = format!(
-                "\x1b[90m[{}s]\x1b[0m \x1b[1;34m{} {}:\x1b[0m \x1b[36m{}\x1b[0m\r\n",
+                "\x1b[90m[{}s]\x1b[0m \x1b[1;34m{} {}:\x1b[0m\r\n  \x1b[36m{}\x1b[0m\r\n",
                 elapsed_secs,
                 icon,
                 tool_name,
-                truncate(&summary, 80),
+                wrap_text(&summary, 120).trim_start(),
             );
             (
                 Some(formatted),
@@ -406,11 +440,10 @@ fn process_message(msg: &ClaudeJson, elapsed_secs: u64) -> (Option<String>, Opti
                 .as_ref()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_default();
-            let short = truncate(&summary, 200);
 
             let color = if is_err { "31" } else { "32" };
             let icon = if is_err { "❌" } else { "✓" };
-            let formatted = if short.is_empty() {
+            let formatted = if summary.trim().is_empty() {
                 format!(
                     "  \x1b[{}m{}\x1b[0m\r\n",
                     color, icon,
@@ -418,13 +451,13 @@ fn process_message(msg: &ClaudeJson, elapsed_secs: u64) -> (Option<String>, Opti
             } else {
                 format!(
                     "  \x1b[{}m{} {}\x1b[0m\r\n",
-                    color, icon, short,
+                    color, icon, wrap_text(&summary, 120).trim_start(),
                 )
             };
             (
                 Some(formatted),
                 Some(ProgressEntry::ToolResult {
-                    summary: short.to_string(),
+                    summary,
                     is_error: is_err,
                 }),
             )
@@ -437,7 +470,7 @@ fn process_message(msg: &ClaudeJson, elapsed_secs: u64) -> (Option<String>, Opti
             let result_display = if result_text.is_empty() {
                 String::new()
             } else {
-                truncate(result_text, 200)
+                result_text.to_string()
             };
             let formatted = format!(
                 "\r\n{} {} ({}s)\x1b[0m\r\n{}\r\n",
@@ -584,4 +617,27 @@ pub fn extract_feedback(result_text: &str) -> String {
     } else {
         truncate(trimmed, 500)
     }
+}
+
+/// Strip ANSI escape sequences from a string, also convert \r\n to \n
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip ESC sequences: ESC [ ... <letter>
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c.is_ascii_alphabetic() { break; }
+                }
+            }
+        } else if ch == '\r' {
+            // skip \r
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }

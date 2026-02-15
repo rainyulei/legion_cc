@@ -89,6 +89,8 @@ pub struct Pane {
     pub sdk_parser: Option<crate::pty::SharedParser>,
     pub sdk_entries: Vec<crate::sdk::ProgressEntry>,
     pub current_ticket_id: Option<usize>,
+    /// Full log buffer for this pane's SDK execution (all formatted output lines)
+    pub sdk_log_buffer: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl Pane {
@@ -165,6 +167,9 @@ pub struct App {
     pub board_selected: usize,          // selected ticket id in board view
     pub board_detail_open: bool,        // whether showing detail popup for selected ticket
     pub board_detail_scroll: usize,     // scroll offset in detail popup
+
+    // Per-ticket log buffers (ticket_id → log lines)
+    pub ticket_logs: HashMap<usize, std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl App {
@@ -209,6 +214,7 @@ impl App {
             board_selected: 0,
             board_detail_open: false,
             board_detail_scroll: 0,
+            ticket_logs: HashMap::new(),
         }
     }
 
@@ -259,6 +265,7 @@ impl App {
             sdk_parser: None,
             sdk_entries: Vec::new(),
             current_ticket_id: None,
+            sdk_log_buffer: None,
         });
     }
 
@@ -625,26 +632,46 @@ impl App {
             let proxy = base_port + i + 1;
             let control = base_port + 1000 + i + 1;
             let label = format!("Worker {}", i + 1);
+            // Restore saved per-pane config on restart
+            let (pane_provider, pane_model) = if let Some((saved_pid, saved_model)) = self.saved_pane_configs.get(&label) {
+                let provider_idx = self.providers.iter().position(|p| p.id == *saved_pid);
+                if provider_idx.is_some() {
+                    (provider_idx, saved_model.clone())
+                } else {
+                    (self.current_provider, self.current_model.clone())
+                }
+            } else {
+                (self.current_provider, self.current_model.clone())
+            };
             self.panes.push(Pane {
                 pty: None,
                 proxy_port: proxy,
                 control_port: control,
                 label,
-                current_provider: self.current_provider,
-                current_model: self.current_model.clone(),
+                current_provider: pane_provider,
+                current_model: pane_model,
                 spawned_with_continue: false,
                 sdk_task: None,
                 sdk_parser: None,
                 sdk_entries: Vec::new(),
                 current_ticket_id: None,
+                sdk_log_buffer: None,
             });
         }
 
         // Track next worker ID for dynamic add
         self.next_worker_id = worker_count + 1;
 
-        // Set up orchestration engine (API will be started by event loop)
-        let engine = legion_core::OrchestrateEngine::new(worker_count);
+        // Set up orchestration engine with DB persistence
+        let session_name = self.current_session.as_ref()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let engine = if let Ok(repo) = legion_db::open_db() {
+            let repo = std::sync::Arc::new(std::sync::Mutex::new(repo));
+            legion_core::OrchestrateEngine::with_db(worker_count, repo, session_name)
+        } else {
+            legion_core::OrchestrateEngine::new(worker_count)
+        };
         self.orchestrate = Some(engine);
         self.pending_orchestrate_port = Some(orchestrate_port);
 
@@ -1051,6 +1078,9 @@ impl App {
         team_mode: &legion_core::TeamMode,
         iteration: u16,
         feedback: Option<&str>,
+        title: &str,
+        context: Option<&str>,
+        criteria: Option<&str>,
     ) {
         // Compute values before mutable borrow
         let working_dir = self.pane_worktree(&self.panes[pane_index].label.clone());
@@ -1079,14 +1109,27 @@ impl App {
             }
         };
 
+        // Build structured effective prompt with title, context, and criteria
+        let structured_prompt = build_structured_prompt(title, prompt, context, criteria);
+
         let wd = working_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
 
+        // Per-ticket log buffer: reuse for retry iterations, create new for new ticket
+        let existing_log = if iteration > 1 {
+            self.ticket_logs.get(&ticket_id).cloned()
+        } else {
+            None
+        };
+
         match crate::sdk::SdkHandle::spawn(
-            &wd, prompt, parser.clone(), use_proxy, proxy_port,
-            Some(&sys_prompt), iteration, feedback,
+            &wd, &structured_prompt, parser.clone(), use_proxy, proxy_port,
+            Some(&sys_prompt), iteration, feedback, existing_log,
         ) {
             Ok(handle) => {
+                // Store log buffer in ticket_logs map (keyed by ticket_id, not pane)
+                self.ticket_logs.insert(ticket_id, handle.log_buffer.clone());
                 let pane = &mut self.panes[pane_index];
+                pane.sdk_log_buffer = Some(handle.log_buffer.clone());
                 pane.sdk_task = Some(handle);
                 pane.sdk_parser = Some(parser);
                 pane.current_ticket_id = Some(ticket_id);
@@ -1154,4 +1197,37 @@ impl App {
         tracing::info!("Removed worker '{}' with strategy '{}'", label, strategy);
         Ok(())
     }
+}
+
+/// Build a structured prompt from ticket fields for SDK execution
+fn build_structured_prompt(title: &str, prompt: &str, context: Option<&str>, criteria: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("# Task: {}", title));
+
+    if let Some(ctx) = context {
+        if !ctx.is_empty() {
+            parts.push(String::new());
+            parts.push("## Context".to_string());
+            parts.push(ctx.to_string());
+        }
+    }
+
+    if let Some(crit) = criteria {
+        if !crit.is_empty() {
+            parts.push(String::new());
+            parts.push("## Success Criteria".to_string());
+            parts.push(crit.to_string());
+        }
+    }
+
+    parts.push(String::new());
+    parts.push("## Task Description".to_string());
+    parts.push(prompt.to_string());
+
+    parts.push(String::new());
+    parts.push("## Instructions".to_string());
+    parts.push("- Follow the team workflow described in your system prompt".to_string());
+    parts.push("- Output <promise>DONE</promise> when ALL criteria are met".to_string());
+
+    parts.join("\n")
 }

@@ -32,6 +32,27 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
 
     // Task Board navigation when right panel is focused
     if app.right_panel_focused && app.is_squad() {
+        if app.board_detail_open {
+            // Detail popup is open: j/k scroll, Esc closes
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.board_detail_scroll = app.board_detail_scroll.saturating_add(1);
+                    return InputResult::Continue;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.board_detail_scroll = app.board_detail_scroll.saturating_sub(1);
+                    return InputResult::Continue;
+                }
+                KeyCode::Esc => {
+                    app.board_detail_open = false;
+                    app.board_detail_scroll = 0;
+                    return InputResult::Continue;
+                }
+                _ => {
+                    return InputResult::Continue;
+                }
+            }
+        }
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
                 navigate_ticket_down(app);
@@ -42,21 +63,66 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
                 return InputResult::Continue;
             }
             KeyCode::Enter => {
-                if !app.board_detail_open {
-                    app.board_detail_open = true;
+                app.board_detail_open = true;
+                app.board_detail_scroll = 0;
+                return InputResult::Continue;
+            }
+            KeyCode::Char('r') => {
+                // Retry selected Error ticket
+                if let Some(engine) = app.orchestrate.clone() {
+                    let selected = app.board_selected;
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            if engine.retry_ticket(selected).await {
+                                app.ticket_logs.remove(&selected);
+                                tracing::info!("Retrying ticket {}", selected);
+                            }
+                        });
+                    });
                 }
                 return InputResult::Continue;
             }
-            KeyCode::Esc => {
-                if app.board_detail_open {
-                    app.board_detail_open = false;
-                } else {
-                    app.right_panel_focused = false;
+            KeyCode::Char('d') => {
+                // Delete selected Done/Error ticket
+                if let Some(engine) = app.orchestrate.clone() {
+                    let selected = app.board_selected;
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            if engine.delete_ticket(selected).await {
+                                app.ticket_logs.remove(&selected);
+                                tracing::info!("Deleted ticket {}", selected);
+                            }
+                        });
+                    });
                 }
+                return InputResult::Continue;
+            }
+            KeyCode::Char('D') => {
+                // Clear all Done+Error tickets
+                if let Some(engine) = app.orchestrate.clone() {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let removed = engine.clear_completed().await;
+                            for id in &removed {
+                                app.ticket_logs.remove(id);
+                            }
+                            tracing::info!("Cleared {} completed tickets", removed.len());
+                        });
+                    });
+                }
+                return InputResult::Continue;
+            }
+            KeyCode::Esc | KeyCode::Left if key.code == KeyCode::Esc || key.modifiers.contains(KeyModifiers::ALT) => {
+                app.right_panel_focused = false;
                 return InputResult::Continue;
             }
             _ => {
-                return InputResult::Continue; // Don't forward to PTY when right panel focused
+                // Don't swallow Alt+key combos — let them fall through to squad shortcuts
+                if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                    // fall through
+                } else {
+                    return InputResult::Continue;
+                }
             }
         }
     }
@@ -132,6 +198,20 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
                 app.dragging_divider = false;
                 app.set_leader_ratio_from_x(event.column);
                 app.apply_resize();
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if app.board_detail_open {
+                app.board_detail_scroll = app.board_detail_scroll.saturating_sub(3);
+            } else if app.right_panel_focused {
+                navigate_ticket_up(app);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.board_detail_open {
+                app.board_detail_scroll = app.board_detail_scroll.saturating_add(3);
+            } else if app.right_panel_focused {
+                navigate_ticket_down(app);
             }
         }
         _ => {}

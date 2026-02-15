@@ -34,9 +34,9 @@ async fn test_take_next() {
     // Worker 1 takes the ticket
     let taken = engine.take_next(1).await;
     assert!(taken.is_some());
-    let (id, prompt, _mode) = taken.unwrap();
-    assert_eq!(id, 1);
-    assert_eq!(prompt, "Task A");
+    let snap = taken.unwrap();
+    assert_eq!(snap.id, 1);
+    assert_eq!(snap.prompt, "Task A");
 
     // Worker 1 should not take another (already working)
     let taken2 = engine.take_next(1).await;

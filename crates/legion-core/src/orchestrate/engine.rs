@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use legion_db::{Repository, TicketRow};
 use serde::Serialize;
 use tokio::sync::RwLock;
 
@@ -28,6 +29,7 @@ impl Default for TeamMode {
 
 /// A ticket in the shared task queue
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub struct TaskTicket {
     pub id: usize,
     pub prompt: String,
@@ -81,6 +83,8 @@ struct EngineInner {
 #[derive(Clone)]
 pub struct OrchestrateEngine {
     inner: Arc<RwLock<EngineInner>>,
+    db: Option<Arc<Mutex<Repository>>>,
+    session_name: Option<String>,
 }
 
 impl OrchestrateEngine {
@@ -91,6 +95,139 @@ impl OrchestrateEngine {
                 next_ticket_id: 1,
                 worker_count,
             })),
+            db: None,
+            session_name: None,
+        }
+    }
+
+    pub fn with_db(worker_count: u16, repo: Arc<Mutex<Repository>>, session_name: String) -> Self {
+        // Load existing tickets from DB
+        let mut tickets = Vec::new();
+        let mut next_id = 1usize;
+        if let Ok(db) = repo.lock() {
+            if let Ok(rows) = db.list_tickets_by_session(&session_name) {
+                for row in rows {
+                    let status = match row.status.as_str() {
+                        "queued" => TicketStatus::Queued,
+                        "working" => TicketStatus::Queued, // Reset working→queued on restart
+                        "done" => TicketStatus::Done,
+                        "error" => TicketStatus::Error,
+                        _ => TicketStatus::Queued,
+                    };
+                    let team_mode = match row.team_mode.as_str() {
+                        "tech_lead_team" => TeamMode::TechLeadTeam,
+                        "solo" => TeamMode::Solo,
+                        other => TeamMode::Custom(other.to_string()),
+                    };
+                    tickets.push(TaskTicket {
+                        id: row.id as usize,
+                        prompt: row.prompt,
+                        title: row.title,
+                        context: row.context,
+                        criteria: row.criteria,
+                        status,
+                        assigned_worker: row.assigned_worker.map(|w| w as u16),
+                        team_mode,
+                        iteration: row.iteration as u16,
+                        max_iterations: row.max_iterations as u16,
+                        feedback: row.feedback,
+                        summary: row.summary,
+                        started_at: None,
+                    });
+                    if row.id as usize >= next_id {
+                        next_id = row.id as usize + 1;
+                    }
+                }
+            }
+        }
+        // Reset assigned_worker for queued tickets (were working before restart)
+        for t in tickets.iter_mut() {
+            if t.status == TicketStatus::Queued {
+                t.assigned_worker = None;
+            }
+        }
+        Self {
+            inner: Arc::new(RwLock::new(EngineInner {
+                tickets,
+                next_ticket_id: next_id,
+                worker_count,
+            })),
+            db: Some(repo),
+            session_name: Some(session_name),
+        }
+    }
+
+    fn persist_ticket(&self, ticket: &TaskTicket) {
+        if let (Some(db), Some(session)) = (&self.db, &self.session_name) {
+            let now = chrono::Utc::now().timestamp();
+            let team_str = match &ticket.team_mode {
+                TeamMode::TechLeadTeam => "tech_lead_team".to_string(),
+                TeamMode::Solo => "solo".to_string(),
+                TeamMode::Custom(s) => s.clone(),
+            };
+            let status_str = match ticket.status {
+                TicketStatus::Queued => "queued",
+                TicketStatus::Working => "working",
+                TicketStatus::Done => "done",
+                TicketStatus::Error => "error",
+            };
+            let row = TicketRow {
+                id: ticket.id as i64,
+                session_name: session.clone(),
+                title: ticket.title.clone(),
+                prompt: ticket.prompt.clone(),
+                context: ticket.context.clone(),
+                criteria: ticket.criteria.clone(),
+                status: status_str.to_string(),
+                assigned_worker: ticket.assigned_worker.map(|w| w as i64),
+                team_mode: team_str,
+                iteration: ticket.iteration as i64,
+                max_iterations: ticket.max_iterations as i64,
+                feedback: ticket.feedback.clone(),
+                summary: ticket.summary.clone(),
+                created_at: now,
+                updated_at: now,
+            };
+            if let Ok(db) = db.lock() {
+                let _ = db.insert_ticket(&row);
+            }
+        }
+    }
+
+    fn persist_ticket_update(&self, ticket: &TaskTicket) {
+        if let (Some(db), Some(session)) = (&self.db, &self.session_name) {
+            let now = chrono::Utc::now().timestamp();
+            let status_str = match ticket.status {
+                TicketStatus::Queued => "queued",
+                TicketStatus::Working => "working",
+                TicketStatus::Done => "done",
+                TicketStatus::Error => "error",
+            };
+            let team_str = match &ticket.team_mode {
+                TeamMode::TechLeadTeam => "tech_lead_team".to_string(),
+                TeamMode::Solo => "solo".to_string(),
+                TeamMode::Custom(s) => s.clone(),
+            };
+            let row = TicketRow {
+                id: ticket.id as i64,
+                session_name: session.clone(),
+                title: ticket.title.clone(),
+                prompt: ticket.prompt.clone(),
+                context: ticket.context.clone(),
+                criteria: ticket.criteria.clone(),
+                status: status_str.to_string(),
+                assigned_worker: ticket.assigned_worker.map(|w| w as i64),
+                team_mode: team_str,
+                iteration: ticket.iteration as i64,
+                max_iterations: ticket.max_iterations as i64,
+                feedback: ticket.feedback.clone(),
+                summary: ticket.summary.clone(),
+                created_at: 0, // not updated
+                updated_at: now,
+            };
+            if let Ok(db) = db.lock() {
+                let _ = db.update_ticket(&row);
+            }
         }
     }
 
@@ -101,7 +238,7 @@ impl OrchestrateEngine {
         let mut guard = self.inner.write().await;
         let id = guard.next_ticket_id;
         guard.next_ticket_id += 1;
-        guard.tickets.push(TaskTicket {
+        let ticket = TaskTicket {
             id,
             prompt,
             title,
@@ -115,11 +252,14 @@ impl OrchestrateEngine {
             feedback: None,
             summary: None,
             started_at: None,
-        });
+        };
+        guard.tickets.push(ticket.clone());
+        drop(guard);
+        self.persist_ticket(&ticket);
         id
     }
 
-    pub async fn take_next(&self, worker_id: u16) -> Option<(usize, String, TeamMode)> {
+    pub async fn take_next(&self, worker_id: u16) -> Option<TicketSnapshot> {
         let mut guard = self.inner.write().await;
         let already_working = guard.tickets.iter().any(|t| {
             t.assigned_worker == Some(worker_id) && t.status == TicketStatus::Working
@@ -131,7 +271,11 @@ impl OrchestrateEngine {
         ticket.assigned_worker = Some(worker_id);
         ticket.iteration = 1;
         ticket.started_at = Some(std::time::Instant::now());
-        Some((ticket.id, ticket.prompt.clone(), ticket.team_mode.clone()))
+        let snap = ticket_to_snapshot(ticket);
+        let persisted = ticket.clone();
+        drop(guard);
+        self.persist_ticket_update(&persisted);
+        Some(snap)
     }
 
     pub async fn report_iteration(
@@ -146,17 +290,26 @@ impl OrchestrateEngine {
         if success {
             ticket.status = TicketStatus::Done;
             ticket.summary = feedback;
+            let snap = ticket.clone();
+            drop(guard);
+            self.persist_ticket_update(&snap);
+            return false;
+        }
+
+        if ticket.iteration >= ticket.max_iterations {
+            ticket.status = TicketStatus::Error;
+            ticket.summary = feedback;
+            let snap = ticket.clone();
+            drop(guard);
+            self.persist_ticket_update(&snap);
             return false;
         }
 
         ticket.iteration += 1;
-        if ticket.iteration > ticket.max_iterations {
-            ticket.status = TicketStatus::Error;
-            ticket.summary = feedback;
-            return false;
-        }
-
         ticket.feedback = feedback;
+        let snap = ticket.clone();
+        drop(guard);
+        self.persist_ticket_update(&snap);
         true
     }
 
@@ -197,13 +350,92 @@ impl OrchestrateEngine {
         self.inner.write().await.worker_count = count;
     }
 
+    pub fn db(&self) -> Option<&Arc<Mutex<Repository>>> {
+        self.db.as_ref()
+    }
+
+    pub fn session_name(&self) -> Option<&str> {
+        self.session_name.as_deref()
+    }
+
+    /// Retry a failed ticket: reset Error → Queued for re-execution
+    pub async fn retry_ticket(&self, ticket_id: usize) -> bool {
+        let mut guard = self.inner.write().await;
+        let ticket = match guard.tickets.iter_mut().find(|t| t.id == ticket_id) {
+            Some(t) => t,
+            None => return false,
+        };
+        if ticket.status != TicketStatus::Error {
+            return false;
+        }
+        ticket.status = TicketStatus::Queued;
+        ticket.assigned_worker = None;
+        ticket.iteration = 0;
+        ticket.feedback = None;
+        ticket.summary = None;
+        ticket.started_at = None;
+        let snap = ticket.clone();
+        drop(guard);
+        self.persist_ticket_update(&snap);
+        true
+    }
+
+    /// Delete a single completed/errored ticket
+    pub async fn delete_ticket(&self, ticket_id: usize) -> bool {
+        let mut guard = self.inner.write().await;
+        let idx = guard.tickets.iter().position(|t| t.id == ticket_id);
+        if let Some(i) = idx {
+            let status = guard.tickets[i].status;
+            if matches!(status, TicketStatus::Done | TicketStatus::Error) {
+                guard.tickets.remove(i);
+                drop(guard);
+                self.delete_ticket_from_db(ticket_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Clear all completed (Done + Error) tickets
+    pub async fn clear_completed(&self) -> Vec<usize> {
+        let mut guard = self.inner.write().await;
+        let mut removed_ids = Vec::new();
+        guard.tickets.retain(|t| {
+            if matches!(t.status, TicketStatus::Done | TicketStatus::Error) {
+                removed_ids.push(t.id);
+                false
+            } else {
+                true
+            }
+        });
+        drop(guard);
+        for id in &removed_ids {
+            self.delete_ticket_from_db(*id);
+        }
+        removed_ids
+    }
+
+    fn delete_ticket_from_db(&self, ticket_id: usize) {
+        if let (Some(db), Some(session)) = (&self.db, &self.session_name) {
+            if let Ok(db) = db.lock() {
+                let _ = db.delete_ticket(ticket_id as i64, session);
+            }
+        }
+    }
+
     pub async fn stop_all(&self) {
         let mut guard = self.inner.write().await;
+        let mut stopped = Vec::new();
         for ticket in guard.tickets.iter_mut() {
             if ticket.status == TicketStatus::Working {
                 ticket.status = TicketStatus::Error;
                 ticket.summary = Some("Stopped by user".into());
+                stopped.push(ticket.clone());
             }
+        }
+        drop(guard);
+        for t in &stopped {
+            self.persist_ticket_update(t);
         }
     }
 }

@@ -43,6 +43,25 @@ pub struct Session {
     pub last_active_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TicketRow {
+    pub id: i64,
+    pub session_name: String,
+    pub title: String,
+    pub prompt: String,
+    pub context: Option<String>,
+    pub criteria: Option<String>,
+    pub status: String,
+    pub assigned_worker: Option<i64>,
+    pub team_mode: String,
+    pub iteration: i64,
+    pub max_iterations: i64,
+    pub feedback: Option<String>,
+    pub summary: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 pub struct Repository {
     conn: Connection,
 }
@@ -338,6 +357,117 @@ impl Repository {
         self.conn.execute(
             "DELETE FROM squad_sessions WHERE name = ?",
             params![name],
+        )?;
+        Ok(())
+    }
+
+    // Ticket methods
+
+    pub fn insert_ticket(&self, ticket: &TicketRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tickets (id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                ticket.id,
+                ticket.session_name,
+                ticket.title,
+                ticket.prompt,
+                ticket.context,
+                ticket.criteria,
+                ticket.status,
+                ticket.assigned_worker,
+                ticket.team_mode,
+                ticket.iteration,
+                ticket.max_iterations,
+                ticket.feedback,
+                ticket.summary,
+                ticket.created_at,
+                ticket.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_ticket(&self, ticket: &TicketRow) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tickets SET status = ?1, assigned_worker = ?2, iteration = ?3, feedback = ?4, summary = ?5, updated_at = ?6 WHERE id = ?7 AND session_name = ?8",
+            params![
+                ticket.status,
+                ticket.assigned_worker,
+                ticket.iteration,
+                ticket.feedback,
+                ticket.summary,
+                ticket.updated_at,
+                ticket.id,
+                ticket.session_name,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_tickets_by_session(&self, session_name: &str) -> Result<Vec<TicketRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at FROM tickets WHERE session_name = ? ORDER BY id"
+        )?;
+        let rows = stmt.query_map(params![session_name], |row| {
+            Ok(TicketRow {
+                id: row.get(0)?,
+                session_name: row.get(1)?,
+                title: row.get(2)?,
+                prompt: row.get(3)?,
+                context: row.get(4)?,
+                criteria: row.get(5)?,
+                status: row.get(6)?,
+                assigned_worker: row.get(7)?,
+                team_mode: row.get(8)?,
+                iteration: row.get(9)?,
+                max_iterations: row.get(10)?,
+                feedback: row.get(11)?,
+                summary: row.get(12)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn max_ticket_id(&self, session_name: &str) -> Result<usize> {
+        let id: Option<i64> = self.conn.query_row(
+            "SELECT MAX(id) FROM tickets WHERE session_name = ?",
+            params![session_name],
+            |row| row.get(0),
+        )?;
+        Ok(id.unwrap_or(0) as usize)
+    }
+
+    // Ticket log methods
+
+    pub fn append_ticket_log(&self, ticket_id: i64, session_name: &str, content: &str, created_at: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO ticket_logs (ticket_id, session_name, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![ticket_id, session_name, content, created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_ticket_logs(&self, ticket_id: i64, session_name: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content FROM ticket_logs WHERE ticket_id = ?1 AND session_name = ?2 ORDER BY id"
+        )?;
+        let rows = stmt.query_map(params![ticket_id, session_name], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Delete a ticket and its logs by id and session
+    pub fn delete_ticket(&self, ticket_id: i64, session_name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM ticket_logs WHERE ticket_id = ?1 AND session_name = ?2",
+            params![ticket_id, session_name],
+        )?;
+        self.conn.execute(
+            "DELETE FROM tickets WHERE id = ?1 AND session_name = ?2",
+            params![ticket_id, session_name],
         )?;
         Ok(())
     }

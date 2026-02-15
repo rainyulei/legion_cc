@@ -5,7 +5,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::path::PathBuf;
 
-pub use repo::{PaneConfig, Provider, Repository, Session, SquadSession};
+pub use repo::{PaneConfig, Provider, Repository, Session, SquadSession, TicketRow};
 
 pub fn get_db_path() -> PathBuf {
     let data_dir = dirs::data_local_dir()

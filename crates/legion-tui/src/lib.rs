@@ -200,6 +200,13 @@ async fn run_event_loop(
             app.ticket_snapshot = Some(engine.all_tickets().await);
             app.queue_stats = Some(engine.queue_stats().await);
 
+            // Auto-select first ticket if current selection is invalid
+            if let Some(ref tickets) = app.ticket_snapshot {
+                if !tickets.is_empty() && !tickets.iter().any(|t| t.id == app.board_selected) {
+                    app.board_selected = tickets[0].id;
+                }
+            }
+
             let wc = engine.worker_count().await;
 
             for wi in 1..=wc as usize {
@@ -250,10 +257,14 @@ async fn run_event_loop(
                                 let prompt = ts.prompt.clone();
                                 let team_mode = ts.team_mode.clone();
                                 let iteration = ts.iteration;
+                                let title = ts.title.clone();
+                                let context = ts.context.clone();
+                                let criteria = ts.criteria.clone();
                                 // Clean up old SDK
                                 app.panes[wi].sdk_task = None;
                                 // Start new iteration
-                                app.start_sdk_task(wi, ticket_id, &prompt, &team_mode, iteration, Some(&feedback));
+                                app.start_sdk_task(wi, ticket_id, &prompt, &team_mode, iteration, Some(&feedback),
+                                    &title, context.as_deref(), criteria.as_deref());
                                 continue;
                             }
                         } else {
@@ -261,16 +272,18 @@ async fn run_event_loop(
                         }
                     }
 
-                    // Clean up finished SDK
+                    // Clean up finished SDK (log buffer stays in app.ticket_logs keyed by ticket_id)
                     app.panes[wi].sdk_task = None;
                     app.panes[wi].current_ticket_id = None;
+                    app.panes[wi].sdk_log_buffer = None;
                 }
 
                 // If worker is idle and no SDK running, try to take next ticket
                 if app.panes[wi].sdk_task.is_none() {
-                    if let Some((ticket_id, prompt, team_mode)) = engine.take_next(wi as u16).await {
-                        tracing::info!("Worker {} taking ticket {}", wi, ticket_id);
-                        app.start_sdk_task(wi, ticket_id, &prompt, &team_mode, 1, None);
+                    if let Some(ts) = engine.take_next(wi as u16).await {
+                        tracing::info!("Worker {} taking ticket {}", wi, ts.id);
+                        app.start_sdk_task(wi, ts.id, &ts.prompt, &ts.team_mode, 1, None,
+                            ts.title.as_str(), ts.context.as_deref(), ts.criteria.as_deref());
                     }
                 }
             }
@@ -341,18 +354,30 @@ async fn handle_add_worker(app: &mut App) {
     }
 
     // Workers: create pane without PTY (SDK will be used when ticket assigned)
+    // Check for saved per-pane config to restore provider/model on restart
+    let (pane_provider, pane_model) = if let Some((saved_pid, saved_model)) = app.get_saved_pane_config(&label) {
+        let provider_idx = app.providers.iter().position(|p| p.id == *saved_pid);
+        if provider_idx.is_some() {
+            (provider_idx, saved_model.clone())
+        } else {
+            (app.current_provider, app.current_model.clone())
+        }
+    } else {
+        (app.current_provider, app.current_model.clone())
+    };
     app.panes.push(app::Pane {
         pty: None,
         proxy_port,
         control_port,
         label: label.clone(),
-        current_provider: app.current_provider,
-        current_model: app.current_model.clone(),
+        current_provider: pane_provider,
+        current_model: pane_model,
         spawned_with_continue: false,
         sdk_task: None,
         sdk_parser: None,
         sdk_entries: Vec::new(),
         current_ticket_id: None,
+        sdk_log_buffer: None,
     });
 
     // Resize all panes to accommodate the new worker

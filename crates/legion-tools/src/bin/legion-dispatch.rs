@@ -1,7 +1,7 @@
 //! legion-dispatch — Submit a ticket to the orchestrate queue
 //!
-//! Usage: legion-dispatch <worker_id> [-t "title"] "ticket text"
-//! POSTs to /legion/orchestrate/submit with {"title": "...", "ticket": "...", "team_mode": "tech_lead_team"}
+//! Usage: legion-dispatch <worker_id> [-t "title"] [-c "context"] [-k "criteria"] "ticket text"
+//! POSTs to /legion/orchestrate/submit with structured fields.
 //! (worker_id is kept for CLI compat but ignored by queue)
 
 use std::env;
@@ -18,7 +18,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] \"ticket text\"");
+        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] [-c \"context\"] [-k \"criteria\"] \"ticket text\"");
         process::exit(1);
     }
 
@@ -30,20 +30,50 @@ fn main() {
         }
     };
 
-    // Parse optional --title / -t flag
+    // Parse optional flags
     let mut title: Option<String> = None;
-    let mut ticket_start = 2;
-    if args.len() > 3 && (args[2] == "-t" || args[2] == "--title") {
-        title = Some(args[3].clone());
-        ticket_start = 4;
+    let mut context: Option<String> = None;
+    let mut criteria: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" | "--title" => {
+                i += 1;
+                if i < args.len() { title = Some(args[i].clone()); }
+            }
+            "-c" | "--context" => {
+                i += 1;
+                if i < args.len() { context = Some(args[i].clone()); }
+            }
+            "-k" | "--criteria" => {
+                i += 1;
+                if i < args.len() { criteria = Some(args[i].clone()); }
+            }
+            _ => positional.push(args[i].clone()),
+        }
+        i += 1;
     }
 
-    if ticket_start >= args.len() {
-        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] \"ticket text\"");
+    if positional.is_empty() {
+        eprintln!("Usage: legion-dispatch <worker_id> -t \"title\" -c \"context\" -k \"criteria\" \"ticket text\"");
         process::exit(1);
     }
 
-    let ticket = args[ticket_start..].join(" ");
+    if context.is_none() {
+        eprintln!("Error: -c/--context is required. Provide working directory, language, related files, etc.");
+        eprintln!("Example: legion-dispatch 1 -t \"Add login\" -c \"Rust project in ./backend, uses axum\" -k \"tests pass\" \"implement login\"");
+        process::exit(1);
+    }
+
+    if criteria.is_none() {
+        eprintln!("Error: -k/--criteria is required. Provide specific, testable success conditions.");
+        eprintln!("Example: legion-dispatch 1 -t \"Add login\" -c \"Rust project in ./backend\" -k \"POST /login returns JWT, cargo test passes\" \"implement login\"");
+        process::exit(1);
+    }
+
+    let ticket = positional.join(" ");
 
     // Auto-generate title from first 40 chars if not provided
     let title = title.unwrap_or_else(|| {
@@ -58,11 +88,18 @@ fn main() {
     let port = get_orchestrate_port();
     let url = format!("http://127.0.0.1:{}/legion/orchestrate/submit", port);
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "title": title,
         "ticket": ticket,
         "team_mode": "tech_lead_team",
     });
+
+    if let Some(ctx) = &context {
+        body["context"] = serde_json::Value::String(ctx.clone());
+    }
+    if let Some(crit) = &criteria {
+        body["criteria"] = serde_json::Value::String(crit.clone());
+    }
 
     match ureq::post(&url)
         .content_type("application/json")
@@ -76,10 +113,9 @@ fn main() {
                 .unwrap_or_default();
 
             if status.is_success() {
-                println!("Submitted ticket (via worker_id {}): {}", worker_id, ticket);
-                // Print ticket ID if returned
+                println!("Dispatched to worker {}: {}", worker_id, ticket);
                 if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&body_str) {
-                    if let Some(id) = resp.get("ticket_id").and_then(|v| v.as_str()) {
+                    if let Some(id) = resp.get("ticket_id") {
                         println!("Ticket ID: {}", id);
                     }
                 }

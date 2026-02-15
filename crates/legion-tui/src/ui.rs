@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 use tui_term::widget::PseudoTerminal;
@@ -171,7 +171,7 @@ fn draw_pane(frame: &mut Frame, app: &App, index: usize, area: Rect) {
         None => return,
     };
 
-    let is_focused = app.focused_pane == index;
+    let is_focused = app.focused_pane == index && !app.right_panel_focused;
     let border_color = if is_focused { Color::Blue } else { Color::DarkGray };
 
     let title = if app.is_squad() {
@@ -324,6 +324,46 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
+    // --- Action bar at bottom (only when focused) ---
+    if is_focused {
+        // Find selected ticket status
+        let selected_status = tickets.iter()
+            .find(|t| t.id == app.board_selected)
+            .map(|t| t.status);
+
+        let mut actions: Vec<Span> = Vec::new();
+        actions.push(Span::styled(" ", Style::default()));
+
+        // Always show Enter to view detail
+        actions.push(Span::styled("[Enter]", Style::default().fg(Color::Yellow)));
+        actions.push(Span::styled(" View ", Style::default().fg(Color::DarkGray)));
+
+        // Context-sensitive actions based on selected ticket status
+        match selected_status {
+            Some(TicketStatus::Error) => {
+                actions.push(Span::styled("[r]", Style::default().fg(Color::Yellow)));
+                actions.push(Span::styled(" Retry ", Style::default().fg(Color::DarkGray)));
+                actions.push(Span::styled("[d]", Style::default().fg(Color::Yellow)));
+                actions.push(Span::styled(" Del ", Style::default().fg(Color::DarkGray)));
+            }
+            Some(TicketStatus::Done) => {
+                actions.push(Span::styled("[d]", Style::default().fg(Color::Yellow)));
+                actions.push(Span::styled(" Del ", Style::default().fg(Color::DarkGray)));
+            }
+            _ => {}
+        }
+
+        // Always show batch clear
+        let has_completed = tickets.iter().any(|t| matches!(t.status, TicketStatus::Done | TicketStatus::Error));
+        if has_completed {
+            actions.push(Span::styled("[D]", Style::default().fg(Color::Yellow)));
+            actions.push(Span::styled(" Clear All ", Style::default().fg(Color::DarkGray)));
+        }
+
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(actions));
+    }
+
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -361,7 +401,13 @@ fn team_mode_short(mode: &TeamMode) -> &str {
 }
 
 
-/// Popup detail view for a selected ticket (rendered as a centered overlay)
+/// Popup detail view for a selected ticket.
+///
+/// Single scrollable area with Scrollbar:
+///   Header (Status / Model / Team / Context / Criteria)
+///   → Prompt (word-wrapped)
+///   → Summary (Done/Error only, before log)
+///   → Running Log (extracted from vt100 parser screen)
 fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
     let popup_area = centered_rect(80, 80, frame.area());
     frame.render_widget(Clear, popup_area);
@@ -376,7 +422,7 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
 
     let block = Block::default()
         .title(title)
-        .title_bottom(Line::from(" [Esc: close] ").centered())
+        .title_bottom(Line::from(" [Esc: close] [j/k: scroll] ").centered())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::Black));
@@ -391,9 +437,12 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
         return;
     };
 
+    let wrap_w = inner.width.saturating_sub(4) as usize; // leave room for scrollbar + padding
     let mut lines: Vec<Line> = Vec::new();
 
-    // --- Header section ---
+    // --- Header ---
+
+    // Status
     let status_str = match t.status {
         TicketStatus::Working => {
             let w = t.assigned_worker.map(|w| format!("W{}", w)).unwrap_or_default();
@@ -410,125 +459,182 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
         Span::styled(status_str, Style::default().fg(Color::White)),
     ]));
 
+    // Model: Provider / Model (from worker pane)
+    let pane_idx = t.assigned_worker.map(|w| w as usize);
+    if let Some(idx) = pane_idx {
+        if let Some(pane) = app.panes.get(idx) {
+            let provider_name = pane.current_provider
+                .and_then(|pi| app.providers.get(pi))
+                .map(|p| p.name.as_str())
+                .unwrap_or("Default");
+            let model_name = pane.current_model.as_deref().unwrap_or("(none)");
+            lines.push(Line::from(vec![
+                Span::styled(" Model: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{} / {}", provider_name, model_name), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    // Team: show members
     let team_str = match &t.team_mode {
-        TeamMode::TechLeadTeam => "TechLeadTeam".to_string(),
-        TeamMode::Solo => "Solo".to_string(),
-        TeamMode::Custom(s) => format!("Custom({})", s),
+        TeamMode::TechLeadTeam => "TechLeader \u{00b7} Engineer \u{00b7} QA",
+        TeamMode::Solo => "Solo",
+        TeamMode::Custom(s) => s.as_str(),
     };
     lines.push(Line::from(vec![
         Span::styled(" Team: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(team_str, Style::default().fg(Color::White)),
     ]));
 
+    // Context
     if let Some(ref ctx) = t.context {
         lines.push(Line::from(vec![
             Span::styled(" Context: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(ctx.clone(), Style::default().fg(Color::White)),
+            Span::styled(ctx.as_str(), Style::default().fg(Color::White)),
         ]));
     }
 
+    // Criteria
     if let Some(ref crit) = t.criteria {
         lines.push(Line::from(vec![
             Span::styled(" Criteria: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(crit.clone(), Style::default().fg(Color::White)),
+            Span::styled(crit.as_str(), Style::default().fg(Color::White)),
         ]));
     }
 
-    lines.push(Line::from(Span::raw("")));
-
-    // --- Progress section ---
-    let pane_idx = t.assigned_worker.map(|w| w as usize);
-    if let Some(idx) = pane_idx {
-        if let Some(pane) = app.panes.get(idx) {
-            if !pane.sdk_entries.is_empty() {
-                let separator_width = inner.width.saturating_sub(2) as usize;
-                let progress_header = format!(" \u{2500}\u{2500}\u{2500} Progress {}", "\u{2500}".repeat(separator_width.saturating_sub(14)));
-                lines.push(Line::from(Span::styled(progress_header, Style::default().fg(Color::DarkGray))));
-
-                for entry in &pane.sdk_entries {
-                    let display = entry.display();
-                    lines.push(Line::from(Span::styled(
-                        format!(" {}", display),
-                        Style::default().fg(Color::White),
-                    )));
-                }
-                lines.push(Line::from(Span::raw("")));
-            }
+    // --- Prompt (word-wrapped) ---
+    if !t.prompt.is_empty() {
+        let sep_w = inner.width.saturating_sub(2) as usize;
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            format!(" \u{2500}\u{2500}\u{2500} Prompt {}", "\u{2500}".repeat(sep_w.saturating_sub(12))),
+            Style::default().fg(Color::DarkGray),
+        )));
+        for wl in wrap_to_lines(&t.prompt, wrap_w) {
+            lines.push(Line::from(Span::styled(format!(" {}", wl), Style::default().fg(Color::White))));
         }
     }
 
-    // --- Terminal Output section ---
-    // We render the terminal below the text lines if there's a parser
-    let _text_height = lines.len() as u16;
-    let scroll = app.board_detail_scroll as u16;
-
-    // Check if we have terminal output to show
-    let has_terminal = pane_idx
-        .and_then(|idx| app.parser_at(idx))
-        .is_some();
-
-    if has_terminal {
-        let separator_width = inner.width.saturating_sub(2) as usize;
-        let term_header = format!(" \u{2500}\u{2500}\u{2500} Terminal Output {}", "\u{2500}".repeat(separator_width.saturating_sub(20)));
-        lines.push(Line::from(Span::styled(term_header, Style::default().fg(Color::DarkGray))));
-    }
-
-    // --- Summary section (Done/Error only) ---
+    // --- Summary (Done/Error only — placed before Running Log) ---
     if matches!(t.status, TicketStatus::Done | TicketStatus::Error) {
         if let Some(ref summary) = t.summary {
-            if !has_terminal {
-                lines.push(Line::from(Span::raw("")));
-            }
-            let separator_width = inner.width.saturating_sub(2) as usize;
-            let sum_header = format!(" \u{2500}\u{2500}\u{2500} Summary {}", "\u{2500}".repeat(separator_width.saturating_sub(13)));
-            lines.push(Line::from(Span::styled(sum_header, Style::default().fg(Color::DarkGray))));
+            let sep_w = inner.width.saturating_sub(2) as usize;
+            lines.push(Line::from(Span::raw("")));
             lines.push(Line::from(Span::styled(
-                format!(" {}", summary),
-                Style::default().fg(Color::White),
+                format!(" \u{2500}\u{2500}\u{2500} Summary {}", "\u{2500}".repeat(sep_w.saturating_sub(13))),
+                Style::default().fg(Color::DarkGray),
             )));
+            let cleaned = clean_xml_tags(summary);
+            for wl in wrap_to_lines(&cleaned, wrap_w) {
+                lines.push(Line::from(Span::styled(format!(" {}", wl), Style::default().fg(Color::White))));
+            }
         }
     }
 
-    // Calculate layout: text area + terminal area
-    let updated_text_height = lines.len() as u16;
+    // --- Running Log (from per-ticket log buffer) ---
+    if let Some(buf) = app.ticket_logs.get(&t.id) {
+        if let Ok(log_lines) = buf.lock() {
+            if !log_lines.is_empty() {
+                let sep_w = inner.width.saturating_sub(2) as usize;
+                lines.push(Line::from(Span::raw("")));
+                lines.push(Line::from(Span::styled(
+                    format!(" \u{2500}\u{2500}\u{2500} Running Log {}", "\u{2500}".repeat(sep_w.saturating_sub(16))),
+                    Style::default().fg(Color::DarkGray),
+                )));
 
-    if has_terminal && inner.height > updated_text_height + 1 {
-        // Split inner area between text and terminal
-        let text_area_height = updated_text_height.min(inner.height / 2);
-        let term_area_height = inner.height.saturating_sub(text_area_height);
-
-        let inner_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(text_area_height),
-                Constraint::Length(term_area_height),
-            ])
-            .split(inner);
-
-        // Render text with scroll
-        let text_paragraph = Paragraph::new(lines).scroll((scroll, 0));
-        frame.render_widget(block, popup_area);
-        frame.render_widget(text_paragraph, inner_chunks[0]);
-
-        // Render terminal
-        if let Some(idx) = pane_idx {
-            if let Some(parser) = app.parser_at(idx) {
-                if let Ok(p) = parser.lock() {
-                    let term_block = Block::default()
-                        .borders(Borders::TOP)
-                        .border_style(Style::default().fg(Color::DarkGray));
-                    let pseudo_term = PseudoTerminal::new(p.screen()).block(term_block);
-                    frame.render_widget(pseudo_term, inner_chunks[1]);
+                let mut trailing_empty = 0usize;
+                for log_line in log_lines.iter() {
+                    let trimmed = log_line.trim_end();
+                    if trimmed.is_empty() {
+                        trailing_empty += 1;
+                    } else {
+                        if trailing_empty > 0 {
+                            lines.push(Line::from(Span::raw("")));
+                        }
+                        trailing_empty = 0;
+                        lines.push(Line::from(Span::styled(
+                            format!(" {}", trimmed),
+                            Style::default().fg(Color::Gray),
+                        )));
+                    }
                 }
             }
         }
-    } else {
-        // No terminal or not enough space: just render text
-        let paragraph = Paragraph::new(lines)
-            .scroll((scroll, 0))
-            .block(block);
-        frame.render_widget(paragraph, popup_area);
     }
+
+    // --- Render: single scrollable Paragraph + Scrollbar ---
+    let total_lines = lines.len();
+    let visible_height = inner.height as usize;
+    let scroll = app.board_detail_scroll;
+
+    // Clamp scroll to valid range
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    let scroll_clamped = scroll.min(max_scroll);
+
+    let paragraph = Paragraph::new(lines)
+        .scroll((scroll_clamped as u16, 0))
+        .block(block);
+    frame.render_widget(paragraph, popup_area);
+
+    // Scrollbar (right side)
+    if total_lines > visible_height {
+        let mut scrollbar_state = ScrollbarState::new(max_scroll)
+            .position(scroll_clamped);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("\u{25b2}"))
+            .end_symbol(Some("\u{25bc}"));
+        // Render scrollbar inside the block's inner area
+        frame.render_stateful_widget(scrollbar, inner, &mut scrollbar_state);
+    }
+}
+
+/// Strip XML-like tags from content (e.g. `<tool_call_begin>`, `<param name="...">`)
+fn clean_xml_tags(s: &str) -> String {
+    let mut result = String::new();
+    let mut in_tag = false;
+    for ch in s.chars() {
+        if ch == '<' { in_tag = true; continue; }
+        if ch == '>' { in_tag = false; continue; }
+        if !in_tag { result.push(ch); }
+    }
+    // Collapse multiple whitespace into single space
+    let mut prev_space = false;
+    let cleaned: String = result.chars().filter(|c| {
+        if *c == ' ' {
+            if prev_space { return false; }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        true
+    }).collect();
+    cleaned.trim().to_string()
+}
+
+/// Word-wrap a string into lines of at most `width` characters.
+fn wrap_to_lines(s: &str, width: usize) -> Vec<String> {
+    if width == 0 { return vec![s.to_string()]; }
+    let mut out = Vec::new();
+    for line in s.lines() {
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut remaining = line;
+        while !remaining.is_empty() {
+            if remaining.len() <= width {
+                out.push(remaining.to_string());
+                break;
+            }
+            let break_at = remaining[..width]
+                .rfind(|c: char| c.is_whitespace())
+                .unwrap_or(width);
+            let break_at = if break_at == 0 { width } else { break_at };
+            out.push(remaining[..break_at].to_string());
+            remaining = remaining[break_at..].trim_start();
+        }
+    }
+    out
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
