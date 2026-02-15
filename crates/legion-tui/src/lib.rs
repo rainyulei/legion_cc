@@ -144,6 +144,7 @@ async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
+    let mut read_leader_status_tick: u32 = 0;
     loop {
         // Start orchestration API if a session was just spawned
         if let Some(orch_port) = app.pending_orchestrate_port.take() {
@@ -180,6 +181,13 @@ async fn run_event_loop(
                 Ok(()) => tracing::info!("Worker removed successfully"),
                 Err(e) => tracing::error!("Failed to remove worker: {}", e),
             }
+        }
+
+        // Periodically read leader context status (every ~2s = 40 ticks at 50ms)
+        read_leader_status_tick += 1;
+        if read_leader_status_tick >= 40 {
+            read_leader_status_tick = 0;
+            read_leader_status(app);
         }
 
         terminal.draw(|frame| draw(frame, app))?;
@@ -392,4 +400,38 @@ async fn handle_add_worker(app: &mut App) {
     app.apply_resize();
 
     tracing::info!("Worker '{}' added successfully", label);
+}
+
+/// Read leader context status from the statusLine hook output file.
+fn read_leader_status(app: &mut App) {
+    let path = std::path::Path::new(crate::pty::LEADER_STATUS_PATH);
+    if !path.exists() {
+        return;
+    }
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            // Context percentage
+            if let Some(pct) = json.get("context_window")
+                .and_then(|cw| cw.get("used_percentage"))
+                .and_then(|v| v.as_f64())
+            {
+                app.leader_context_pct = Some(pct.round() as u8);
+            }
+            // Git branch from cwd
+            if let Some(cwd) = json.get("cwd").and_then(|v| v.as_str()) {
+                if let Ok(output) = std::process::Command::new("git")
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .current_dir(cwd)
+                    .output()
+                {
+                    if output.status.success() {
+                        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !branch.is_empty() {
+                            app.leader_git_branch = Some(branch);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -256,6 +256,10 @@ pub struct App {
 
     // Delete confirm state
     pub delete_confirm_id: usize,
+
+    // Leader context status (from statusLine hook)
+    pub leader_context_pct: Option<u8>,
+    pub leader_git_branch: Option<String>,
 }
 
 impl App {
@@ -309,6 +313,8 @@ impl App {
             retry_form_fields: [String::new(), String::new(), String::new(), String::new()],
             retry_form_focus: 0,
             delete_confirm_id: 0,
+            leader_context_pct: None,
+            leader_git_branch: None,
         }
     }
 

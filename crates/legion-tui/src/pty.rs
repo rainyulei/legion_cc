@@ -89,6 +89,13 @@ impl PtyHandle {
             cmd.env("LEGION_ORCHESTRATE_PORT", op.to_string());
         }
 
+        // Leader only: inject statusLine hook to export context data
+        if worker_id.is_none() {
+            if let Ok(status_file) = setup_leader_statusline_hook() {
+                cmd.args(["--settings", &status_file]);
+            }
+        }
+
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -172,6 +179,37 @@ impl PtyHandle {
         }
         Ok(())
     }
+}
+
+/// Path to the leader status JSON file written by the statusLine hook.
+pub const LEADER_STATUS_PATH: &str = "/tmp/legion-leader-status.json";
+
+/// Create a statusLine hook script and a settings JSON file that references it.
+/// Returns the path to the settings JSON file (for `--settings` arg).
+fn setup_leader_statusline_hook() -> Result<String> {
+    let hook_path = "/tmp/legion-statusline-hook.sh";
+    let settings_path = "/tmp/legion-statusline-settings.json";
+
+    // Write hook script: reads stdin JSON, writes to status file
+    std::fs::write(hook_path, format!(
+        "#!/bin/bash\ncat > {}\n", LEADER_STATUS_PATH
+    )).context("Failed to write statusline hook")?;
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hook_path, std::fs::Permissions::from_mode(0o755))
+            .context("Failed to chmod statusline hook")?;
+    }
+
+    // Write settings JSON
+    std::fs::write(settings_path, format!(
+        r#"{{"statusLine":{{"type":"command","command":"{}"}}}}"#,
+        hook_path
+    )).context("Failed to write statusline settings")?;
+
+    Ok(settings_path.to_string())
 }
 
 /// Check if a PTY shows an idle Claude Code prompt.

@@ -104,6 +104,31 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         indicator,
     ]);
 
+    // Git branch
+    if let Some(ref branch) = app.leader_git_branch {
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled(
+            branch.as_str(),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    // Context percentage with color coding
+    if let Some(pct) = app.leader_context_pct {
+        let ctx_color = if pct >= 80 {
+            Color::Red
+        } else if pct >= 50 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled(
+            format!("\u{1f9e0}{}%", pct),
+            Style::default().fg(ctx_color),
+        ));
+    }
+
     let header = Line::from(spans);
 
     frame.render_widget(Paragraph::new(header), area);
