@@ -30,24 +30,47 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
         return InputResult::Continue;
     }
 
-    // Ctrl+T toggles dashboard overlay (squad only)
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
-        if app.is_squad() {
-            app.show_dashboard = !app.show_dashboard;
-            return InputResult::Continue;
+    // Task Board navigation when right panel is focused
+    if app.right_panel_focused && app.is_squad() {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                navigate_ticket_down(app);
+                return InputResult::Continue;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                navigate_ticket_up(app);
+                return InputResult::Continue;
+            }
+            KeyCode::Enter => {
+                if !app.kanban_detail {
+                    app.kanban_detail = true;
+                }
+                return InputResult::Continue;
+            }
+            KeyCode::Esc => {
+                if app.kanban_detail {
+                    app.kanban_detail = false;
+                } else {
+                    app.right_panel_focused = false;
+                }
+                return InputResult::Continue;
+            }
+            _ => {
+                return InputResult::Continue; // Don't forward to PTY when right panel focused
+            }
         }
     }
 
     // Squad-only shortcuts (not forwarded to PTY)
     if app.is_squad() {
         match key.code {
-            // Tab / BackTab cycle pane focus
-            KeyCode::Tab => {
-                app.focus_next();
+            // Alt+Right / Alt+Left toggle focus between Leader and Task Board
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                app.right_panel_focused = !app.right_panel_focused;
                 return InputResult::Continue;
             }
-            KeyCode::BackTab => {
-                app.focus_prev();
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                app.right_panel_focused = !app.right_panel_focused;
                 return InputResult::Continue;
             }
             // Ctrl+Left/Right adjust leader/worker split ratio
@@ -116,9 +139,11 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
 }
 
 fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
-    // Ctrl+P also closes popup
+    // Ctrl+P also closes popup (but not during startup with no panes)
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
-        app.toggle_popup();
+        if !app.panes.is_empty() {
+            app.toggle_popup();
+        }
         return InputResult::Continue;
     }
 
@@ -130,6 +155,9 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         }
         AppMode::Popup(PopupMenu::SessionList) => handle_session_list_keys(app, key),
         AppMode::Popup(PopupMenu::CompleteSession) => handle_complete_session_keys(app, key),
+        AppMode::Popup(PopupMenu::NewSessionInput) => handle_new_session_input_keys(app, key),
+        AppMode::Popup(PopupMenu::RemoveWorkerList) => handle_remove_worker_list_keys(app, key),
+        AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => handle_remove_worker_confirm_keys(app, key),
         _ => {}
     }
 
@@ -181,18 +209,33 @@ fn handle_submenu_keys(app: &mut App, key: KeyEvent) {
 fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
-            app.mode = AppMode::Popup(PopupMenu::Main);
+            // Only allow Esc if panes exist (not in startup mode)
+            if !app.panes.is_empty() {
+                app.mode = AppMode::Popup(PopupMenu::Main);
+            }
         }
         KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
         KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
         KeyCode::Enter => {
             if app.session_list_index >= app.session_list.len() {
-                tracing::info!("New session requested");
+                // "New Session" selected → show text input with default name
+                app.session_name_input = app.default_session_name();
+                app.mode = AppMode::Popup(PopupMenu::NewSessionInput);
             } else {
-                let session = &app.session_list[app.session_list_index];
-                tracing::info!("Switch to session: {}", session.name);
+                // Resume existing session
+                let session = app.session_list[app.session_list_index].clone();
+                let workers = session.worker_count as u16;
+                match app.start_session(&session.name, workers, true) {
+                    Ok(()) => {
+                        tracing::info!("Resumed session: {}", session.name);
+                        update_proxy_config(app);
+                        app.mode = AppMode::Normal;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to resume session '{}': {}", session.name, e);
+                    }
+                }
             }
-            app.mode = AppMode::Normal;
         }
         _ => {}
     }
@@ -229,6 +272,117 @@ fn handle_complete_session_keys(app: &mut App, key: KeyEvent) {
             app.should_quit = true;
         }
         _ => {}
+    }
+}
+
+fn handle_new_session_input_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Go back to session list
+            app.session_name_input.clear();
+            app.load_session_list();
+            app.mode = AppMode::Popup(PopupMenu::SessionList);
+            app.session_list_index = 0;
+        }
+        KeyCode::Enter => {
+            let name = app.session_name_input.trim().to_string();
+            if !name.is_empty() {
+                let workers = app.requested_workers;
+                match app.start_session(&name, workers, false) {
+                    Ok(()) => {
+                        tracing::info!("Created new session: {}", name);
+                        app.session_name_input.clear();
+                        update_proxy_config(app);
+                        app.mode = AppMode::Normal;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to create session '{}': {}", name, e);
+                    }
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            app.session_name_input.pop();
+        }
+        KeyCode::Char(c) => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && (c.is_alphanumeric() || c == '-' || c == '_')
+            {
+                app.session_name_input.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_remove_worker_list_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Popup(PopupMenu::Main);
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Enter => {
+            // Proceed to confirm dialog
+            app.remove_worker_strategy_index = 0;
+            app.mode = AppMode::Popup(PopupMenu::RemoveWorkerConfirm);
+        }
+        _ => {}
+    }
+}
+
+fn handle_remove_worker_confirm_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Back to worker list
+            app.mode = AppMode::Popup(PopupMenu::RemoveWorkerList);
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Enter => {
+            let strategy = match app.remove_worker_strategy_index {
+                0 => "merge",
+                1 => "keep",
+                _ => "discard",
+            };
+            // pane_index = remove_worker_target + 1 (skip leader)
+            let pane_index = app.remove_worker_target + 1;
+            app.pending_remove_worker = Some((pane_index, strategy.to_string()));
+            app.mode = AppMode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn navigate_ticket_down(app: &mut App) {
+    if let Some(ref tickets) = app.ticket_snapshot {
+        if tickets.is_empty() {
+            return;
+        }
+        let ids: Vec<usize> = tickets.iter().map(|t| t.id).collect();
+        let current_pos = ids.iter().position(|&id| id == app.kanban_selected).unwrap_or(0);
+        let next = if current_pos + 1 < ids.len() {
+            current_pos + 1
+        } else {
+            0
+        };
+        app.kanban_selected = ids[next];
+    }
+}
+
+fn navigate_ticket_up(app: &mut App) {
+    if let Some(ref tickets) = app.ticket_snapshot {
+        if tickets.is_empty() {
+            return;
+        }
+        let ids: Vec<usize> = tickets.iter().map(|t| t.id).collect();
+        let current_pos = ids.iter().position(|&id| id == app.kanban_selected).unwrap_or(0);
+        let prev = if current_pos > 0 {
+            current_pos - 1
+        } else {
+            ids.len() - 1
+        };
+        app.kanban_selected = ids[prev];
     }
 }
 
