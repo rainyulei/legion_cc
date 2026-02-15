@@ -42,14 +42,14 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
                 return InputResult::Continue;
             }
             KeyCode::Enter => {
-                if !app.kanban_detail {
-                    app.kanban_detail = true;
+                if !app.board_detail_open {
+                    app.board_detail_open = true;
                 }
                 return InputResult::Continue;
             }
             KeyCode::Esc => {
-                if app.kanban_detail {
-                    app.kanban_detail = false;
+                if app.board_detail_open {
+                    app.board_detail_open = false;
                 } else {
                     app.right_panel_focused = false;
                 }
@@ -360,13 +360,13 @@ fn navigate_ticket_down(app: &mut App) {
             return;
         }
         let ids: Vec<usize> = tickets.iter().map(|t| t.id).collect();
-        let current_pos = ids.iter().position(|&id| id == app.kanban_selected).unwrap_or(0);
+        let current_pos = ids.iter().position(|&id| id == app.board_selected).unwrap_or(0);
         let next = if current_pos + 1 < ids.len() {
             current_pos + 1
         } else {
             0
         };
-        app.kanban_selected = ids[next];
+        app.board_selected = ids[next];
     }
 }
 
@@ -376,13 +376,13 @@ fn navigate_ticket_up(app: &mut App) {
             return;
         }
         let ids: Vec<usize> = tickets.iter().map(|t| t.id).collect();
-        let current_pos = ids.iter().position(|&id| id == app.kanban_selected).unwrap_or(0);
+        let current_pos = ids.iter().position(|&id| id == app.board_selected).unwrap_or(0);
         let prev = if current_pos > 0 {
             current_pos - 1
         } else {
             ids.len() - 1
         };
-        app.kanban_selected = ids[prev];
+        app.board_selected = ids[prev];
     }
 }
 

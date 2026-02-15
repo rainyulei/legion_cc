@@ -161,10 +161,10 @@ pub struct App {
     // Saved per-pane configs (label → (provider_id, model))
     saved_pane_configs: HashMap<String, (String, Option<String>)>,
 
-    // Kanban board state (Ctrl+T dashboard)
-    pub kanban_selected: usize,         // selected worker index in kanban view (0-based, workers only)
-    pub kanban_detail: bool,            // whether showing detail view for selected worker
-    pub kanban_detail_scroll: usize,    // scroll offset in detail view
+    // Board state (squad task board)
+    pub board_selected: usize,          // selected ticket id in board view
+    pub board_detail_open: bool,        // whether showing detail popup for selected ticket
+    pub board_detail_scroll: usize,     // scroll offset in detail popup
 }
 
 impl App {
@@ -206,9 +206,9 @@ impl App {
             remove_worker_target: 0,
             remove_worker_strategy_index: 0,
             saved_pane_configs: HashMap::new(),
-            kanban_selected: 0,
-            kanban_detail: false,
-            kanban_detail_scroll: 0,
+            board_selected: 0,
+            board_detail_open: false,
+            board_detail_scroll: 0,
         }
     }
 

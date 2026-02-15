@@ -9,7 +9,7 @@ use ratatui::{
 };
 use tui_term::widget::PseudoTerminal;
 
-use legion_core::{TicketSnapshot, TicketStatus};
+use legion_core::{TeamMode, TicketSnapshot, TicketStatus};
 
 use crate::app::{App, AppMode, MainMenuItem, MatrixCol, ModelTarget, PopupMenu};
 
@@ -33,6 +33,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // Draw popup overlay if in popup mode
     if let AppMode::Popup(menu) = app.mode {
         draw_popup(frame, app, menu);
+    }
+
+    // Draw board detail popup overlay (squad mode)
+    if app.board_detail_open && app.is_squad() {
+        draw_board_detail_popup(frame, app);
     }
 }
 
@@ -139,12 +144,8 @@ fn draw_squad_layout(frame: &mut Frame, app: &App, area: Rect) {
     // Center: draggable divider
     draw_divider(frame, app, h_chunks[1]);
 
-    // Right: Task Board (kanban)
-    if app.kanban_detail {
-        draw_ticket_detail(frame, app, h_chunks[2]);
-    } else {
-        draw_task_board(frame, app, h_chunks[2]);
-    }
+    // Right: Squad Board (always visible; detail is a popup overlay)
+    draw_task_board(frame, app, h_chunks[2]);
 }
 
 /// Draw the vertical divider between leader and task board
@@ -200,13 +201,13 @@ fn draw_pane(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     frame.render_widget(content, area);
 }
 
-/// Draw the embedded task board in the right panel
+/// Draw the embedded squad board in the right panel
 fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.right_panel_focused;
     let border_color = if is_focused { Color::Blue } else { Color::DarkGray };
 
     let block = Block::default()
-        .title(" Task Board ")
+        .title(" Squad Board ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
 
@@ -219,144 +220,315 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let mut items: Vec<ListItem> = Vec::new();
-
-    // Working tickets first
+    // Partition tickets by status
     let working: Vec<&TicketSnapshot> = tickets.iter().filter(|t| t.status == TicketStatus::Working).collect();
-    if !working.is_empty() {
-        items.push(ListItem::new(Line::from(Span::styled(
-            " WORKING", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ))));
-        for t in &working {
-            items.push(ticket_list_item(t, app));
-        }
-    }
-
-    // Queued tickets
     let queued: Vec<&TicketSnapshot> = tickets.iter().filter(|t| t.status == TicketStatus::Queued).collect();
-    if !queued.is_empty() {
-        items.push(ListItem::new(Line::from(Span::styled(
-            " QUEUED", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ))));
-        for t in &queued {
-            items.push(ticket_list_item(t, app));
-        }
-    }
-
-    // Done tickets
     let done: Vec<&TicketSnapshot> = tickets.iter().filter(|t| t.status == TicketStatus::Done).collect();
-    if !done.is_empty() {
-        items.push(ListItem::new(Line::from(Span::styled(
-            " DONE", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ))));
-        for t in &done {
-            items.push(ticket_list_item(t, app));
-        }
-    }
-
-    // Error tickets
     let errored: Vec<&TicketSnapshot> = tickets.iter().filter(|t| t.status == TicketStatus::Error).collect();
-    if !errored.is_empty() {
-        items.push(ListItem::new(Line::from(Span::styled(
-            " ERROR", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ))));
-        for t in &errored {
-            items.push(ticket_list_item(t, app));
-        }
+
+    // Build lines to render inside the outer block
+    let inner = block.inner(area);
+    let mut lines: Vec<Line> = Vec::new();
+
+    // --- WORKING section: bordered cards ---
+    let selected_prefix = |ticket_id: usize| -> &'static str {
+        if app.right_panel_focused && app.board_selected == ticket_id { "\u{25b6} " } else { "  " }
+    };
+
+    lines.push(Line::from(Span::styled(
+        format!(" \u{25b6} WORKING ({})", working.len()),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )));
+    for t in &working {
+        let w_label = t.assigned_worker.map(|w| format!("W{}", w)).unwrap_or_default();
+        let team_short = team_mode_short(&t.team_mode);
+        let card_width = inner.width.saturating_sub(4) as usize;
+        let title_line = format!("#{} {}", t.id, t.title);
+        let suffix = format!(" {} ", w_label);
+        let pad_len = card_width.saturating_sub(title_line.len() + suffix.len() + 2);
+        let dashes = "\u{2500}".repeat(pad_len.min(60));
+
+        let sel = app.right_panel_focused && app.board_selected == t.id;
+        let border_col = if sel { Color::Yellow } else { Color::DarkGray };
+
+        // Top border
+        let top = format!("{}\u{250c}\u{2500} {} {}{}\u{2510}",
+            selected_prefix(t.id),
+            title_line, dashes, suffix);
+        // Truncate to fit
+        let top_display: String = top.chars().take(inner.width as usize).collect();
+        lines.push(Line::from(Span::styled(top_display, Style::default().fg(border_col))));
+
+        // Content line
+        let detail = format!("iter {}/{} \u{00b7} {} \u{00b7} {}",
+            t.iteration, t.max_iterations, format_elapsed(t.elapsed_secs), team_short);
+        let content_line = format!("  \u{2502} {} ", detail);
+        let content_pad = card_width.saturating_sub(detail.len() + 2);
+        let content_full = format!("{}{}\u{2502}",
+            content_line, " ".repeat(content_pad.min(200)));
+        let content_display: String = content_full.chars().take(inner.width as usize).collect();
+        lines.push(Line::from(Span::styled(content_display, Style::default().fg(border_col))));
+
+        // Bottom border
+        let bot_inner = card_width.saturating_sub(0);
+        let bot = format!("  \u{2514}{}\u{2518}", "\u{2500}".repeat(bot_inner.min(200)));
+        let bot_display: String = bot.chars().take(inner.width as usize).collect();
+        lines.push(Line::from(Span::styled(bot_display, Style::default().fg(border_col))));
     }
 
-    frame.render_widget(List::new(items).block(block), area);
+    lines.push(Line::from(Span::raw("")));
+
+    // --- QUEUED section: compact ---
+    lines.push(Line::from(Span::styled(
+        format!(" \u{23f3} QUEUED ({})", queued.len()),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    for t in &queued {
+        lines.push(ticket_compact_line(t, app, false));
+    }
+
+    lines.push(Line::from(Span::raw("")));
+
+    // --- DONE section: compact with elapsed ---
+    lines.push(Line::from(Span::styled(
+        format!(" \u{2713} DONE ({})", done.len()),
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+    )));
+    for t in &done {
+        lines.push(ticket_compact_line(t, app, true));
+    }
+
+    lines.push(Line::from(Span::raw("")));
+
+    // --- ERROR section: compact ---
+    lines.push(Line::from(Span::styled(
+        format!(" \u{2717} ERROR ({})", errored.len()),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    for t in &errored {
+        let sel = app.right_panel_focused && app.board_selected == t.id;
+        let prefix = if sel { "\u{25b6} " } else { "  " };
+        let row_style = if sel {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("#{} ", t.id), Style::default().fg(Color::DarkGray)),
+            Span::styled(t.title.clone(), row_style),
+            Span::styled(
+                format!(" \u{00b7} ERR {}/{}", t.iteration, t.max_iterations),
+                Style::default().fg(Color::Red),
+            ),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn ticket_list_item<'a>(ticket: &TicketSnapshot, app: &App) -> ListItem<'a> {
-    let selected = app.kanban_selected == ticket.id;
-    let prefix = if selected && app.right_panel_focused { "\u{25b6} " } else { "  " };
-
-    let prompt_short = if ticket.prompt.len() > 30 {
-        format!("{}...", &ticket.prompt[..27])
-    } else {
-        ticket.prompt.clone()
-    };
-
-    let (status_str, status_color) = match ticket.status {
-        TicketStatus::Working => {
-            let w = ticket.assigned_worker.map(|w| format!("W{}", w)).unwrap_or_default();
-            (format!("{} [{}/{}]", w, ticket.iteration, ticket.max_iterations), Color::Yellow)
-        }
-        TicketStatus::Queued => ("".into(), Color::DarkGray),
-        TicketStatus::Done => (format_elapsed(ticket.elapsed_secs), Color::Green),
-        TicketStatus::Error => (format!("ERR {}/{}", ticket.iteration, ticket.max_iterations), Color::Red),
-    };
-
-    let row_style = if selected && app.right_panel_focused {
+/// Compact single-line ticket for Queued/Done sections
+fn ticket_compact_line<'a>(ticket: &TicketSnapshot, app: &App, show_elapsed: bool) -> Line<'a> {
+    let sel = app.right_panel_focused && app.board_selected == ticket.id;
+    let prefix = if sel { "\u{25b6} " } else { "  " };
+    let row_style = if sel {
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };
 
-    ListItem::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(prefix.to_string(), Style::default().fg(Color::Yellow)),
-        Span::styled(format!("#{:<3}", ticket.id), Style::default().fg(Color::DarkGray)),
-        Span::styled(prompt_short, row_style),
-        Span::styled(format!(" {}", status_str), Style::default().fg(status_color)),
-    ]))
+        Span::styled(format!("#{} ", ticket.id), Style::default().fg(Color::DarkGray)),
+        Span::styled(ticket.title.clone(), row_style),
+    ];
+    if show_elapsed && ticket.elapsed_secs > 0 {
+        spans.push(Span::styled(
+            format!(" \u{00b7} {}", format_elapsed(ticket.elapsed_secs)),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    Line::from(spans)
 }
 
-/// Ticket detail view: show worker SDK output or ticket info
-fn draw_ticket_detail(frame: &mut Frame, app: &App, area: Rect) {
-    let is_focused = app.right_panel_focused;
-    let border_color = if is_focused { Color::Blue } else { Color::DarkGray };
+/// Short display for TeamMode
+fn team_mode_short(mode: &TeamMode) -> &str {
+    match mode {
+        TeamMode::TechLeadTeam => "TechLead",
+        TeamMode::Solo => "Solo",
+        TeamMode::Custom(_) => "Custom",
+    }
+}
+
+
+/// Popup detail view for a selected ticket (rendered as a centered overlay)
+fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
+    let popup_area = centered_rect(80, 80, frame.area());
+    frame.render_widget(Clear, popup_area);
 
     let ticket = app.ticket_snapshot.as_ref()
-        .and_then(|ts| ts.iter().find(|t| t.id == app.kanban_selected));
+        .and_then(|ts| ts.iter().find(|t| t.id == app.board_selected));
 
     let title = match ticket {
-        Some(t) => format!(" #{} [Esc: back] ", t.id),
-        None => " Ticket Detail [Esc: back] ".to_string(),
+        Some(t) => format!(" #{} {} ", t.id, t.title),
+        None => " Ticket Detail ".to_string(),
     };
 
     let block = Block::default()
         .title(title)
+        .title_bottom(Line::from(" [Esc: close] ").centered())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black));
 
-    // Try to render SDK parser output using PseudoTerminal
-    let pane_idx = ticket.and_then(|t| t.assigned_worker).map(|w| w as usize);
+    let inner = block.inner(popup_area);
 
+    let Some(t) = ticket else {
+        let content = Paragraph::new("  No ticket selected")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(block);
+        frame.render_widget(content, popup_area);
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // --- Header section ---
+    let status_str = match t.status {
+        TicketStatus::Working => {
+            let w = t.assigned_worker.map(|w| format!("W{}", w)).unwrap_or_default();
+            format!("Working \u{00b7} {} \u{00b7} iter {}/{} \u{00b7} {}",
+                w, t.iteration, t.max_iterations, format_elapsed(t.elapsed_secs))
+        }
+        TicketStatus::Queued => "Queued".to_string(),
+        TicketStatus::Done => format!("Done \u{00b7} {}", format_elapsed(t.elapsed_secs)),
+        TicketStatus::Error => format!("Error \u{00b7} iter {}/{} \u{00b7} {}",
+            t.iteration, t.max_iterations, format_elapsed(t.elapsed_secs)),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Status: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(status_str, Style::default().fg(Color::White)),
+    ]));
+
+    let team_str = match &t.team_mode {
+        TeamMode::TechLeadTeam => "TechLeadTeam".to_string(),
+        TeamMode::Solo => "Solo".to_string(),
+        TeamMode::Custom(s) => format!("Custom({})", s),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Team: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(team_str, Style::default().fg(Color::White)),
+    ]));
+
+    if let Some(ref ctx) = t.context {
+        lines.push(Line::from(vec![
+            Span::styled(" Context: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(ctx.clone(), Style::default().fg(Color::White)),
+        ]));
+    }
+
+    if let Some(ref crit) = t.criteria {
+        lines.push(Line::from(vec![
+            Span::styled(" Criteria: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(crit.clone(), Style::default().fg(Color::White)),
+        ]));
+    }
+
+    lines.push(Line::from(Span::raw("")));
+
+    // --- Progress section ---
+    let pane_idx = t.assigned_worker.map(|w| w as usize);
     if let Some(idx) = pane_idx {
-        if let Some(parser) = app.parser_at(idx) {
-            if let Ok(p) = parser.lock() {
-                let pseudo_term = PseudoTerminal::new(p.screen()).block(block);
-                frame.render_widget(pseudo_term, area);
-                return;
+        if let Some(pane) = app.panes.get(idx) {
+            if !pane.sdk_entries.is_empty() {
+                let separator_width = inner.width.saturating_sub(2) as usize;
+                let progress_header = format!(" \u{2500}\u{2500}\u{2500} Progress {}", "\u{2500}".repeat(separator_width.saturating_sub(14)));
+                lines.push(Line::from(Span::styled(progress_header, Style::default().fg(Color::DarkGray))));
+
+                for entry in &pane.sdk_entries {
+                    let display = entry.display();
+                    lines.push(Line::from(Span::styled(
+                        format!(" {}", display),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+                lines.push(Line::from(Span::raw("")));
             }
         }
     }
 
-    // Fallback: show ticket info as text
-    let mut lines = Vec::new();
-    if let Some(t) = ticket {
-        lines.push(Line::from(vec![
-            Span::styled("  Task: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(t.prompt.clone(), Style::default().fg(Color::White)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  Status: {:?} | Iter: {}/{} | Elapsed: {}",
-                    t.status, t.iteration, t.max_iterations, format_elapsed(t.elapsed_secs)),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        if let Some(ref fb) = t.feedback {
-            lines.push(Line::from(Span::raw("")));
-            lines.push(Line::from(Span::styled("  Last Feedback:", Style::default().fg(Color::Yellow))));
-            lines.push(Line::from(Span::styled(format!("  {}", fb), Style::default().fg(Color::White))));
-        }
-    } else {
-        lines.push(Line::from(Span::styled("  No ticket selected", Style::default().fg(Color::DarkGray))));
+    // --- Terminal Output section ---
+    // We render the terminal below the text lines if there's a parser
+    let _text_height = lines.len() as u16;
+    let scroll = app.board_detail_scroll as u16;
+
+    // Check if we have terminal output to show
+    let has_terminal = pane_idx
+        .and_then(|idx| app.parser_at(idx))
+        .is_some();
+
+    if has_terminal {
+        let separator_width = inner.width.saturating_sub(2) as usize;
+        let term_header = format!(" \u{2500}\u{2500}\u{2500} Terminal Output {}", "\u{2500}".repeat(separator_width.saturating_sub(20)));
+        lines.push(Line::from(Span::styled(term_header, Style::default().fg(Color::DarkGray))));
     }
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    // --- Summary section (Done/Error only) ---
+    if matches!(t.status, TicketStatus::Done | TicketStatus::Error) {
+        if let Some(ref summary) = t.summary {
+            if !has_terminal {
+                lines.push(Line::from(Span::raw("")));
+            }
+            let separator_width = inner.width.saturating_sub(2) as usize;
+            let sum_header = format!(" \u{2500}\u{2500}\u{2500} Summary {}", "\u{2500}".repeat(separator_width.saturating_sub(13)));
+            lines.push(Line::from(Span::styled(sum_header, Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(
+                format!(" {}", summary),
+                Style::default().fg(Color::White),
+            )));
+        }
+    }
+
+    // Calculate layout: text area + terminal area
+    let updated_text_height = lines.len() as u16;
+
+    if has_terminal && inner.height > updated_text_height + 1 {
+        // Split inner area between text and terminal
+        let text_area_height = updated_text_height.min(inner.height / 2);
+        let term_area_height = inner.height.saturating_sub(text_area_height);
+
+        let inner_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(text_area_height),
+                Constraint::Length(term_area_height),
+            ])
+            .split(inner);
+
+        // Render text with scroll
+        let text_paragraph = Paragraph::new(lines).scroll((scroll, 0));
+        frame.render_widget(block, popup_area);
+        frame.render_widget(text_paragraph, inner_chunks[0]);
+
+        // Render terminal
+        if let Some(idx) = pane_idx {
+            if let Some(parser) = app.parser_at(idx) {
+                if let Ok(p) = parser.lock() {
+                    let term_block = Block::default()
+                        .borders(Borders::TOP)
+                        .border_style(Style::default().fg(Color::DarkGray));
+                    let pseudo_term = PseudoTerminal::new(p.screen()).block(term_block);
+                    frame.render_widget(pseudo_term, inner_chunks[1]);
+                }
+            }
+        }
+    } else {
+        // No terminal or not enough space: just render text
+        let paragraph = Paragraph::new(lines)
+            .scroll((scroll, 0))
+            .block(block);
+        frame.render_widget(paragraph, popup_area);
+    }
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
