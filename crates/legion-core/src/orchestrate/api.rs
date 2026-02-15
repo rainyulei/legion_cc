@@ -110,7 +110,12 @@ async fn handle_submit(
 
     #[derive(serde::Deserialize)]
     struct SubmitRequest {
+        title: String,
         ticket: String,
+        #[serde(default)]
+        context: Option<String>,
+        #[serde(default)]
+        criteria: Option<String>,
         #[serde(default)]
         team_mode: Option<super::engine::TeamMode>,
         #[serde(default = "default_max_iter")]
@@ -124,7 +129,7 @@ async fn handle_submit(
         Ok(req) => {
             let mode = req.team_mode.unwrap_or_default();
             let id = engine
-                .submit_ticket(req.ticket, mode, req.max_iterations)
+                .submit_ticket(req.title, req.ticket, req.context, req.criteria, mode, req.max_iterations)
                 .await;
             Ok(json_response(
                 StatusCode::OK,
@@ -168,8 +173,13 @@ async fn handle_dispatch_compat(
 
     match serde_json::from_slice::<DispatchRequest>(&body_bytes) {
         Ok(req) => {
+            let title = if req.ticket.len() > 40 {
+                format!("{}...", &req.ticket[..37])
+            } else {
+                req.ticket.clone()
+            };
             let id = engine
-                .submit_ticket(req.ticket, super::engine::TeamMode::default(), 5)
+                .submit_ticket(title, req.ticket, None, None, super::engine::TeamMode::default(), 5)
                 .await;
             Ok(json_response(
                 StatusCode::OK,

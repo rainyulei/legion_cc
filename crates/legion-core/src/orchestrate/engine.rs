@@ -31,6 +31,9 @@ impl Default for TeamMode {
 pub struct TaskTicket {
     pub id: usize,
     pub prompt: String,
+    pub title: String,
+    pub context: Option<String>,
+    pub criteria: Option<String>,
     pub status: TicketStatus,
     pub assigned_worker: Option<u16>,
     pub team_mode: TeamMode,
@@ -53,6 +56,9 @@ impl TaskTicket {
 pub struct TicketSnapshot {
     pub id: usize,
     pub prompt: String,
+    pub title: String,
+    pub context: Option<String>,
+    pub criteria: Option<String>,
     pub status: TicketStatus,
     pub assigned_worker: Option<u16>,
     pub team_mode: TeamMode,
@@ -88,13 +94,19 @@ impl OrchestrateEngine {
         }
     }
 
-    pub async fn submit_ticket(&self, prompt: String, team_mode: TeamMode, max_iterations: u16) -> usize {
+    pub async fn submit_ticket(
+        &self, title: String, prompt: String, context: Option<String>, criteria: Option<String>,
+        team_mode: TeamMode, max_iterations: u16,
+    ) -> usize {
         let mut guard = self.inner.write().await;
         let id = guard.next_ticket_id;
         guard.next_ticket_id += 1;
         guard.tickets.push(TaskTicket {
             id,
             prompt,
+            title,
+            context,
+            criteria,
             status: TicketStatus::Queued,
             assigned_worker: None,
             team_mode,
@@ -200,6 +212,9 @@ fn ticket_to_snapshot(t: &TaskTicket) -> TicketSnapshot {
     TicketSnapshot {
         id: t.id,
         prompt: t.prompt.clone(),
+        title: t.title.clone(),
+        context: t.context.clone(),
+        criteria: t.criteria.clone(),
         status: t.status,
         assigned_worker: t.assigned_worker,
         team_mode: t.team_mode.clone(),
