@@ -105,6 +105,10 @@ fn main() {
                 .get("ticket_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
+            let title = t
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let ticket_text = t
                 .get("ticket")
                 .and_then(|v| v.as_str())
@@ -112,7 +116,9 @@ fn main() {
             let worker = t.get("worker_id").and_then(|v| v.as_u64());
             let elapsed = t.get("elapsed_secs").and_then(|v| v.as_u64()).unwrap_or(0);
 
-            let display_ticket = if ticket_text.chars().count() > 50 {
+            let display_ticket = if !title.is_empty() {
+                title.to_string()
+            } else if ticket_text.chars().count() > 50 {
                 let truncated: String = ticket_text.chars().take(47).collect();
                 format!("{}...", truncated)
             } else {

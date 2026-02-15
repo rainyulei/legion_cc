@@ -1,7 +1,7 @@
 //! legion-dispatch — Submit a ticket to the orchestrate queue
 //!
-//! Usage: legion-dispatch <worker_id> "ticket text"
-//! POSTs to /legion/orchestrate/submit with {"ticket": "...", "team_mode": "tech_lead_team"}
+//! Usage: legion-dispatch <worker_id> [-t "title"] "ticket text"
+//! POSTs to /legion/orchestrate/submit with {"title": "...", "ticket": "...", "team_mode": "tech_lead_team"}
 //! (worker_id is kept for CLI compat but ignored by queue)
 
 use std::env;
@@ -18,7 +18,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Usage: legion-dispatch <worker_id> \"ticket text\"");
+        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] \"ticket text\"");
         process::exit(1);
     }
 
@@ -30,12 +30,36 @@ fn main() {
         }
     };
 
-    let ticket = args[2..].join(" ");
+    // Parse optional --title / -t flag
+    let mut title: Option<String> = None;
+    let mut ticket_start = 2;
+    if args.len() > 3 && (args[2] == "-t" || args[2] == "--title") {
+        title = Some(args[3].clone());
+        ticket_start = 4;
+    }
+
+    if ticket_start >= args.len() {
+        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] \"ticket text\"");
+        process::exit(1);
+    }
+
+    let ticket = args[ticket_start..].join(" ");
+
+    // Auto-generate title from first 40 chars if not provided
+    let title = title.unwrap_or_else(|| {
+        let t: String = ticket.chars().take(40).collect();
+        if ticket.chars().count() > 40 {
+            format!("{}...", t)
+        } else {
+            t
+        }
+    });
 
     let port = get_orchestrate_port();
     let url = format!("http://127.0.0.1:{}/legion/orchestrate/submit", port);
 
     let body = serde_json::json!({
+        "title": title,
         "ticket": ticket,
         "team_mode": "tech_lead_team",
     });
