@@ -667,6 +667,13 @@ fn handle_max_retries_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             app.default_max_iterations = (app.submenu_index as u16) + 1;
             app.pending_sync_max_iterations = true;
+            // Persist to DB
+            if let Some(ref mut session) = app.current_session {
+                session.max_iterations = Some(app.default_max_iterations as i64);
+                if let Ok(repo) = legion_db::open_db() {
+                    let _ = repo.upsert_squad_session(session);
+                }
+            }
             app.mode = AppMode::Popup(PopupMenu::Main);
             tracing::info!("Max retries set to {}", app.default_max_iterations);
         }

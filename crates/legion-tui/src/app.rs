@@ -737,6 +737,7 @@ impl App {
             base_branch: self.detected_branch.clone(),
             base_commit: self.detected_commit.clone(),
             last_active_at: Some(now),
+            max_iterations: Some(self.default_max_iterations as i64),
         };
 
         if let Ok(repo) = legion_db::open_db() {
@@ -931,6 +932,11 @@ impl App {
                 let _ = repo.touch_squad_session(name);
             }
             let session_is_default = self.current_session.as_ref().map(|s| s.is_default).unwrap_or(is_default);
+            // Restore max_iterations from session config
+            if let Some(mi) = self.current_session.as_ref().and_then(|s| s.max_iterations) {
+                self.default_max_iterations = mi as u16;
+                self.pending_sync_max_iterations = true;
+            }
 
             let mut paths = Vec::new();
             if session_is_default {

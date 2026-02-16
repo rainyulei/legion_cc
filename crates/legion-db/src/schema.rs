@@ -108,6 +108,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN base_branch TEXT", []);
     let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN base_commit TEXT", []);
     let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN last_active_at INTEGER", []);
+    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN max_iterations INTEGER", []);
     let _ = conn.execute("ALTER TABLE tickets ADD COLUMN origin_session TEXT", []);
     Ok(())
 }
