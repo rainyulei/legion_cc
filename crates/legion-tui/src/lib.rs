@@ -83,63 +83,25 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     let size = terminal.size()?;
     app.term_size = (size.width, size.height);
 
-    // Check for default session — auto-resume if exists
-    let default_session = if let Ok(repo) = legion_db::open_db() {
-        let pp = app.project_path.as_ref().unwrap().to_string_lossy().to_string();
-        repo.get_default_squad_session(&pp).ok().flatten()
+    // Detect current branch
+    if let Some(ref project_path) = app.project_path {
+        app.detected_branch = crate::worktree::current_branch(project_path);
+        app.detected_commit = crate::worktree::current_commit(project_path);
+    }
+
+    // Always show session list on startup — let user choose
+    app.load_session_list();
+
+    if app.session_list.iter().any(|s| s.status == "active") {
+        // Has existing sessions — show session list, pre-select default session
+        let default_idx = app.session_list.iter()
+            .position(|s| s.is_default && s.status == "active")
+            .unwrap_or(0);
+        app.session_list_index = default_idx;
+        app.mode = app::AppMode::Popup(app::PopupMenu::SessionList);
     } else {
-        None
-    };
-
-    if let Some(default_sess) = default_session {
-        // Detect current branch
-        if let Some(ref project_path) = app.project_path {
-            app.detected_branch = crate::worktree::current_branch(project_path);
-            app.detected_commit = crate::worktree::current_commit(project_path);
-        }
-
-        // Check if session's branch was deleted
-        let branch_deleted = if let (Some(ref branch), Some(ref project_path)) = (&default_sess.base_branch, &app.project_path) {
-            !crate::worktree::branch_exists(project_path, branch)
-        } else {
-            false
-        };
-
-        if branch_deleted {
-            // Show recovery dialog instead of auto-resuming
-            app.recovery_session = Some(default_sess);
-            app.recovery_choice = 0;
-            app.mode = app::AppMode::Popup(app::PopupMenu::BranchRecovery);
-        } else {
-            // Normal auto-resume
-            let workers = default_sess.worker_count as u16;
-            match app.start_session(&default_sess.name, workers, true, true) {
-                Ok(()) => {
-                    tracing::info!("Auto-resumed default session: {}", default_sess.name);
-                    app.mode = app::AppMode::Normal;
-                }
-                Err(e) => {
-                    tracing::error!("Failed to resume default session: {}", e);
-                    // Use branch name if detected, otherwise fallback
-                    if let Some(ref branch) = app.detected_branch {
-                        app.session_name_input = crate::worktree::sanitize_branch_name(branch);
-                    } else {
-                        app.session_name_input = app.default_session_name_for_default();
-                    }
-                    app.mode = app::AppMode::Popup(app::PopupMenu::NewSessionInput);
-                    app.creating_default_session = true;
-                }
-            }
-        }
-    } else {
-        // No default session — first-time setup with branch detection
-        if let Some(ref project_path) = app.project_path {
-            app.detected_branch = crate::worktree::current_branch(project_path);
-            app.detected_commit = crate::worktree::current_commit(project_path);
-        }
-        if app.detected_branch.is_some() {
-            // Auto-fill session name from branch
-            let branch = app.detected_branch.as_ref().unwrap();
+        // No sessions — go to new session input with branch auto-fill
+        if let Some(ref branch) = app.detected_branch {
             app.session_name_input = crate::worktree::sanitize_branch_name(branch);
         } else {
             app.session_name_input = app.default_session_name_for_default();
