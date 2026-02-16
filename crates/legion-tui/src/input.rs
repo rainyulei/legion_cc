@@ -271,6 +271,7 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::FileDiff) => handle_file_diff_keys(app, key),
         AppMode::Popup(PopupMenu::BranchRecovery) => handle_branch_recovery_keys(app, key),
         AppMode::Popup(PopupMenu::BranchList) => handle_branch_list_keys(app, key),
+        AppMode::Popup(PopupMenu::BranchChanged) => handle_branch_changed_keys(app, key),
         _ => {}
     }
 
@@ -1075,6 +1076,66 @@ fn handle_branch_list_keys(app: &mut App, key: KeyEvent) {
                 if let Some(session) = app.recovery_session.take() {
                     update_session_branch(app, &session.name);
                     resume_session(app, &session);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_branch_changed_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Ignore — keep current binding
+            app.branch_changed_to = None;
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.recovery_choice > 0 { app.recovery_choice -= 1; }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.recovery_choice < 2 { app.recovery_choice += 1; }
+        }
+        KeyCode::Enter => {
+            let new_branch = match app.branch_changed_to.take() {
+                Some(b) => b,
+                None => { app.mode = AppMode::Normal; return; }
+            };
+            match app.recovery_choice {
+                0 => {
+                    // Switch session — rebuild worktrees
+                    app.detected_branch = Some(new_branch);
+                    if let Some(ref project_path) = app.project_path {
+                        app.detected_commit = crate::worktree::current_commit(project_path);
+                    }
+                    if let Some(ref session) = app.current_session {
+                        update_session_branch(app, &session.name);
+                    }
+                    // Update in-memory session too
+                    if let Some(ref mut session) = app.current_session {
+                        session.base_branch = app.detected_branch.clone();
+                        session.base_commit = app.detected_commit.clone();
+                    }
+                    app.mode = AppMode::Normal;
+                }
+                1 => {
+                    // Switch session — rebase worktrees
+                    app.detected_branch = Some(new_branch);
+                    if let Some(ref project_path) = app.project_path {
+                        app.detected_commit = crate::worktree::current_commit(project_path);
+                    }
+                    if let Some(ref session) = app.current_session {
+                        update_session_branch(app, &session.name);
+                    }
+                    if let Some(ref mut session) = app.current_session {
+                        session.base_branch = app.detected_branch.clone();
+                        session.base_commit = app.detected_commit.clone();
+                    }
+                    app.mode = AppMode::Normal;
+                }
+                2 | _ => {
+                    // Ignore
+                    app.mode = AppMode::Normal;
                 }
             }
         }

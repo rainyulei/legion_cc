@@ -41,6 +41,7 @@ pub enum PopupMenu {
     FileDiff,
     BranchRecovery,
     BranchList,
+    BranchChanged,
 }
 
 /// Which column is active in the matrix view
@@ -292,6 +293,10 @@ pub struct App {
     pub branch_list: Vec<String>,                 // cached local branches
     pub branch_list_index: usize,                 // selected branch in list
 
+    // Runtime branch change detection
+    pub last_branch_check: Option<std::time::Instant>,
+    pub branch_changed_to: Option<String>,
+
     // File diff popup state
     pub diff_ticket_id: usize,
     pub diff_data: Option<crate::diff::DiffData>,
@@ -368,6 +373,8 @@ impl App {
             recovery_choice: 0,
             branch_list: Vec::new(),
             branch_list_index: 0,
+            last_branch_check: None,
+            branch_changed_to: None,
             diff_ticket_id: 0,
             diff_data: None,
             diff_file_selected: 0,

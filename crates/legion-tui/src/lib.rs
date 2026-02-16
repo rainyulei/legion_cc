@@ -219,6 +219,27 @@ async fn run_event_loop(
             read_leader_status(app);
         }
 
+        // Periodic branch check (every 5s)
+        if app.mode == app::AppMode::Normal {
+            let should_check = app.last_branch_check
+                .map(|t| t.elapsed().as_secs() >= 5)
+                .unwrap_or(true);
+            if should_check {
+                app.last_branch_check = Some(std::time::Instant::now());
+                if let (Some(ref session), Some(ref project_path)) = (&app.current_session, &app.project_path) {
+                    if let Some(ref base_branch) = session.base_branch {
+                        if let Some(current) = crate::worktree::current_branch(project_path) {
+                            if &current != base_branch {
+                                app.branch_changed_to = Some(current);
+                                app.recovery_choice = 0;
+                                app.mode = app::AppMode::Popup(app::PopupMenu::BranchChanged);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         terminal.draw(|frame| draw(frame, app))?;
 
         if event::poll(std::time::Duration::from_millis(50))? {

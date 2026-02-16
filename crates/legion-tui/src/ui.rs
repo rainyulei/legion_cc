@@ -702,7 +702,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
                     Span::styled(": Back", Style::default().fg(Color::DarkGray)),
                 ],
-                PopupMenu::BranchRecovery | PopupMenu::BranchList => vec![
+                PopupMenu::BranchRecovery | PopupMenu::BranchList | PopupMenu::BranchChanged => vec![
                     Span::styled(" j/k", Style::default().fg(Color::Yellow)),
                     Span::styled(": Navigate ", Style::default().fg(Color::DarkGray)),
                     Span::styled("Enter", Style::default().fg(Color::Yellow)),
@@ -736,7 +736,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
     let (pw, ph) = match menu {
         PopupMenu::RetryForm => (70, 80),
-        PopupMenu::BranchRecovery => (60, 40),
+        PopupMenu::BranchRecovery | PopupMenu::BranchChanged => (60, 30),
         PopupMenu::BranchList => (50, 60),
         PopupMenu::DeleteConfirm | PopupMenu::ClearConfirm => (50, 30),
         PopupMenu::SessionDeleteConfirm => (55, 40),
@@ -768,6 +768,7 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::FileDiff => draw_file_diff(frame, app, area),
         PopupMenu::BranchRecovery => draw_branch_recovery(frame, app, area),
         PopupMenu::BranchList => draw_branch_list(frame, app, area),
+        PopupMenu::BranchChanged => draw_branch_changed(frame, app, area),
     }
 }
 
@@ -1942,6 +1943,48 @@ fn draw_branch_recovery(frame: &mut Frame, app: &App, area: Rect) {
             format!("{}{}", prefix, opt),
             style,
         ))));
+    }
+
+    frame.render_widget(List::new(items).block(block), area);
+}
+
+fn draw_branch_changed(frame: &mut Frame, app: &App, area: Rect) {
+    let old = app.current_session.as_ref()
+        .and_then(|s| s.base_branch.as_deref())
+        .unwrap_or("unknown");
+    let new = app.branch_changed_to.as_deref().unwrap_or("unknown");
+
+    let block = Block::default()
+        .title(" Branch Changed [ESC=Ignore] ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let options = [
+        format!("Switch to '{}' (rebuild worktrees)", new),
+        format!("Switch to '{}' (rebase worktrees)", new),
+        "Ignore".to_string(),
+    ];
+
+    let mut items = vec![
+        ListItem::new(Line::from(vec![
+            Span::styled("  Branch changed: ", Style::default().fg(Color::Yellow)),
+            Span::styled(old, Style::default().fg(Color::Red)),
+            Span::styled(" \u{2192} ", Style::default().fg(Color::Yellow)),
+            Span::styled(new, Style::default().fg(Color::Green)),
+        ])),
+        ListItem::new(""),
+    ];
+
+    for (i, opt) in options.iter().enumerate() {
+        let selected = i == app.recovery_choice;
+        let prefix = if selected { "> " } else { "  " };
+        let style = if selected {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        items.push(ListItem::new(Line::from(Span::styled(format!("{}{}", prefix, opt), style))));
     }
 
     frame.render_widget(List::new(items).block(block), area);
