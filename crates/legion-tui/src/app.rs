@@ -925,9 +925,10 @@ impl App {
 
         // Create or verify worktrees
         let worktree_paths = if is_resume {
-            // Load session from DB to check is_default
+            // Load session from DB and update last_active_at
             if let Ok(repo) = legion_db::open_db() {
                 self.current_session = repo.get_squad_session(name).ok().flatten();
+                let _ = repo.touch_squad_session(name);
             }
             let session_is_default = self.current_session.as_ref().map(|s| s.is_default).unwrap_or(is_default);
 
