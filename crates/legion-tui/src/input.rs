@@ -1054,9 +1054,14 @@ fn handle_branch_recovery_keys(app: &mut App, key: KeyEvent) {
 fn handle_branch_list_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
-            // Back to recovery dialog
-            app.recovery_choice = 1;
-            app.mode = AppMode::Popup(PopupMenu::BranchRecovery);
+            if app.recovery_session.is_some() {
+                // Back to recovery dialog
+                app.recovery_choice = 1;
+                app.mode = AppMode::Popup(PopupMenu::BranchRecovery);
+            } else {
+                // Back to main menu (manual switch)
+                app.mode = AppMode::Popup(PopupMenu::Main);
+            }
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.branch_list_index > 0 { app.branch_list_index -= 1; }
@@ -1069,13 +1074,22 @@ fn handle_branch_list_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             if app.branch_list_index < app.branch_list.len() {
                 let branch = app.branch_list[app.branch_list_index].clone();
-                app.detected_branch = Some(branch);
+                app.detected_branch = Some(branch.clone());
                 if let Some(ref project_path) = app.project_path {
                     app.detected_commit = crate::worktree::current_commit(project_path);
                 }
                 if let Some(session) = app.recovery_session.take() {
+                    // Recovery flow — update and resume
                     update_session_branch(app, &session.name);
                     resume_session(app, &session);
+                } else {
+                    // Manual switch — update current session, show rebuild/rebase prompt
+                    if let Some(ref session) = app.current_session {
+                        update_session_branch(app, &session.name);
+                    }
+                    app.branch_changed_to = Some(branch);
+                    app.recovery_choice = 0;
+                    app.mode = AppMode::Popup(PopupMenu::BranchChanged);
                 }
             }
         }

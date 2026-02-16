@@ -68,6 +68,7 @@ pub enum MainMenuItem {
     AddWorker,
     RemoveWorker,
     SwitchSession,
+    SwitchBranch,
     CompleteSession,
     Quit,
 }
@@ -81,6 +82,7 @@ impl MainMenuItem {
             Self::AddWorker => "Add Worker",
             Self::RemoveWorker => "Remove Worker",
             Self::SwitchSession => "Switch Session",
+            Self::SwitchBranch => "Switch Branch",
             Self::CompleteSession => "Complete Session",
             Self::Quit => "Quit",
         }
@@ -1073,6 +1075,9 @@ impl App {
             if wc > 0 {
                 items.push(MainMenuItem::RemoveWorker);
             }
+            if self.current_session.as_ref().and_then(|s| s.base_branch.as_ref()).is_some() {
+                items.push(MainMenuItem::SwitchBranch);
+            }
         }
         items.push(MainMenuItem::SwitchSession);
         items.push(MainMenuItem::CompleteSession);
@@ -1125,6 +1130,14 @@ impl App {
                     MainMenuItem::RemoveWorker => {
                         self.remove_worker_target = 0;
                         self.mode = AppMode::Popup(PopupMenu::RemoveWorkerList);
+                    }
+                    MainMenuItem::SwitchBranch => {
+                        if let Some(ref project_path) = self.project_path {
+                            self.branch_list = crate::worktree::list_local_branches(project_path);
+                        }
+                        self.branch_list_index = 0;
+                        self.recovery_session = None;
+                        self.mode = AppMode::Popup(PopupMenu::BranchList);
                     }
                     MainMenuItem::SwitchSession => {
                         self.load_session_list();

@@ -809,6 +809,13 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
                 MainMenuItem::MaxRetries => {
                     format!("[{}]", app.default_max_iterations)
                 }
+                MainMenuItem::SwitchBranch => {
+                    if let Some(ref b) = app.detected_branch {
+                        format!("[{}]", b)
+                    } else {
+                        String::new()
+                    }
+                }
                 MainMenuItem::CompleteSession => String::new(),
                 MainMenuItem::Quit => String::new(),
             };
