@@ -106,9 +106,19 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
             }
         }
     } else {
-        // No default session — first-time setup
+        // No default session — first-time setup with branch detection
+        if let Some(ref project_path) = app.project_path {
+            app.detected_branch = crate::worktree::current_branch(project_path);
+            app.detected_commit = crate::worktree::current_commit(project_path);
+        }
+        if app.detected_branch.is_some() {
+            // Auto-fill session name from branch
+            let branch = app.detected_branch.as_ref().unwrap();
+            app.session_name_input = crate::worktree::sanitize_branch_name(branch);
+        } else {
+            app.session_name_input = app.default_session_name_for_default();
+        }
         app.mode = app::AppMode::Popup(app::PopupMenu::NewSessionInput);
-        app.session_name_input = app.default_session_name_for_default();
         app.creating_default_session = true;
     }
 
@@ -251,7 +261,35 @@ async fn run_event_loop(
                 let drained = app.panes[wi].sdk_task.as_mut()
                     .map(|sdk| sdk.drain_entries())
                     .unwrap_or_default();
+                if !drained.is_empty() {
+                    app.panes[wi].last_sdk_activity = Some(std::time::Instant::now());
+                }
                 app.panes[wi].sdk_entries.extend(drained);
+
+                // Timeout check: 5 min no SDK output → kill and report error
+                if app.panes[wi].sdk_task.is_some()
+                    && !app.panes[wi].sdk_task.as_ref().unwrap().is_finished()
+                {
+                    if let Some(last) = app.panes[wi].last_sdk_activity {
+                        if last.elapsed().as_secs() >= app::WORKER_TIMEOUT_SECS {
+                            let ticket_id = app.panes[wi].current_ticket_id.unwrap_or(0);
+                            tracing::warn!(
+                                "Worker {} ticket {} timed out (no output for {}s)",
+                                wi, ticket_id, app::WORKER_TIMEOUT_SECS
+                            );
+                            if let Some(ref mut sdk) = app.panes[wi].sdk_task {
+                                sdk.kill();
+                            }
+                            engine.report_iteration(ticket_id, false, Some("Worker timed out: no output for 5 minutes".into())).await;
+                            engine.force_error(ticket_id, "Timed out: no output for 5 minutes").await;
+                            app.panes[wi].sdk_task = None;
+                            app.panes[wi].current_ticket_id = None;
+                            app.panes[wi].sdk_log_buffer = None;
+                            app.panes[wi].last_sdk_activity = None;
+                            continue;
+                        }
+                    }
+                }
 
                 // Check if SDK finished — collect info before any mutation
                 let finished_info = {
@@ -360,6 +398,7 @@ async fn run_event_loop(
                     app.panes[wi].sdk_task = None;
                     app.panes[wi].current_ticket_id = None;
                     app.panes[wi].sdk_log_buffer = None;
+                    app.panes[wi].last_sdk_activity = None;
                 }
 
                 // If worker is idle and no SDK running, try to take next ticket
@@ -462,6 +501,7 @@ async fn handle_add_worker(app: &mut App) {
         sdk_entries: Vec::new(),
         current_ticket_id: None,
         sdk_log_buffer: None,
+        last_sdk_activity: None,
     });
 
     // Resize all panes to accommodate the new worker

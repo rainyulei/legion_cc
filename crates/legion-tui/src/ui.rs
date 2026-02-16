@@ -1164,26 +1164,43 @@ fn draw_new_session_input(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(Color::Green))
         .style(Style::default().bg(Color::DarkGray));
 
-    let items = vec![
-        ListItem::new(Line::from(Span::styled(
-            "  Enter session name:",
-            Style::default().fg(Color::White),
-        ))),
-        ListItem::new(Line::from(Span::raw(""))),
-        ListItem::new(Line::from(vec![
-            Span::styled("  > ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                app.session_name_input.as_str(),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("\u{2588}", Style::default().fg(Color::Yellow)), // block cursor
-        ])),
-        ListItem::new(Line::from(Span::raw(""))),
-        ListItem::new(Line::from(Span::styled(
-            "  (a-z, 0-9, hyphens, underscores)",
-            Style::default().fg(Color::DarkGray),
-        ))),
-    ];
+    let mut items = vec![];
+
+    // Show branch info if detected
+    if let Some(ref branch) = app.detected_branch {
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("  Branch: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(branch.as_str(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ])));
+        if let Some(ref commit) = app.detected_commit {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("  Commit: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(commit.as_str(), Style::default().fg(Color::DarkGray)),
+            ])));
+        }
+        items.push(ListItem::new(Line::from(Span::raw(""))));
+    }
+
+    items.push(ListItem::new(Line::from(Span::styled(
+        "  Enter session name:",
+        Style::default().fg(Color::White),
+    ))));
+    items.push(ListItem::new(Line::from(Span::raw(""))));
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled("  > ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            app.session_name_input.as_str(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("\u{2588}", Style::default().fg(Color::Yellow)),
+    ])));
+    items.push(ListItem::new(Line::from(Span::raw(""))));
+
+    let workers_hint = format!("  {} workers  |  [Enter=Create] [Esc=Cancel]", app.requested_workers);
+    items.push(ListItem::new(Line::from(Span::styled(
+        workers_hint,
+        Style::default().fg(Color::DarkGray),
+    ))));
 
     frame.render_widget(List::new(items).block(block), area);
 }

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use legion_core::orchestrate::OrchestrateEngine;
 use legion_db::{Provider, SquadSession};
@@ -148,6 +149,9 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
 /// Maximum number of workers (not including leader)
 pub const MAX_WORKERS: u16 = 8;
 
+/// Worker timeout: kill SDK process if no output for this many seconds
+pub const WORKER_TIMEOUT_SECS: u64 = 300;
+
 /// A single pane in the TUI - each runs its own Claude Code instance
 pub struct Pane {
     pub pty: Option<PtyHandle>,
@@ -166,6 +170,8 @@ pub struct Pane {
     pub current_ticket_id: Option<usize>,
     /// Full log buffer for this pane's SDK execution (all formatted output lines)
     pub sdk_log_buffer: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    /// Last time SDK produced output (for timeout detection)
+    pub last_sdk_activity: Option<Instant>,
 }
 
 impl Pane {
@@ -230,6 +236,10 @@ pub struct App {
     pub complete_record_choice: usize,
     pub complete_session_name: Option<String>,
     pub creating_default_session: bool,
+
+    // Branch detection at startup
+    pub detected_branch: Option<String>,
+    pub detected_commit: Option<String>,
 
     // Deferred session spawning (for in-TUI session selection)
     pub session_name_input: String,
@@ -318,6 +328,8 @@ impl App {
             complete_record_choice: 0,
             complete_session_name: None,
             creating_default_session: false,
+            detected_branch: None,
+            detected_commit: None,
             session_name_input: String::new(),
             base_port: 0,
             requested_workers: 0,
@@ -399,6 +411,7 @@ impl App {
             sdk_entries: Vec::new(),
             current_ticket_id: None,
             sdk_log_buffer: None,
+            last_sdk_activity: None,
         });
     }
 
@@ -636,6 +649,12 @@ impl App {
             crate::worktree::create_session_worktrees(project_path, name, worker_count)?
         };
 
+        // Detect branch if not already set (non-startup creation)
+        if self.detected_branch.is_none() {
+            self.detected_branch = crate::worktree::current_branch(project_path);
+            self.detected_commit = crate::worktree::current_commit(project_path);
+        }
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -649,8 +668,8 @@ impl App {
             created_at: now,
             completed_at: None,
             is_default,
-            base_branch: None,
-            base_commit: None,
+            base_branch: self.detected_branch.clone(),
+            base_commit: self.detected_commit.clone(),
         };
 
         if let Ok(repo) = legion_db::open_db() {
@@ -910,6 +929,7 @@ impl App {
                 sdk_entries: Vec::new(),
                 current_ticket_id: None,
                 sdk_log_buffer: None,
+                last_sdk_activity: None,
             });
         }
 
@@ -1407,6 +1427,7 @@ impl App {
                 pane.sdk_task = Some(handle);
                 pane.sdk_parser = Some(parser);
                 pane.current_ticket_id = Some(ticket_id);
+                pane.last_sdk_activity = Some(Instant::now());
                 if iteration == 1 {
                     pane.sdk_entries.clear();
                 }
