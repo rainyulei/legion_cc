@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod claudemd;
+pub mod diff;
 pub mod input;
 pub mod pty;
 pub mod sdk;
@@ -270,12 +271,14 @@ async fn run_event_loop(
 
                 if let Some((ticket_id, result_text)) = finished_info {
                     let promise_found = crate::sdk::detect_promise(&result_text);
+                    let mut should_cache_diff = false;
 
                     if promise_found {
                         // Success — report to engine
                         let summary = Some(crate::sdk::extract_feedback(&result_text));
                         engine.report_iteration(ticket_id, true, summary).await;
                         tracing::info!("Worker {} ticket {} completed (promise found)", wi, ticket_id);
+                        should_cache_diff = true;
                     } else {
                         // Failed — check if retry needed
                         let feedback = crate::sdk::extract_feedback(&result_text);
@@ -303,6 +306,53 @@ async fn run_event_loop(
                             }
                         } else {
                             tracing::warn!("Worker {} ticket {} failed (max iterations)", wi, ticket_id);
+                            should_cache_diff = true;
+                        }
+                    }
+
+                    // Cache diff for Done/Error tickets
+                    if should_cache_diff {
+                        if let (Some(project_path), Some(session)) = (&app.project_path, &app.current_session) {
+                            let wt_path = crate::worktree::pane_worktree_path(
+                                project_path, &session.name, &format!("Worker {}", wi),
+                            );
+                            let leader_ref = crate::diff::get_leader_ref(
+                                project_path, &session.name, session.is_default,
+                            );
+                            let session_name = session.name.clone();
+                            let db = engine.db().cloned();
+                            tokio::task::spawn_blocking(move || {
+                                match crate::diff::get_worktree_diff(&wt_path, &leader_ref, false) {
+                                    Ok(data) => {
+                                        let file_summary: Vec<legion_db::FileDiffSummary> = data.files.iter().map(|f| {
+                                            legion_db::FileDiffSummary {
+                                                path: f.path.clone(),
+                                                status: f.status.clone(),
+                                                additions: f.additions,
+                                                deletions: f.deletions,
+                                            }
+                                        }).collect();
+                                        let summary_json = serde_json::to_string(&file_summary).unwrap_or_default();
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs() as i64;
+                                        if let Some(db) = db {
+                                            if let Ok(db) = db.lock() {
+                                                if let Err(e) = db.save_ticket_diff(
+                                                    ticket_id as i64, &session_name,
+                                                    &data.raw_diff, &summary_json, now,
+                                                ) {
+                                                    tracing::warn!("Failed to cache diff for ticket {}: {}", ticket_id, e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to get diff for ticket {}: {}", ticket_id, e);
+                                    }
+                                }
+                            });
                         }
                     }
 

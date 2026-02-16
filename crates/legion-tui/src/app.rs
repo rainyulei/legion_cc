@@ -37,6 +37,7 @@ pub enum PopupMenu {
     ClearConfirm,
     SessionDeleteConfirm,
     CompleteRecordChoice,
+    FileDiff,
 }
 
 /// Which column is active in the matrix view
@@ -271,6 +272,14 @@ pub struct App {
     // Leader context status (from statusLine hook)
     pub leader_context_pct: Option<u8>,
     pub leader_git_branch: Option<String>,
+
+    // File diff popup state
+    pub diff_ticket_id: usize,
+    pub diff_data: Option<crate::diff::DiffData>,
+    pub diff_file_selected: usize,
+    pub diff_scroll: usize,
+    pub diff_loading: bool,
+    pub diff_error: Option<String>,
 }
 
 impl App {
@@ -333,6 +342,12 @@ impl App {
             delete_confirm_id: 0,
             leader_context_pct: None,
             leader_git_branch: None,
+            diff_ticket_id: 0,
+            diff_data: None,
+            diff_file_selected: 0,
+            diff_scroll: 0,
+            diff_loading: false,
+            diff_error: None,
         }
     }
 

@@ -370,10 +370,18 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
                 actions.push(Span::styled(" Retry ", Style::default().fg(Color::DarkGray)));
                 actions.push(Span::styled("[d]", Style::default().fg(Color::Yellow)));
                 actions.push(Span::styled(" Del ", Style::default().fg(Color::DarkGray)));
+                actions.push(Span::styled("[f]", Style::default().fg(Color::Yellow)));
+                actions.push(Span::styled(" Files ", Style::default().fg(Color::DarkGray)));
             }
             Some(TicketStatus::Done) => {
                 actions.push(Span::styled("[d]", Style::default().fg(Color::Yellow)));
                 actions.push(Span::styled(" Del ", Style::default().fg(Color::DarkGray)));
+                actions.push(Span::styled("[f]", Style::default().fg(Color::Yellow)));
+                actions.push(Span::styled(" Files ", Style::default().fg(Color::DarkGray)));
+            }
+            Some(TicketStatus::Working) => {
+                actions.push(Span::styled("[f]", Style::default().fg(Color::Yellow)));
+                actions.push(Span::styled(" Files ", Style::default().fg(Color::DarkGray)));
             }
             _ => {}
         }
@@ -723,6 +731,7 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::DeleteConfirm | PopupMenu::ClearConfirm => (50, 30),
         PopupMenu::SessionDeleteConfirm => (55, 40),
         PopupMenu::CompleteRecordChoice => (55, 25),
+        PopupMenu::FileDiff => (95, 90),
         _ => (60, 60),
     };
     let area = centered_rect(pw, ph, frame.area());
@@ -746,6 +755,7 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::ClearConfirm => draw_clear_confirm(frame, app, area),
         PopupMenu::SessionDeleteConfirm => draw_session_delete_confirm(frame, app, area),
         PopupMenu::CompleteRecordChoice => draw_complete_record_choice(frame, app, area),
+        PopupMenu::FileDiff => draw_file_diff(frame, app, area),
     }
 }
 
@@ -1635,4 +1645,203 @@ fn truncate_str(s: &str, max: usize) -> String {
     } else {
         format!("{}...", &s[..max.saturating_sub(3)])
     }
+}
+
+fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
+    // Find ticket title for header
+    let ticket_title = app.ticket_snapshot.as_ref()
+        .and_then(|ts| ts.iter().find(|t| t.id == app.diff_ticket_id))
+        .map(|t| format!(" #{} {} ", t.id, truncate_str(&t.title, 40)))
+        .unwrap_or_else(|| format!(" #{} ", app.diff_ticket_id));
+
+    // Loading state
+    if app.diff_loading {
+        let block = Block::default()
+            .title(ticket_title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        let p = Paragraph::new("  Loading diff...").block(block);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    // Error state
+    if let Some(ref err) = app.diff_error {
+        let block = Block::default()
+            .title(ticket_title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red));
+        let p = Paragraph::new(format!("  Error: {}", err)).block(block);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let Some(ref data) = app.diff_data else {
+        let block = Block::default()
+            .title(ticket_title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let p = Paragraph::new("  No diff data").block(block);
+        frame.render_widget(p, area);
+        return;
+    };
+
+    if data.files.is_empty() {
+        let block = Block::default()
+            .title(ticket_title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let p = Paragraph::new("  No file changes").block(block);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    // Compute total stats
+    let total_add: usize = data.files.iter().map(|f| f.additions).sum();
+    let total_del: usize = data.files.iter().map(|f| f.deletions).sum();
+
+    // Outer block
+    let outer_block = Block::default()
+        .title(format!("{}\u{2500}\u{2500} {} files changed, +{} -{} ",
+            ticket_title, data.files.len(), total_add, total_del))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = outer_block.inner(area);
+    frame.render_widget(outer_block, area);
+
+    // Split: left 35% (file list) | right 65% (diff content)
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(35),
+            Constraint::Percentage(65),
+        ])
+        .split(inner);
+
+    let left_area = h_chunks[0];
+    let right_area = h_chunks[1];
+
+    // === Left panel: file list ===
+    let file_block = Block::default()
+        .title(" Files ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let file_inner = file_block.inner(left_area);
+
+    let file_items: Vec<ListItem> = data.files.iter().enumerate().map(|(i, f)| {
+        let status_color = match f.status.as_str() {
+            "A" => Color::Green,
+            "D" => Color::Red,
+            _ => Color::Yellow,
+        };
+        let prefix = if i == app.diff_file_selected { "\u{25b6} " } else { "  " };
+        let stats = format!("+{} -{}", f.additions, f.deletions);
+
+        // Truncate path to fit
+        let max_path_len = file_inner.width.saturating_sub(stats.len() as u16 + 5) as usize;
+        let display_path = if f.path.len() > max_path_len && max_path_len > 3 {
+            format!("...{}", &f.path[f.path.len().saturating_sub(max_path_len - 3)..])
+        } else {
+            f.path.clone()
+        };
+
+        let style = if i == app.diff_file_selected {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        ListItem::new(Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(
+                format!("{}", f.status),
+                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", style),
+            Span::styled(display_path, style),
+            Span::styled(
+                format!(" {}", stats),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+    }).collect();
+
+    let file_list = List::new(file_items);
+    frame.render_widget(file_block, left_area);
+    frame.render_widget(file_list, file_inner);
+
+    // File list scrollbar
+    if data.files.len() > file_inner.height as usize {
+        let max_scroll = data.files.len().saturating_sub(file_inner.height as usize);
+        let scroll_pos = app.diff_file_selected.min(max_scroll);
+        let mut sb_state = ScrollbarState::new(max_scroll).position(scroll_pos);
+        let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(sb, file_inner, &mut sb_state);
+    }
+
+    // === Right panel: diff content ===
+    let selected_file = data.files.get(app.diff_file_selected);
+    let diff_block = Block::default()
+        .title(format!(" {} ", selected_file.map(|f| f.path.as_str()).unwrap_or("...")))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue));
+    let diff_inner = diff_block.inner(right_area);
+
+    let diff_lines: Vec<Line> = selected_file
+        .map(|f| {
+            f.diff_lines.iter().map(|line| {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    Line::from(Span::styled(line.clone(), Style::default().fg(Color::Green)))
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    Line::from(Span::styled(line.clone(), Style::default().fg(Color::Red)))
+                } else if line.starts_with("@@") {
+                    Line::from(Span::styled(line.clone(), Style::default().fg(Color::Cyan)))
+                } else if line.starts_with("diff --git") || line.starts_with("index ") || line.starts_with("---") || line.starts_with("+++") {
+                    Line::from(Span::styled(line.clone(), Style::default().fg(Color::DarkGray)))
+                } else {
+                    Line::from(Span::styled(line.clone(), Style::default().fg(Color::White)))
+                }
+            }).collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let total_diff_lines = diff_lines.len();
+    let visible_h = diff_inner.height as usize;
+    let max_scroll = total_diff_lines.saturating_sub(visible_h);
+    let scroll_clamped = app.diff_scroll.min(max_scroll);
+
+    let diff_paragraph = Paragraph::new(diff_lines)
+        .scroll((scroll_clamped as u16, 0))
+        .block(diff_block);
+    frame.render_widget(diff_paragraph, right_area);
+
+    // Diff content scrollbar
+    if total_diff_lines > visible_h {
+        let mut sb_state = ScrollbarState::new(max_scroll).position(scroll_clamped);
+        let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("\u{25b2}"))
+            .end_symbol(Some("\u{25bc}"));
+        frame.render_stateful_widget(sb, diff_inner, &mut sb_state);
+    }
+
+    // Footer hints (render at bottom of outer area)
+    let footer_area = Rect {
+        x: area.x + 1,
+        y: area.y + area.height.saturating_sub(1),
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    let footer = Line::from(vec![
+        Span::styled(" \u{2191}\u{2193}", Style::default().fg(Color::Yellow)),
+        Span::styled(" Files ", Style::default().fg(Color::DarkGray)),
+        Span::styled("j/k", Style::default().fg(Color::Yellow)),
+        Span::styled(" Scroll ", Style::default().fg(Color::DarkGray)),
+        Span::styled("PgUp/PgDn", Style::default().fg(Color::Yellow)),
+        Span::styled(" Page ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::styled(" Close ", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(footer), footer_area);
 }

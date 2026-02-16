@@ -64,6 +64,22 @@ pub struct TicketRow {
     pub origin_session: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDiffSummary {
+    pub path: String,
+    pub status: String,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+pub struct TicketDiffRow {
+    pub ticket_id: i64,
+    pub session_name: String,
+    pub diff_content: String,
+    pub file_summary: Vec<FileDiffSummary>,
+    pub cached_at: i64,
+}
+
 pub struct Repository {
     conn: Connection,
 }
@@ -474,6 +490,10 @@ impl Repository {
             params![ticket_id, session_name],
         )?;
         self.conn.execute(
+            "DELETE FROM ticket_diffs WHERE ticket_id = ?1",
+            params![ticket_id],
+        )?;
+        self.conn.execute(
             "DELETE FROM tickets WHERE id = ?1 AND session_name = ?2",
             params![ticket_id, session_name],
         )?;
@@ -503,6 +523,10 @@ impl Repository {
     pub fn delete_session_tickets(&self, session_name: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM ticket_logs WHERE session_name = ?",
+            params![session_name],
+        )?;
+        self.conn.execute(
+            "DELETE FROM ticket_diffs WHERE session_name = ?",
             params![session_name],
         )?;
         self.conn.execute(
@@ -549,6 +573,59 @@ impl Repository {
             |row| row.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    // Ticket diff methods
+
+    pub fn save_ticket_diff(
+        &self,
+        ticket_id: i64,
+        session_name: &str,
+        diff_content: &str,
+        file_summary_json: &str,
+        cached_at: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ticket_diffs (ticket_id, session_name, diff_content, file_summary, cached_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ticket_id, session_name, diff_content, file_summary_json, cached_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_ticket_diff(&self, ticket_id: i64) -> Result<Option<TicketDiffRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ticket_id, session_name, diff_content, file_summary, cached_at FROM ticket_diffs WHERE ticket_id = ?1"
+        )?;
+        let mut rows = stmt.query(params![ticket_id])?;
+        if let Some(row) = rows.next()? {
+            let summary_json: String = row.get(3)?;
+            let file_summary: Vec<FileDiffSummary> = serde_json::from_str(&summary_json).unwrap_or_default();
+            Ok(Some(TicketDiffRow {
+                ticket_id: row.get(0)?,
+                session_name: row.get(1)?,
+                diff_content: row.get(2)?,
+                file_summary,
+                cached_at: row.get(4)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn delete_ticket_diff(&self, ticket_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM ticket_diffs WHERE ticket_id = ?1",
+            params![ticket_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_session_ticket_diffs(&self, session_name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM ticket_diffs WHERE session_name = ?1",
+            params![session_name],
+        )?;
+        Ok(())
     }
 }
 

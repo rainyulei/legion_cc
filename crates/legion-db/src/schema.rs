@@ -91,6 +91,14 @@ CREATE TABLE IF NOT EXISTS ticket_logs (
     content TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ticket_diffs (
+    ticket_id INTEGER PRIMARY KEY,
+    session_name TEXT NOT NULL,
+    diff_content TEXT NOT NULL,
+    file_summary TEXT NOT NULL,
+    cached_at INTEGER NOT NULL
+);
 "#;
 
 pub fn init_db(conn: &Connection) -> Result<()> {

@@ -98,6 +98,26 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
                 }
                 return InputResult::Continue;
             }
+            KeyCode::Char('f') => {
+                // Open file diff popup for Working/Done/Error ticket
+                let ticket_info = app.ticket_snapshot.as_ref().and_then(|tickets| {
+                    tickets.iter().find(|t| t.id == app.board_selected).and_then(|t| {
+                        if matches!(t.status,
+                            legion_core::orchestrate::engine::TicketStatus::Working
+                            | legion_core::orchestrate::engine::TicketStatus::Done
+                            | legion_core::orchestrate::engine::TicketStatus::Error
+                        ) {
+                            Some((t.id, t.status, t.assigned_worker))
+                        } else {
+                            None
+                        }
+                    })
+                });
+                if let Some((tid, status, worker)) = ticket_info {
+                    open_file_diff(app, tid, &status, worker);
+                }
+                return InputResult::Continue;
+            }
             KeyCode::Char('D') => {
                 // Open clear confirm popup
                 if let Some(ref tickets) = app.ticket_snapshot {
@@ -197,14 +217,20 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
             }
         }
         MouseEventKind::ScrollUp => {
-            if app.board_detail_open {
+            if matches!(app.mode, AppMode::Popup(PopupMenu::FileDiff)) {
+                // In file diff popup: scroll diff content up
+                app.diff_scroll = app.diff_scroll.saturating_sub(3);
+            } else if app.board_detail_open {
                 app.board_detail_scroll = app.board_detail_scroll.saturating_sub(3);
             } else if app.right_panel_focused {
                 navigate_ticket_up(app);
             }
         }
         MouseEventKind::ScrollDown => {
-            if app.board_detail_open {
+            if matches!(app.mode, AppMode::Popup(PopupMenu::FileDiff)) {
+                // In file diff popup: scroll diff content down
+                app.diff_scroll = app.diff_scroll.saturating_add(3);
+            } else if app.board_detail_open {
                 app.board_detail_scroll = app.board_detail_scroll.saturating_add(3);
             } else if app.right_panel_focused {
                 navigate_ticket_down(app);
@@ -242,6 +268,7 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::ClearConfirm) => handle_clear_confirm_keys(app, key),
         AppMode::Popup(PopupMenu::SessionDeleteConfirm) => handle_session_delete_confirm_keys(app, key),
         AppMode::Popup(PopupMenu::CompleteRecordChoice) => handle_complete_record_choice_keys(app, key),
+        AppMode::Popup(PopupMenu::FileDiff) => handle_file_diff_keys(app, key),
         _ => {}
     }
 
@@ -791,6 +818,130 @@ fn handle_clear_confirm_keys(app: &mut App, key: KeyEvent) {
                 });
             }
             app.mode = AppMode::Normal;
+        }
+        _ => {}
+    }
+}
+
+/// Open file diff popup for a ticket
+fn open_file_diff(
+    app: &mut App,
+    ticket_id: usize,
+    status: &legion_core::orchestrate::engine::TicketStatus,
+    assigned_worker: Option<u16>,
+) {
+    app.diff_ticket_id = ticket_id;
+    app.diff_file_selected = 0;
+    app.diff_scroll = 0;
+    app.diff_loading = true;
+    app.diff_error = None;
+    app.diff_data = None;
+    app.mode = AppMode::Popup(PopupMenu::FileDiff);
+
+    // Try DB cache first for Done/Error
+    if matches!(status,
+        legion_core::orchestrate::engine::TicketStatus::Done
+        | legion_core::orchestrate::engine::TicketStatus::Error
+    ) {
+        if let Some(engine) = &app.orchestrate {
+            if let Some(db_arc) = engine.db() {
+                if let Ok(db) = db_arc.lock() {
+                    if let Ok(Some(cached)) = db.get_ticket_diff(ticket_id as i64) {
+                        // Rebuild DiffData from cached
+                        let files = cached.file_summary.iter().map(|fs| {
+                            crate::diff::DiffFile {
+                                path: fs.path.clone(),
+                                status: fs.status.clone(),
+                                additions: fs.additions,
+                                deletions: fs.deletions,
+                                diff_lines: Vec::new(), // will extract from raw
+                            }
+                        }).collect::<Vec<_>>();
+                        // Re-parse to get per-file diff lines
+                        let data = crate::diff::parse_raw_diff_with_summary(&cached.diff_content, files);
+                        app.diff_data = Some(data);
+                        app.diff_loading = false;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Real-time fetch from git
+    let include_uncommitted = matches!(status, legion_core::orchestrate::engine::TicketStatus::Working);
+    if let (Some(project_path), Some(session)) = (&app.project_path, &app.current_session) {
+        if let Some(worker_id) = assigned_worker {
+            let wt_path = crate::worktree::pane_worktree_path(
+                project_path, &session.name, &format!("Worker {}", worker_id),
+            );
+            let leader_ref = crate::diff::get_leader_ref(
+                project_path, &session.name, session.is_default,
+            );
+            match crate::diff::get_worktree_diff(&wt_path, &leader_ref, include_uncommitted) {
+                Ok(data) => {
+                    app.diff_data = Some(data);
+                    app.diff_loading = false;
+                }
+                Err(e) => {
+                    app.diff_error = Some(format!("Failed to get diff: {}", e));
+                    app.diff_loading = false;
+                }
+            }
+        } else {
+            app.diff_error = Some("No worker assigned".to_string());
+            app.diff_loading = false;
+        }
+    } else {
+        app.diff_error = Some("No active session".to_string());
+        app.diff_loading = false;
+    }
+}
+
+fn handle_file_diff_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+            app.diff_data = None;
+            app.diff_error = None;
+        }
+        KeyCode::Up => {
+            // File list: move up
+            if app.diff_file_selected > 0 {
+                app.diff_file_selected -= 1;
+                app.diff_scroll = 0;
+            }
+        }
+        KeyCode::Down => {
+            // File list: move down
+            if let Some(ref data) = app.diff_data {
+                if app.diff_file_selected < data.files.len().saturating_sub(1) {
+                    app.diff_file_selected += 1;
+                    app.diff_scroll = 0;
+                }
+            }
+        }
+        KeyCode::Char('j') => {
+            app.diff_scroll = app.diff_scroll.saturating_add(1);
+        }
+        KeyCode::Char('k') => {
+            app.diff_scroll = app.diff_scroll.saturating_sub(1);
+        }
+        KeyCode::PageDown => {
+            app.diff_scroll = app.diff_scroll.saturating_add(20);
+        }
+        KeyCode::PageUp => {
+            app.diff_scroll = app.diff_scroll.saturating_sub(20);
+        }
+        KeyCode::Home => {
+            app.diff_scroll = 0;
+        }
+        KeyCode::End => {
+            if let Some(ref data) = app.diff_data {
+                if let Some(file) = data.files.get(app.diff_file_selected) {
+                    app.diff_scroll = file.diff_lines.len().saturating_sub(1);
+                }
+            }
         }
         _ => {}
     }
