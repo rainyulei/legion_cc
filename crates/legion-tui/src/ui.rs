@@ -63,7 +63,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let indicator = if app.provider_connected {
         Span::styled(" \u{25cf}", Style::default().fg(Color::Green))
     } else {
-        Span::styled(" \u{25cb}", Style::default().fg(Color::DarkGray))
+        Span::styled(" \u{25cb}", Style::default().fg(Color::Gray))
     };
 
     let mut spans = vec![
@@ -110,11 +110,11 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
     spans.extend([
         Span::raw("  "),
-        Span::styled("[", Style::default().fg(Color::DarkGray)),
+        Span::styled("[", Style::default().fg(Color::Gray)),
         Span::styled(provider_name, Style::default().fg(Color::Yellow)),
-        Span::styled(" \u{2192} ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" \u{2192} ", Style::default().fg(Color::Gray)),
         Span::styled(model_name, Style::default().fg(Color::Magenta)),
-        Span::styled("]", Style::default().fg(Color::DarkGray)),
+        Span::styled("]", Style::default().fg(Color::Gray)),
         indicator,
     ]);
 
@@ -153,9 +153,9 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
         // No panes yet (startup session selection)
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(Color::Gray));
         let content = Paragraph::new(" Select or create a session to begin...")
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(Color::Gray))
             .block(block);
         frame.render_widget(content, area);
     } else if app.is_squad() {
@@ -194,7 +194,7 @@ fn draw_divider(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.hover_on_divider {
         ("\u{2502}", Style::default().fg(Color::Cyan))   // cyan
     } else {
-        ("\u{2502}", Style::default().fg(Color::DarkGray)) // dim
+        ("\u{2502}", Style::default().fg(Color::Gray)) // dim
     };
 
     let lines: Vec<Line> = (0..area.height)
@@ -235,7 +235,7 @@ fn draw_pane(frame: &mut Frame, app: &App, index: usize, area: Rect) {
 
     // Fallback: no PTY running yet
     let content = Paragraph::new(" Starting Claude Code...")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::Gray))
         .block(block);
     frame.render_widget(content, area);
 }
@@ -253,7 +253,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
     let tickets = app.ticket_snapshot.as_deref().unwrap_or(&[]);
     if tickets.is_empty() {
         let content = Paragraph::new(" Waiting for Leader to submit tickets...")
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(Color::Gray))
             .block(block);
         frame.render_widget(content, area);
         return;
@@ -288,17 +288,16 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         let dashes = "\u{2500}".repeat(pad_len.min(60));
 
         let sel = app.right_panel_focused && app.board_selected == t.id;
-        let border_col = if sel { Color::Yellow } else { Color::DarkGray };
+        let border_col = if sel { Color::Yellow } else { Color::Gray };
 
-        // Top border
+        // Top border with title
         let top = format!("{}\u{250c}\u{2500} {} {}{}\u{2510}",
             selected_prefix(t.id),
             title_line, dashes, suffix);
-        // Truncate to fit
         let top_display: String = top.chars().take(inner.width as usize).collect();
         lines.push(Line::from(Span::styled(top_display, Style::default().fg(border_col))));
 
-        // Content line
+        // Content line — detail text brighter than border
         let detail = format!("iter {}/{} \u{00b7} {} \u{00b7} {}",
             t.iteration, t.max_iterations, format_elapsed(t.elapsed_secs), team_short);
         let content_line = format!("  \u{2502} {} ", detail);
@@ -306,7 +305,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         let content_full = format!("{}{}\u{2502}",
             content_line, " ".repeat(content_pad.min(200)));
         let content_display: String = content_full.chars().take(inner.width as usize).collect();
-        lines.push(Line::from(Span::styled(content_display, Style::default().fg(border_col))));
+        lines.push(Line::from(Span::styled(content_display, Style::default().fg(Color::White))));
 
         // Bottom border
         let bot_inner = card_width.saturating_sub(0);
@@ -354,7 +353,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         };
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(Color::Yellow)),
-            Span::styled(format!("#{} ", t.id), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("#{} ", t.id), Style::default().fg(Color::Gray)),
             Span::styled(t.title.clone(), row_style),
             Span::styled(
                 format!(" \u{00b7} ERR {}/{}", t.iteration, t.max_iterations),
@@ -375,27 +374,27 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
 
         // Always show Enter to view detail
         actions.push(Span::styled("[Enter]", Style::default().fg(Color::Yellow)));
-        actions.push(Span::styled(" View ", Style::default().fg(Color::DarkGray)));
+        actions.push(Span::styled(" View ", Style::default().fg(Color::Gray)));
 
         // Context-sensitive actions based on selected ticket status
         match selected_status {
             Some(TicketStatus::Error) => {
                 actions.push(Span::styled("[r]", Style::default().fg(Color::Yellow)));
-                actions.push(Span::styled(" Retry ", Style::default().fg(Color::DarkGray)));
+                actions.push(Span::styled(" Retry ", Style::default().fg(Color::Gray)));
                 actions.push(Span::styled("[d]", Style::default().fg(Color::Yellow)));
-                actions.push(Span::styled(" Del ", Style::default().fg(Color::DarkGray)));
+                actions.push(Span::styled(" Del ", Style::default().fg(Color::Gray)));
                 actions.push(Span::styled("[f]", Style::default().fg(Color::Yellow)));
-                actions.push(Span::styled(" Files ", Style::default().fg(Color::DarkGray)));
+                actions.push(Span::styled(" Files ", Style::default().fg(Color::Gray)));
             }
             Some(TicketStatus::Done) => {
                 actions.push(Span::styled("[d]", Style::default().fg(Color::Yellow)));
-                actions.push(Span::styled(" Del ", Style::default().fg(Color::DarkGray)));
+                actions.push(Span::styled(" Del ", Style::default().fg(Color::Gray)));
                 actions.push(Span::styled("[f]", Style::default().fg(Color::Yellow)));
-                actions.push(Span::styled(" Files ", Style::default().fg(Color::DarkGray)));
+                actions.push(Span::styled(" Files ", Style::default().fg(Color::Gray)));
             }
             Some(TicketStatus::Working) => {
                 actions.push(Span::styled("[f]", Style::default().fg(Color::Yellow)));
-                actions.push(Span::styled(" Files ", Style::default().fg(Color::DarkGray)));
+                actions.push(Span::styled(" Files ", Style::default().fg(Color::Gray)));
             }
             _ => {}
         }
@@ -404,7 +403,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         let has_completed = tickets.iter().any(|t| matches!(t.status, TicketStatus::Done | TicketStatus::Error));
         if has_completed {
             actions.push(Span::styled("[D]", Style::default().fg(Color::Yellow)));
-            actions.push(Span::styled(" Clear All ", Style::default().fg(Color::DarkGray)));
+            actions.push(Span::styled(" Clear All ", Style::default().fg(Color::Gray)));
         }
 
         lines.push(Line::from(Span::raw("")));
@@ -426,7 +425,7 @@ fn ticket_compact_line<'a>(ticket: &TicketSnapshot, app: &App, show_elapsed: boo
 
     let mut spans = vec![
         Span::styled(prefix.to_string(), Style::default().fg(Color::Yellow)),
-        Span::styled(format!("#{} ", ticket.id), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("#{} ", ticket.id), Style::default().fg(Color::Gray)),
         Span::styled(ticket.title.clone(), row_style),
     ];
     if show_elapsed && ticket.elapsed_secs > 0 {
@@ -478,7 +477,7 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
 
     let Some(t) = ticket else {
         let content = Paragraph::new("  No ticket selected")
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(Color::Gray))
             .block(block);
         frame.render_widget(content, popup_area);
         return;
@@ -555,7 +554,7 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
         lines.push(Line::from(Span::raw("")));
         lines.push(Line::from(Span::styled(
             format!(" \u{2500}\u{2500}\u{2500} Prompt {}", "\u{2500}".repeat(sep_w.saturating_sub(12))),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
         for wl in wrap_to_lines(&t.prompt, wrap_w) {
             lines.push(Line::from(Span::styled(format!(" {}", wl), Style::default().fg(Color::White))));
@@ -569,7 +568,7 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
             lines.push(Line::from(Span::raw("")));
             lines.push(Line::from(Span::styled(
                 format!(" \u{2500}\u{2500}\u{2500} Summary {}", "\u{2500}".repeat(sep_w.saturating_sub(13))),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             )));
             let cleaned = clean_xml_tags(summary);
             for wl in wrap_to_lines(&cleaned, wrap_w) {
@@ -586,7 +585,7 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
                 lines.push(Line::from(Span::raw("")));
                 lines.push(Line::from(Span::styled(
                     format!(" \u{2500}\u{2500}\u{2500} Running Log {}", "\u{2500}".repeat(sep_w.saturating_sub(16))),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 )));
 
                 let mut trailing_empty = 0usize;
@@ -688,61 +687,61 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let mode_hint = if app.is_squad() && app.mode == AppMode::Normal {
         vec![
             Span::styled(" Alt+\u{2190}\u{2192}", Style::default().fg(Color::Yellow)),
-            Span::styled(": Focus ", Style::default().fg(Color::DarkGray)),
-            Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
+            Span::styled(": Focus ", Style::default().fg(Color::Gray)),
+            Span::styled("\u{2502} ", Style::default().fg(Color::Gray)),
             Span::styled("Ctrl+P", Style::default().fg(Color::Yellow)),
-            Span::styled(": Menu ", Style::default().fg(Color::DarkGray)),
-            Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
+            Span::styled(": Menu ", Style::default().fg(Color::Gray)),
+            Span::styled("\u{2502} ", Style::default().fg(Color::Gray)),
             Span::styled("Ctrl+Q", Style::default().fg(Color::Yellow)),
-            Span::styled(": Quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(": Quit", Style::default().fg(Color::Gray)),
         ]
     } else {
         match app.mode {
             AppMode::Normal => vec![
                 Span::styled(" Ctrl+P", Style::default().fg(Color::Yellow)),
-                Span::styled(": Menu ", Style::default().fg(Color::DarkGray)),
-                Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
+                Span::styled(": Menu ", Style::default().fg(Color::Gray)),
+                Span::styled("\u{2502} ", Style::default().fg(Color::Gray)),
                 Span::styled("Ctrl+Q", Style::default().fg(Color::Yellow)),
-                Span::styled(": Quit", Style::default().fg(Color::DarkGray)),
+                Span::styled(": Quit", Style::default().fg(Color::Gray)),
             ],
             AppMode::Popup(popup) => match popup {
                 PopupMenu::Matrix => vec![
                     Span::styled(" Tab", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Column ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Column ", Style::default().fg(Color::Gray)),
                     Span::styled("j/k", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Row ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Row ", Style::default().fg(Color::Gray)),
                     Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Edit ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Edit ", Style::default().fg(Color::Gray)),
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Back", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Back", Style::default().fg(Color::Gray)),
                 ],
                 PopupMenu::CopilotAuth | PopupMenu::AddWorkerConfirm => vec![
                     Span::styled(" Enter/Y", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Confirm ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Confirm ", Style::default().fg(Color::Gray)),
                     Span::styled("Esc/N", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Cancel", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Cancel", Style::default().fg(Color::Gray)),
                 ],
                 PopupMenu::BranchRecovery | PopupMenu::BranchList | PopupMenu::BranchChanged => vec![
                     Span::styled(" j/k", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Navigate ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Navigate ", Style::default().fg(Color::Gray)),
                     Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Select ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Select ", Style::default().fg(Color::Gray)),
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Back", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Back", Style::default().fg(Color::Gray)),
                 ],
                 PopupMenu::NewSessionInput => vec![
                     Span::styled(" Enter", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Create ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Create ", Style::default().fg(Color::Gray)),
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Back", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Back", Style::default().fg(Color::Gray)),
                 ],
                 _ => vec![
                     Span::styled(" j/k", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Navigate ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Navigate ", Style::default().fg(Color::Gray)),
                     Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Select ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Select ", Style::default().fg(Color::Gray)),
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Close", Style::default().fg(Color::DarkGray)),
+                    Span::styled(": Close", Style::default().fg(Color::Gray)),
                 ],
             },
         }
@@ -863,7 +862,7 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
                     Span::raw(prefix),
                     Span::styled(item.label(), style),
                     Span::raw(pad),
-                    Span::styled(value, Style::default().fg(Color::DarkGray)),
+                    Span::styled(value, Style::default().fg(Color::Gray)),
                 ]))
             }
         })
@@ -876,7 +875,7 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
         if i == quit_idx {
             final_items.push(ListItem::new(Line::from(Span::styled(
                 "  \u{2500}".repeat(12),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ))));
         }
         final_items.push(item);
@@ -897,7 +896,7 @@ fn draw_matrix(frame: &mut Frame, app: &App, area: Rect) {
 
     // Column header
     items.push(ListItem::new(Line::from(vec![
-        Span::styled("  Pane            ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled("  Pane            ", Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
         Span::styled("Provider          ", Style::default().fg(
             if app.matrix_col == MatrixCol::Provider { Color::Yellow } else { Color::DarkGray }
         ).add_modifier(Modifier::BOLD)),
@@ -916,7 +915,7 @@ fn draw_matrix(frame: &mut Frame, app: &App, area: Rect) {
     if app.is_squad() {
         items.push(ListItem::new(Line::from(Span::styled(
             "  \u{2500}".repeat(20),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ))));
 
         let aw_selected = app.matrix_row == pane_count;
@@ -930,11 +929,11 @@ fn draw_matrix(frame: &mut Frame, app: &App, area: Rect) {
     items.push(ListItem::new(Line::from(Span::raw(""))));
     items.push(ListItem::new(Line::from(vec![
         Span::styled("  Tab", Style::default().fg(Color::Yellow)),
-        Span::styled(": Column  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(": Column  ", Style::default().fg(Color::Gray)),
         Span::styled("Enter", Style::default().fg(Color::Yellow)),
-        Span::styled(": Edit  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(": Edit  ", Style::default().fg(Color::Gray)),
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
-        Span::styled(": Back", Style::default().fg(Color::DarkGray)),
+        Span::styled(": Back", Style::default().fg(Color::Gray)),
     ])));
 
     frame.render_widget(List::new(items).block(block), area);
@@ -998,7 +997,7 @@ fn draw_provider_menu(frame: &mut Frame, app: &App, area: Rect) {
     if app.providers.is_empty() {
         frame.render_widget(
             Paragraph::new("No providers configured")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(Color::Gray))
                 .block(block),
             area,
         );
@@ -1070,7 +1069,7 @@ fn draw_model_menu(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         frame.render_widget(
             Paragraph::new("No models available")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(Color::Gray))
                 .block(block),
             area,
         );
@@ -1126,7 +1125,7 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
         }
         spans.push(Span::styled(
             format!("  {} workers", session.worker_count),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ));
         // Branch info
         if let Some(ref branch) = session.base_branch {
@@ -1156,23 +1155,23 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
     if !completed.is_empty() {
         items.push(ListItem::new("")); // spacer
         items.push(ListItem::new(Line::from(Span::styled(
-            "  Completed:", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            "  Completed:", Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
         ))));
 
         for (i, session) in &completed {
             let selected = *i == app.session_list_index;
             let prefix = if selected { "> " } else { "  " };
             let style = if selected {
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(Color::Gray)
             };
             let date = format_relative_time(session.completed_at.unwrap_or(session.created_at));
             items.push(ListItem::new(Line::from(vec![
                 Span::raw(prefix.to_string()),
                 Span::styled("\u{2713} ", style),
                 Span::styled(session.name.clone(), style),
-                Span::styled(format!("  {}", date), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("  {}", date), Style::default().fg(Color::Gray)),
             ])));
         }
     }
@@ -1194,18 +1193,18 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
     // Footer hints
     items.push(ListItem::new("")); // spacer
     items.push(ListItem::new(Line::from(vec![
-        Span::styled("  [Enter", Style::default().fg(Color::DarkGray)),
-        Span::styled("=Resume] ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[n", Style::default().fg(Color::DarkGray)),
-        Span::styled("=New] ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[d", Style::default().fg(Color::DarkGray)),
-        Span::styled("=Delete] ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[c", Style::default().fg(Color::DarkGray)),
-        Span::styled("=Complete]", Style::default().fg(Color::DarkGray)),
+        Span::styled("  [Enter", Style::default().fg(Color::Gray)),
+        Span::styled("=Resume] ", Style::default().fg(Color::Gray)),
+        Span::styled("[n", Style::default().fg(Color::Gray)),
+        Span::styled("=New] ", Style::default().fg(Color::Gray)),
+        Span::styled("[d", Style::default().fg(Color::Gray)),
+        Span::styled("=Delete] ", Style::default().fg(Color::Gray)),
+        Span::styled("[c", Style::default().fg(Color::Gray)),
+        Span::styled("=Complete]", Style::default().fg(Color::Gray)),
     ])));
     items.push(ListItem::new(Line::from(Span::styled(
         "  [x=Remove completed]",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     ))));
 
     frame.render_widget(List::new(items).block(block), area);
@@ -1305,7 +1304,7 @@ fn draw_complete_session(frame: &mut Frame, app: &App, area: Rect) {
             };
             ListItem::new(vec![
                 Line::from(vec![Span::raw(prefix), Span::styled(*opt, style)]),
-                Line::from(Span::styled(format!("    {}", desc), Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(format!("    {}", desc), Style::default().fg(Color::Gray))),
             ])
         })
         .collect();
@@ -1335,7 +1334,7 @@ fn draw_remove_worker_list(frame: &mut Frame, app: &App, area: Rect) {
         items.push(ListItem::new(Line::from(vec![
             Span::raw(prefix),
             Span::styled(&pane.label, style),
-            Span::styled(format!("  [{}]", model), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  [{}]", model), Style::default().fg(Color::Gray)),
         ])));
     }
 
@@ -1371,7 +1370,7 @@ fn draw_remove_worker_confirm(frame: &mut Frame, app: &App, area: Rect) {
             };
             ListItem::new(vec![
                 Line::from(vec![Span::raw(prefix), Span::styled(*opt, style)]),
-                Line::from(Span::styled(format!("    {}", desc), Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(format!("    {}", desc), Style::default().fg(Color::Gray))),
             ])
         })
         .collect();
@@ -1418,7 +1417,7 @@ fn draw_connect_provider(frame: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{}{}", prefix, tmpl.name), style),
                 Span::styled(badge, Style::default().fg(Color::Green)),
-                Span::styled(format!("  {}", tmpl.api_format), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("  {}", tmpl.api_format), Style::default().fg(Color::Gray)),
             ]))
         })
         .collect();
@@ -1581,7 +1580,7 @@ fn draw_retry_form(frame: &mut Frame, app: &App, area: Rect) {
         let border_style = if is_focused {
             Style::default().fg(Color::Yellow)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::Gray)
         };
         lines.push(Line::from(Span::styled(field_text, border_style)));
         lines.push(Line::from(Span::raw("")));
@@ -1589,11 +1588,11 @@ fn draw_retry_form(frame: &mut Frame, app: &App, area: Rect) {
 
     lines.push(Line::from(vec![
         Span::styled("  [Tab]", Style::default().fg(Color::Yellow)),
-        Span::styled(" Switch  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Switch  ", Style::default().fg(Color::Gray)),
         Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
-        Span::styled(" Confirm  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Confirm  ", Style::default().fg(Color::Gray)),
         Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
-        Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Cancel", Style::default().fg(Color::Gray)),
     ]));
 
     let paragraph = Paragraph::new(lines);
@@ -1624,9 +1623,9 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::raw("")),
         Line::from(vec![
             Span::styled("  [Enter/y]", Style::default().fg(Color::Yellow)),
-            Span::styled(" Confirm  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Confirm  ", Style::default().fg(Color::Gray)),
             Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
-            Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Cancel", Style::default().fg(Color::Gray)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1655,9 +1654,9 @@ fn draw_clear_confirm(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::raw("")),
         Line::from(vec![
             Span::styled("  [Enter/y]", Style::default().fg(Color::Yellow)),
-            Span::styled(" Confirm  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Confirm  ", Style::default().fg(Color::Gray)),
             Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
-            Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Cancel", Style::default().fg(Color::Gray)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1686,14 +1685,14 @@ fn draw_session_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
                 app.session_delete_ticket_count,
                 app.session_delete_pending_count,
                 app.session_delete_log_count),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )),
         Line::from(Span::raw("")),
         Line::from(vec![
             Span::styled("  [Enter/y]", Style::default().fg(Color::Yellow)),
-            Span::styled(" Confirm  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Confirm  ", Style::default().fg(Color::Gray)),
             Span::styled("[Esc/n]", Style::default().fg(Color::Yellow)),
-            Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Cancel", Style::default().fg(Color::Gray)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1723,7 +1722,7 @@ fn draw_complete_record_choice(frame: &mut Frame, app: &App, area: Rect) {
         let style = if i == app.complete_record_choice {
             Style::default().fg(Color::Cyan)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::Gray)
         };
         lines.push(Line::from(Span::styled(format!("  {}{}", prefix, label), style)));
     }
@@ -1771,7 +1770,7 @@ fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
         let block = Block::default()
             .title(ticket_title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(Color::Gray));
         let p = Paragraph::new("  No diff data").block(block);
         frame.render_widget(p, area);
         return;
@@ -1781,7 +1780,7 @@ fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
         let block = Block::default()
             .title(ticket_title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(Color::Gray));
         let p = Paragraph::new("  No file changes").block(block);
         frame.render_widget(p, area);
         return;
@@ -1816,7 +1815,7 @@ fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
     let file_block = Block::default()
         .title(" Files ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Gray));
     let file_inner = file_block.inner(left_area);
 
     let file_items: Vec<ListItem> = data.files.iter().enumerate().map(|(i, f)| {
@@ -1852,7 +1851,7 @@ fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(display_path, style),
             Span::styled(
                 format!(" {}", stats),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ),
         ]))
     }).collect();
@@ -1890,7 +1889,7 @@ fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
                 } else if line.starts_with("@@") {
                     Line::from(Span::styled(line.clone(), Style::default().fg(Color::Cyan)))
                 } else if line.starts_with("diff --git") || line.starts_with("index ") || line.starts_with("---") || line.starts_with("+++") {
-                    Line::from(Span::styled(line.clone(), Style::default().fg(Color::DarkGray)))
+                    Line::from(Span::styled(line.clone(), Style::default().fg(Color::Gray)))
                 } else {
                     Line::from(Span::styled(line.clone(), Style::default().fg(Color::White)))
                 }
@@ -1926,13 +1925,13 @@ fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
     };
     let footer = Line::from(vec![
         Span::styled(" \u{2191}\u{2193}", Style::default().fg(Color::Yellow)),
-        Span::styled(" Files ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Files ", Style::default().fg(Color::Gray)),
         Span::styled("j/k", Style::default().fg(Color::Yellow)),
-        Span::styled(" Scroll ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Scroll ", Style::default().fg(Color::Gray)),
         Span::styled("PgUp/PgDn", Style::default().fg(Color::Yellow)),
-        Span::styled(" Page ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Page ", Style::default().fg(Color::Gray)),
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
-        Span::styled(" Close ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" Close ", Style::default().fg(Color::Gray)),
     ]);
     frame.render_widget(Paragraph::new(footer), footer_area);
 }
@@ -1966,7 +1965,7 @@ fn draw_branch_recovery(frame: &mut Frame, app: &App, area: Rect) {
         ))),
         ListItem::new(Line::from(Span::styled(
             format!("  Base commit: {}", commit),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ))),
         ListItem::new(""),
     ];
@@ -2055,7 +2054,7 @@ fn draw_branch_list(frame: &mut Frame, app: &App, area: Rect) {
     if items.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "  No local branches found",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ))));
     }
 
