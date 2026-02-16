@@ -1084,6 +1084,27 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
             format!("  {} workers", session.worker_count),
             Style::default().fg(Color::DarkGray),
         ));
+        // Branch info
+        if let Some(ref branch) = session.base_branch {
+            let branch_exists = app.session_branch_status.get(&session.name).copied().unwrap_or(true);
+            if branch_exists {
+                spans.push(Span::styled(
+                    format!(" \u{2190} {}", branch), // ← branch
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!(" \u{26a0} branch '{}' deleted", branch), // ⚠ branch deleted
+                    Style::default().fg(Color::Red),
+                ));
+                if let Some(ref commit) = session.base_commit {
+                    spans.push(Span::styled(
+                        format!(" ({})", commit),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+        }
         items.push(ListItem::new(Line::from(spans)));
     }
 

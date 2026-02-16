@@ -227,6 +227,7 @@ pub struct App {
     pub session_list: Vec<SquadSession>,
     pub session_list_index: usize,
     pub complete_merge_index: usize,
+    pub session_branch_status: std::collections::HashMap<String, bool>, // session_name → branch_exists
 
     // Session delete/complete state
     pub session_delete_target: Option<String>,
@@ -321,6 +322,7 @@ impl App {
             session_list: Vec::new(),
             session_list_index: 0,
             complete_merge_index: 0,
+            session_branch_status: std::collections::HashMap::new(),
             session_delete_target: None,
             session_delete_pending_count: 0,
             session_delete_ticket_count: 0,
@@ -817,6 +819,16 @@ impl App {
     pub fn load_session_list(&mut self) {
         if let Ok(repo) = legion_db::open_db() {
             self.session_list = repo.list_squad_sessions().unwrap_or_default();
+        }
+        // Check branch status for all sessions
+        self.session_branch_status.clear();
+        if let Some(ref project_path) = self.project_path {
+            for session in &self.session_list {
+                if let Some(ref branch) = session.base_branch {
+                    let exists = crate::worktree::branch_exists(project_path, branch);
+                    self.session_branch_status.insert(session.name.clone(), exists);
+                }
+            }
         }
     }
 
