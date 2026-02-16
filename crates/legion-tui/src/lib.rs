@@ -93,11 +93,14 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     app.load_session_list();
 
     if app.session_list.iter().any(|s| s.status == "active") {
-        // Has existing sessions — show session list, pre-select default session
-        let default_idx = app.session_list.iter()
-            .position(|s| s.is_default && s.status == "active")
+        // Has existing sessions — show session list, pre-select last used (or first active)
+        let last_used_idx = app.session_list.iter()
+            .enumerate()
+            .filter(|(_, s)| s.status == "active")
+            .max_by_key(|(_, s)| s.last_active_at.unwrap_or(0))
+            .map(|(i, _)| i)
             .unwrap_or(0);
-        app.session_list_index = default_idx;
+        app.session_list_index = last_used_idx;
         app.mode = app::AppMode::Popup(app::PopupMenu::SessionList);
     } else {
         // No sessions — go to new session input with branch auto-fill

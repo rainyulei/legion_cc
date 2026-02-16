@@ -1092,11 +1092,15 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
     let current_name = app.current_session.as_ref().map(|s| s.name.as_str());
 
     // Collect active and completed sessions separately
-    // Active: default first, then others
-    let mut active: Vec<_> = app.session_list.iter().enumerate()
+    // Active: already sorted by last_active_at DESC from DB
+    let active: Vec<_> = app.session_list.iter().enumerate()
         .filter(|(_, s)| s.status == "active")
         .collect();
-    active.sort_by(|(_, a), (_, b)| b.is_default.cmp(&a.is_default));
+    // Find the most recently used active session
+    let last_used_name: Option<&str> = active.iter()
+        .filter(|(_, s)| s.last_active_at.is_some())
+        .max_by_key(|(_, s)| s.last_active_at.unwrap_or(0))
+        .map(|(_, s)| s.name.as_str());
 
     let completed: Vec<_> = app.session_list.iter().enumerate()
         .filter(|(_, s)| s.status == "completed")
@@ -1127,6 +1131,9 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
         ];
         if session.is_default {
             spans.push(Span::styled(" [default]", Style::default().fg(Color::Cyan)));
+        }
+        if last_used_name == Some(session.name.as_str()) {
+            spans.push(Span::styled(" [last used]", Style::default().fg(Color::Yellow)));
         }
         spans.push(Span::styled(
             format!("  {} workers", session.worker_count),

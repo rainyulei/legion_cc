@@ -1053,6 +1053,10 @@ fn resume_session(app: &mut App, session: &legion_db::SquadSession) {
     match app.start_session(&session.name, workers, true, is_default) {
         Ok(()) => {
             tracing::info!("Resumed session: {}", session.name);
+            // Update last_active_at
+            if let Ok(repo) = legion_db::open_db() {
+                let _ = repo.touch_squad_session(&session.name);
+            }
             update_proxy_config(app);
             app.mode = AppMode::Normal;
         }

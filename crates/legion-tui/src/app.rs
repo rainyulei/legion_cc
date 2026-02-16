@@ -736,6 +736,7 @@ impl App {
             is_default,
             base_branch: self.detected_branch.clone(),
             base_commit: self.detected_commit.clone(),
+            last_active_at: Some(now),
         };
 
         if let Ok(repo) = legion_db::open_db() {
