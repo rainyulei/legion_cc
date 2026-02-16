@@ -702,6 +702,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
                     Span::styled(": Back", Style::default().fg(Color::DarkGray)),
                 ],
+                PopupMenu::CopilotAuth => vec![
+                    Span::styled(" Esc", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Cancel ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Confirm", Style::default().fg(Color::DarkGray)),
+                ],
                 PopupMenu::BranchRecovery | PopupMenu::BranchList | PopupMenu::BranchChanged => vec![
                     Span::styled(" j/k", Style::default().fg(Color::Yellow)),
                     Span::styled(": Navigate ", Style::default().fg(Color::DarkGray)),
@@ -736,6 +742,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
     let (pw, ph) = match menu {
         PopupMenu::RetryForm => (70, 80),
+        PopupMenu::CopilotAuth => (60, 35),
         PopupMenu::BranchRecovery | PopupMenu::BranchChanged => (60, 30),
         PopupMenu::BranchList => (50, 60),
         PopupMenu::DeleteConfirm | PopupMenu::ClearConfirm => (50, 30),
@@ -769,7 +776,7 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::BranchRecovery => draw_branch_recovery(frame, app, area),
         PopupMenu::BranchList => draw_branch_list(frame, app, area),
         PopupMenu::BranchChanged => draw_branch_changed(frame, app, area),
-        PopupMenu::CopilotAuth => {} // TODO: draw copilot auth popup
+        PopupMenu::CopilotAuth => draw_copilot_auth(frame, app, area),
     }
 }
 
@@ -2034,6 +2041,103 @@ fn draw_branch_list(frame: &mut Frame, app: &App, area: Rect) {
             "  No local branches found",
             Style::default().fg(Color::DarkGray),
         ))));
+    }
+
+    frame.render_widget(List::new(items).block(block), area);
+}
+
+fn draw_copilot_auth(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::app::CopilotAuthStatus;
+
+    let block = Block::default()
+        .title(" GitHub Copilot Auth [ESC] ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let mut items = vec![];
+
+    match app.copilot_auth_status {
+        CopilotAuthStatus::RequestingCode => {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  Requesting device code...",
+                Style::default().fg(Color::Yellow),
+            ))));
+        }
+        CopilotAuthStatus::WaitingForAuth => {
+            if let Some(ref uri) = app.copilot_verification_uri {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    "  Please visit:",
+                    Style::default().fg(Color::White),
+                ))));
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("  {}", uri),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ))));
+            }
+            items.push(ListItem::new(""));
+            if let Some(ref code) = app.copilot_user_code {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    "  Enter code:",
+                    Style::default().fg(Color::White),
+                ))));
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("  {}", code),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ))));
+            }
+            items.push(ListItem::new(""));
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  Waiting for authorization...",
+                Style::default().fg(Color::Yellow),
+            ))));
+        }
+        CopilotAuthStatus::Exchanging => {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  Authorized! Exchanging token...",
+                Style::default().fg(Color::Green),
+            ))));
+        }
+        CopilotAuthStatus::Success => {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  \u{2713} GitHub Copilot connected!",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ))));
+            if let Some(ref models) = app.copilot_models_result {
+                items.push(ListItem::new(""));
+                let model_str = if models.len() > 5 {
+                    format!("  Models: {} (+{} more)", models[..5].join(", "), models.len() - 5)
+                } else {
+                    format!("  Models: {}", models.join(", "))
+                };
+                items.push(ListItem::new(Line::from(Span::styled(
+                    model_str,
+                    Style::default().fg(Color::Gray),
+                ))));
+            }
+            items.push(ListItem::new(""));
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  [Enter] Done",
+                Style::default().fg(Color::Gray),
+            ))));
+        }
+        CopilotAuthStatus::Error => {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  Error:",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ))));
+            if let Some(ref err) = app.copilot_auth_error {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("  {}", err),
+                    Style::default().fg(Color::Red),
+                ))));
+            }
+            items.push(ListItem::new(""));
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  [Enter] Retry  [Esc] Cancel",
+                Style::default().fg(Color::Gray),
+            ))));
+        }
     }
 
     frame.render_widget(List::new(items).block(block), area);

@@ -272,6 +272,7 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::BranchRecovery) => handle_branch_recovery_keys(app, key),
         AppMode::Popup(PopupMenu::BranchList) => handle_branch_list_keys(app, key),
         AppMode::Popup(PopupMenu::BranchChanged) => handle_branch_changed_keys(app, key),
+        AppMode::Popup(PopupMenu::CopilotAuth) => handle_copilot_auth_keys(app, key),
         _ => {}
     }
 
@@ -1221,6 +1222,34 @@ fn handle_branch_changed_keys(app: &mut App, key: KeyEvent) {
                     // Ignore
                     app.mode = AppMode::Normal;
                 }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_copilot_auth_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Cancel — drop the channel receiver to signal the spawned task
+            app.copilot_auth_rx = None;
+            app.copilot_auth_status = crate::app::CopilotAuthStatus::RequestingCode;
+            app.mode = AppMode::Popup(PopupMenu::ConnectProvider);
+        }
+        KeyCode::Enter => {
+            match app.copilot_auth_status {
+                crate::app::CopilotAuthStatus::Success => {
+                    // Done — go back to connect provider list
+                    app.copilot_auth_rx = None;
+                    app.mode = AppMode::Popup(PopupMenu::ConnectProvider);
+                }
+                crate::app::CopilotAuthStatus::Error => {
+                    // Retry — go back to connect provider, user can press Enter again
+                    app.copilot_auth_rx = None;
+                    app.copilot_auth_status = crate::app::CopilotAuthStatus::RequestingCode;
+                    app.mode = AppMode::Popup(PopupMenu::ConnectProvider);
+                }
+                _ => {}
             }
         }
         _ => {}
