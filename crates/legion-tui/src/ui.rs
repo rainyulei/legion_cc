@@ -702,6 +702,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
                     Span::styled(": Back", Style::default().fg(Color::DarkGray)),
                 ],
+                PopupMenu::BranchRecovery | PopupMenu::BranchList => vec![
+                    Span::styled(" j/k", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Navigate ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Select ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Back", Style::default().fg(Color::DarkGray)),
+                ],
                 PopupMenu::NewSessionInput => vec![
                     Span::styled(" Enter", Style::default().fg(Color::Yellow)),
                     Span::styled(": Create ", Style::default().fg(Color::DarkGray)),
@@ -728,6 +736,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
     let (pw, ph) = match menu {
         PopupMenu::RetryForm => (70, 80),
+        PopupMenu::BranchRecovery => (60, 40),
+        PopupMenu::BranchList => (50, 60),
         PopupMenu::DeleteConfirm | PopupMenu::ClearConfirm => (50, 30),
         PopupMenu::SessionDeleteConfirm => (55, 40),
         PopupMenu::CompleteRecordChoice => (55, 25),
@@ -756,6 +766,8 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::SessionDeleteConfirm => draw_session_delete_confirm(frame, app, area),
         PopupMenu::CompleteRecordChoice => draw_complete_record_choice(frame, app, area),
         PopupMenu::FileDiff => draw_file_diff(frame, app, area),
+        PopupMenu::BranchRecovery => draw_branch_recovery(frame, app, area),
+        PopupMenu::BranchList => draw_branch_list(frame, app, area),
     }
 }
 
@@ -1882,4 +1894,87 @@ fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Close ", Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(footer), footer_area);
+}
+
+fn draw_branch_recovery(frame: &mut Frame, app: &App, area: Rect) {
+    let session = match &app.recovery_session {
+        Some(s) => s,
+        None => return,
+    };
+    let branch = session.base_branch.as_deref().unwrap_or("unknown");
+    let commit = session.base_commit.as_deref().unwrap_or("unknown");
+    let current_branch = app.detected_branch.as_deref().unwrap_or("unknown");
+
+    let block = Block::default()
+        .title(" \u{26a0} Branch Deleted [ESC] ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let options = [
+        format!("Bind to current branch ({}) and continue", current_branch),
+        "Select another branch".to_string(),
+        format!("Create new branch from base commit ({})", commit),
+        "Cancel".to_string(),
+    ];
+
+    let mut items = vec![
+        ListItem::new(Line::from(Span::styled(
+            format!("  Branch '{}' has been deleted", branch),
+            Style::default().fg(Color::Yellow),
+        ))),
+        ListItem::new(Line::from(Span::styled(
+            format!("  Base commit: {}", commit),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        ListItem::new(""),
+    ];
+
+    for (i, opt) in options.iter().enumerate() {
+        let selected = i == app.recovery_choice;
+        let prefix = if selected { "> " } else { "  " };
+        let style = if selected {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("{}{}", prefix, opt),
+            style,
+        ))));
+    }
+
+    frame.render_widget(List::new(items).block(block), area);
+}
+
+fn draw_branch_list(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Select Branch [ESC] ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let mut items = vec![];
+    for (i, branch) in app.branch_list.iter().enumerate() {
+        let selected = i == app.branch_list_index;
+        let prefix = if selected { "> " } else { "  " };
+        let style = if selected {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("{}{}", prefix, branch),
+            style,
+        ))));
+    }
+
+    if items.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  No local branches found",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+
+    frame.render_widget(List::new(items).block(block), area);
 }

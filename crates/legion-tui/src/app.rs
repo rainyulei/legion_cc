@@ -39,6 +39,8 @@ pub enum PopupMenu {
     SessionDeleteConfirm,
     CompleteRecordChoice,
     FileDiff,
+    BranchRecovery,
+    BranchList,
 }
 
 /// Which column is active in the matrix view
@@ -284,6 +286,12 @@ pub struct App {
     pub leader_context_pct: Option<u8>,
     pub leader_git_branch: Option<String>,
 
+    // Branch recovery dialog state
+    pub recovery_session: Option<SquadSession>,  // session being recovered
+    pub recovery_choice: usize,                   // 0-3 selected option
+    pub branch_list: Vec<String>,                 // cached local branches
+    pub branch_list_index: usize,                 // selected branch in list
+
     // File diff popup state
     pub diff_ticket_id: usize,
     pub diff_data: Option<crate::diff::DiffData>,
@@ -356,6 +364,10 @@ impl App {
             delete_confirm_id: 0,
             leader_context_pct: None,
             leader_git_branch: None,
+            recovery_session: None,
+            recovery_choice: 0,
+            branch_list: Vec::new(),
+            branch_list_index: 0,
             diff_ticket_id: 0,
             diff_data: None,
             diff_file_selected: 0,

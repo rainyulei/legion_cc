@@ -269,6 +269,8 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::SessionDeleteConfirm) => handle_session_delete_confirm_keys(app, key),
         AppMode::Popup(PopupMenu::CompleteRecordChoice) => handle_complete_record_choice_keys(app, key),
         AppMode::Popup(PopupMenu::FileDiff) => handle_file_diff_keys(app, key),
+        AppMode::Popup(PopupMenu::BranchRecovery) => handle_branch_recovery_keys(app, key),
+        AppMode::Popup(PopupMenu::BranchList) => handle_branch_list_keys(app, key),
         _ => {}
     }
 
@@ -386,6 +388,21 @@ fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
             } else {
                 // Resume existing session
                 let session = app.session_list[app.session_list_index].clone();
+
+                // Check if branch was deleted
+                if let (Some(ref branch), Some(ref project_path)) = (&session.base_branch, &app.project_path) {
+                    if !crate::worktree::branch_exists(project_path, branch) {
+                        // Detect current branch for recovery option display
+                        app.detected_branch = crate::worktree::current_branch(project_path);
+                        app.detected_commit = crate::worktree::current_commit(project_path);
+                        app.recovery_session = Some(session);
+                        app.recovery_choice = 0;
+                        app.mode = AppMode::Popup(PopupMenu::BranchRecovery);
+                        return;
+                    }
+                }
+
+                // Normal resume (branch exists or no branch info)
                 let workers = session.worker_count as u16;
                 let is_default = session.is_default;
                 match app.start_session(&session.name, workers, true, is_default) {
@@ -940,6 +957,124 @@ fn handle_file_diff_keys(app: &mut App, key: KeyEvent) {
             if let Some(ref data) = app.diff_data {
                 if let Some(file) = data.files.get(app.diff_file_selected) {
                     app.diff_scroll = file.diff_lines.len().saturating_sub(1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn update_session_branch(app: &App, session_name: &str) {
+    if let Ok(repo) = legion_db::open_db() {
+        if let Ok(Some(mut session)) = repo.get_squad_session(session_name) {
+            session.base_branch = app.detected_branch.clone();
+            session.base_commit = app.detected_commit.clone();
+            let _ = repo.upsert_squad_session(&session);
+        }
+    }
+}
+
+fn resume_session(app: &mut App, session: &legion_db::SquadSession) {
+    let workers = session.worker_count as u16;
+    let is_default = session.is_default;
+    match app.start_session(&session.name, workers, true, is_default) {
+        Ok(()) => {
+            tracing::info!("Resumed session: {}", session.name);
+            update_proxy_config(app);
+            app.mode = AppMode::Normal;
+        }
+        Err(e) => {
+            tracing::error!("Failed to resume session '{}': {}", session.name, e);
+            app.mode = AppMode::Popup(PopupMenu::SessionList);
+        }
+    }
+}
+
+fn handle_branch_recovery_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.recovery_session = None;
+            app.load_session_list();
+            app.mode = AppMode::Popup(PopupMenu::SessionList);
+            app.session_list_index = 0;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.recovery_choice > 0 { app.recovery_choice -= 1; }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.recovery_choice < 3 { app.recovery_choice += 1; }
+        }
+        KeyCode::Enter => {
+            let session = match app.recovery_session.take() {
+                Some(s) => s,
+                None => return,
+            };
+            match app.recovery_choice {
+                0 => {
+                    // Bind to current branch and continue
+                    update_session_branch(app, &session.name);
+                    resume_session(app, &session);
+                }
+                1 => {
+                    // Select another branch
+                    if let Some(ref project_path) = app.project_path {
+                        app.branch_list = crate::worktree::list_local_branches(project_path);
+                    }
+                    app.branch_list_index = 0;
+                    app.recovery_session = Some(session);
+                    app.mode = AppMode::Popup(PopupMenu::BranchList);
+                }
+                2 => {
+                    // Create new branch from base commit
+                    if let (Some(ref commit), Some(ref project_path)) = (&session.base_commit, &app.project_path) {
+                        let branch_name = session.base_branch.as_deref().unwrap_or("recovered");
+                        let _ = std::process::Command::new("git")
+                            .args(["branch", branch_name, commit])
+                            .current_dir(project_path)
+                            .output();
+                        app.detected_branch = Some(branch_name.to_string());
+                        app.detected_commit = Some(commit.clone());
+                    }
+                    update_session_branch(app, &session.name);
+                    resume_session(app, &session);
+                }
+                3 | _ => {
+                    // Cancel
+                    app.load_session_list();
+                    app.mode = AppMode::Popup(PopupMenu::SessionList);
+                    app.session_list_index = 0;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_branch_list_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Back to recovery dialog
+            app.recovery_choice = 1;
+            app.mode = AppMode::Popup(PopupMenu::BranchRecovery);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.branch_list_index > 0 { app.branch_list_index -= 1; }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.branch_list_index < app.branch_list.len().saturating_sub(1) {
+                app.branch_list_index += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if app.branch_list_index < app.branch_list.len() {
+                let branch = app.branch_list[app.branch_list_index].clone();
+                app.detected_branch = Some(branch);
+                if let Some(ref project_path) = app.project_path {
+                    app.detected_commit = crate::worktree::current_commit(project_path);
+                }
+                if let Some(session) = app.recovery_session.take() {
+                    update_session_branch(app, &session.name);
+                    resume_session(app, &session);
                 }
             }
         }
