@@ -417,10 +417,15 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
 fn ticket_compact_line<'a>(ticket: &TicketSnapshot, app: &App, show_elapsed: bool) -> Line<'a> {
     let sel = app.right_panel_focused && app.board_selected == ticket.id;
     let prefix = if sel { "\u{25b6} " } else { "  " };
+    let base_color = match ticket.status {
+        TicketStatus::Done => Color::Green,
+        TicketStatus::Queued => Color::Cyan,
+        _ => Color::White,
+    };
     let row_style = if sel {
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(base_color)
     };
 
     let mut spans = vec![
