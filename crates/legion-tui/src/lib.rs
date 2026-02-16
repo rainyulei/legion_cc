@@ -266,6 +266,33 @@ async fn run_event_loop(
             }
         }
 
+        // Check Copilot auth channel
+        if let Some(mut rx) = app.copilot_auth_rx.take() {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    app::CopilotAuthMsg::DeviceCode { user_code, verification_uri } => {
+                        app.copilot_user_code = Some(user_code);
+                        app.copilot_verification_uri = Some(verification_uri);
+                        app.copilot_auth_status = app::CopilotAuthStatus::WaitingForAuth;
+                    }
+                    app::CopilotAuthMsg::Authorized => {
+                        app.copilot_auth_status = app::CopilotAuthStatus::Exchanging;
+                    }
+                    app::CopilotAuthMsg::SetupComplete { models } => {
+                        app.copilot_models_result = Some(models);
+                        app.copilot_auth_status = app::CopilotAuthStatus::Success;
+                        // Reload providers from DB
+                        app.load_from_db();
+                    }
+                    app::CopilotAuthMsg::Error(e) => {
+                        app.copilot_auth_error = Some(e);
+                        app.copilot_auth_status = app::CopilotAuthStatus::Error;
+                    }
+                }
+            }
+            app.copilot_auth_rx = Some(rx);
+        }
+
         terminal.draw(|frame| draw(frame, app))?;
 
         if event::poll(std::time::Duration::from_millis(50))? {

@@ -545,11 +545,79 @@ fn handle_connect_provider_keys(app: &mut App, key: KeyEvent) {
             app.connect_provider_index = (app.connect_provider_index + 1) % template_count;
         }
         KeyCode::Enter => {
-            // Enter API key input for selected template
             let tmpl = &crate::app::PROVIDER_TEMPLATES[app.connect_provider_index];
-            // Pre-fill from env var if available
-            app.api_key_input = std::env::var(tmpl.env_var).unwrap_or_default();
-            app.mode = AppMode::Popup(PopupMenu::ProviderApiKeyInput);
+            if tmpl.auth_method == "device_flow" {
+                // Start Copilot device auth flow
+                app.copilot_auth_status = crate::app::CopilotAuthStatus::RequestingCode;
+                app.copilot_user_code = None;
+                app.copilot_verification_uri = None;
+                app.copilot_auth_error = None;
+                app.copilot_models_result = None;
+
+                // Spawn async auth task
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                app.copilot_auth_rx = Some(rx);
+
+                let provider_index = app.connect_provider_index;
+                tokio::spawn(async move {
+                    // Step 1: Request device code
+                    match legion_core::copilot::request_device_code().await {
+                        Ok(dc) => {
+                            let _ = tx.send(crate::app::CopilotAuthMsg::DeviceCode {
+                                user_code: dc.user_code,
+                                verification_uri: dc.verification_uri,
+                            });
+                            // Step 2: Poll for access token
+                            match legion_core::copilot::poll_for_access_token(&dc.device_code, dc.interval).await {
+                                Ok(github_token) => {
+                                    let _ = tx.send(crate::app::CopilotAuthMsg::Authorized);
+                                    // Step 3: Full setup (exchange + fetch models)
+                                    match legion_core::copilot::full_setup(&github_token).await {
+                                        Ok((_info, models)) => {
+                                            // Save provider to DB
+                                            let tmpl = &crate::app::PROVIDER_TEMPLATES[provider_index];
+                                            if let Ok(repo) = legion_db::open_db() {
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs() as i64;
+                                                let provider = legion_db::Provider {
+                                                    id: tmpl.id.to_string(),
+                                                    name: tmpl.name.to_string(),
+                                                    base_url: tmpl.base_url.to_string(),
+                                                    api_key: Some(github_token),
+                                                    api_format: tmpl.api_format.to_string(),
+                                                    models: Some(models.clone()),
+                                                    is_default: false,
+                                                    created_at: now,
+                                                };
+                                                let _ = repo.upsert_provider(&provider);
+                                            }
+                                            let _ = tx.send(crate::app::CopilotAuthMsg::SetupComplete { models });
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(crate::app::CopilotAuthMsg::Error(format!("Setup failed: {}", e)));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(crate::app::CopilotAuthMsg::Error(format!("{}", e)));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(crate::app::CopilotAuthMsg::Error(format!("{}", e)));
+                        }
+                    }
+                });
+
+                app.mode = AppMode::Popup(PopupMenu::CopilotAuth);
+            } else {
+                // Standard API key input
+                let tmpl = &crate::app::PROVIDER_TEMPLATES[app.connect_provider_index];
+                app.api_key_input = std::env::var(tmpl.env_var).unwrap_or_default();
+                app.mode = AppMode::Popup(PopupMenu::ProviderApiKeyInput);
+            }
         }
         _ => {}
     }
