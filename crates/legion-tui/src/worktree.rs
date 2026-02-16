@@ -198,6 +198,25 @@ pub fn create_session_worktrees(
     Ok(paths)
 }
 
+/// Create worktrees for a default session (Leader uses main repo, workers get worktrees)
+pub fn create_default_session_worktrees(
+    project_path: &Path,
+    session_name: &str,
+    worker_count: u16,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(1 + worker_count as usize);
+    // Leader path = project_path itself (no worktree)
+    paths.push(project_path.to_path_buf());
+    for i in 1..=worker_count {
+        paths.push(create_worktree(
+            project_path,
+            session_name,
+            &format!("Worker {}", i),
+        )?);
+    }
+    Ok(paths)
+}
+
 /// Remove all worktrees for a session
 pub fn remove_session_worktrees(
     project_path: &Path,
@@ -206,6 +225,26 @@ pub fn remove_session_worktrees(
     force: bool,
 ) -> Result<()> {
     remove_worktree(project_path, session_name, "Leader", force)?;
+    for i in 1..=worker_count {
+        remove_worktree(project_path, session_name, &format!("Worker {}", i), force)?;
+    }
+
+    let session_dir = legion_root(project_path).join(session_name);
+    if session_dir.exists() {
+        std::fs::remove_dir(&session_dir).ok();
+    }
+
+    Ok(())
+}
+
+/// Remove worktrees for a default session (only workers, Leader = main repo is untouched)
+pub fn remove_default_session_worktrees(
+    project_path: &Path,
+    session_name: &str,
+    worker_count: u16,
+    force: bool,
+) -> Result<()> {
+    // Skip Leader — it's the main repo
     for i in 1..=worker_count {
         remove_worktree(project_path, session_name, &format!("Worker {}", i), force)?;
     }
