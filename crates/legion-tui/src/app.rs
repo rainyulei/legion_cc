@@ -42,6 +42,23 @@ pub enum PopupMenu {
     BranchRecovery,
     BranchList,
     BranchChanged,
+    CopilotAuth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopilotAuthStatus {
+    RequestingCode,
+    WaitingForAuth,
+    Exchanging,
+    Success,
+    Error,
+}
+
+pub enum CopilotAuthMsg {
+    DeviceCode { user_code: String, verification_uri: String },
+    Authorized,
+    SetupComplete { models: Vec<String> },
+    Error(String),
 }
 
 /// Which column is active in the matrix view
@@ -98,6 +115,7 @@ pub struct ProviderTemplate {
     pub api_format: &'static str,
     pub models: &'static [&'static str],
     pub env_var: &'static str,
+    pub auth_method: &'static str, // "api_key" or "device_flow"
 }
 
 pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
@@ -108,6 +126,7 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
         api_format: "anthropic",
         models: &["claude-opus-4-6", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"],
         env_var: "ANTHROPIC_API_KEY",
+        auth_method: "api_key",
     },
     ProviderTemplate {
         id: "openai",
@@ -116,6 +135,7 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
         api_format: "openai_chat",
         models: &["gpt-4o", "gpt-4o-mini", "o3", "o3-mini"],
         env_var: "OPENAI_API_KEY",
+        auth_method: "api_key",
     },
     ProviderTemplate {
         id: "github_copilot",
@@ -124,6 +144,7 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
         api_format: "anthropic_bearer",
         models: &["claude-sonnet-4-5-20250929", "claude-opus-4-6", "gpt-4o"],
         env_var: "GITHUB_TOKEN",
+        auth_method: "device_flow",
     },
     ProviderTemplate {
         id: "openrouter",
@@ -132,6 +153,7 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
         api_format: "openai_chat",
         models: &["anthropic/claude-opus-4-6", "openai/gpt-4o", "google/gemini-2.5-pro"],
         env_var: "OPENROUTER_API_KEY",
+        auth_method: "api_key",
     },
     ProviderTemplate {
         id: "google_gemini",
@@ -140,6 +162,7 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
         api_format: "openai_chat",
         models: &["gemini-2.5-pro", "gemini-2.5-flash"],
         env_var: "GOOGLE_API_KEY",
+        auth_method: "api_key",
     },
     ProviderTemplate {
         id: "deepseek",
@@ -148,6 +171,7 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
         api_format: "openai_chat",
         models: &["deepseek-chat", "deepseek-reasoner"],
         env_var: "DEEPSEEK_API_KEY",
+        auth_method: "api_key",
     },
 ];
 
@@ -309,6 +333,14 @@ pub struct App {
     pub diff_scroll: usize,
     pub diff_loading: bool,
     pub diff_error: Option<String>,
+
+    // Copilot device auth flow state
+    pub copilot_auth_status: CopilotAuthStatus,
+    pub copilot_auth_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CopilotAuthMsg>>,
+    pub copilot_user_code: Option<String>,
+    pub copilot_verification_uri: Option<String>,
+    pub copilot_auth_error: Option<String>,
+    pub copilot_models_result: Option<Vec<String>>,
 }
 
 impl App {
@@ -387,6 +419,12 @@ impl App {
             diff_scroll: 0,
             diff_loading: false,
             diff_error: None,
+            copilot_auth_status: CopilotAuthStatus::RequestingCode,
+            copilot_auth_rx: None,
+            copilot_user_code: None,
+            copilot_verification_uri: None,
+            copilot_auth_error: None,
+            copilot_models_result: None,
         }
     }
 

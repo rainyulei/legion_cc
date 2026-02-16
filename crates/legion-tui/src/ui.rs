@@ -769,6 +769,7 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::BranchRecovery => draw_branch_recovery(frame, app, area),
         PopupMenu::BranchList => draw_branch_list(frame, app, area),
         PopupMenu::BranchChanged => draw_branch_changed(frame, app, area),
+        PopupMenu::CopilotAuth => {} // TODO: draw copilot auth popup
     }
 }
 
