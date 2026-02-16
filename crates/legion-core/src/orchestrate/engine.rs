@@ -198,6 +198,7 @@ impl OrchestrateEngine {
                 summary: ticket.summary.clone(),
                 created_at: now,
                 updated_at: now,
+                origin_session: None,
             };
             if let Ok(db) = db.lock() {
                 let _ = db.insert_ticket(&row);
@@ -235,6 +236,7 @@ impl OrchestrateEngine {
                 summary: ticket.summary.clone(),
                 created_at: 0, // not updated
                 updated_at: now,
+                origin_session: None,
             };
             if let Ok(db) = db.lock() {
                 let _ = db.update_ticket(&row);

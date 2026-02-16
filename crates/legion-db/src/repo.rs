@@ -30,6 +30,7 @@ pub struct SquadSession {
     pub status: String,
     pub created_at: i64,
     pub completed_at: Option<i64>,
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +61,7 @@ pub struct TicketRow {
     pub summary: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub origin_session: Option<String>,
 }
 
 pub struct Repository {
@@ -279,7 +281,7 @@ impl Repository {
 
     pub fn upsert_squad_session(&self, session: &SquadSession) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO squad_sessions (name, project_path, worker_count, status, created_at, completed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO squad_sessions (name, project_path, worker_count, status, created_at, completed_at, is_default) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session.name,
                 session.project_path,
@@ -287,6 +289,7 @@ impl Repository {
                 session.status,
                 session.created_at,
                 session.completed_at,
+                session.is_default as i32,
             ],
         )?;
         Ok(())
@@ -294,7 +297,7 @@ impl Repository {
 
     pub fn get_squad_session(&self, name: &str) -> Result<Option<SquadSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, project_path, worker_count, status, created_at, completed_at FROM squad_sessions WHERE name = ?"
+            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default FROM squad_sessions WHERE name = ?"
         )?;
         let mut rows = stmt.query(params![name])?;
         if let Some(row) = rows.next()? {
@@ -305,6 +308,7 @@ impl Repository {
                 status: row.get(3)?,
                 created_at: row.get(4)?,
                 completed_at: row.get(5)?,
+                is_default: row.get::<_, i32>(6)? != 0,
             }))
         } else {
             Ok(None)
@@ -313,7 +317,7 @@ impl Repository {
 
     pub fn list_squad_sessions(&self) -> Result<Vec<SquadSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, project_path, worker_count, status, created_at, completed_at FROM squad_sessions ORDER BY created_at DESC"
+            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default FROM squad_sessions ORDER BY created_at DESC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(SquadSession {
@@ -323,6 +327,7 @@ impl Repository {
                 status: row.get(3)?,
                 created_at: row.get(4)?,
                 completed_at: row.get(5)?,
+                is_default: row.get::<_, i32>(6)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -330,7 +335,7 @@ impl Repository {
 
     pub fn list_active_squad_sessions(&self) -> Result<Vec<SquadSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, project_path, worker_count, status, created_at, completed_at FROM squad_sessions WHERE status = 'active' ORDER BY created_at DESC"
+            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default FROM squad_sessions WHERE status = 'active' ORDER BY created_at DESC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(SquadSession {
@@ -340,6 +345,7 @@ impl Repository {
                 status: row.get(3)?,
                 created_at: row.get(4)?,
                 completed_at: row.get(5)?,
+                is_default: row.get::<_, i32>(6)? != 0,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -365,7 +371,7 @@ impl Repository {
 
     pub fn insert_ticket(&self, ticket: &TicketRow) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO tickets (id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT OR REPLACE INTO tickets (id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at, origin_session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 ticket.id,
                 ticket.session_name,
@@ -382,6 +388,7 @@ impl Repository {
                 ticket.summary,
                 ticket.created_at,
                 ticket.updated_at,
+                ticket.origin_session,
             ],
         )?;
         Ok(())
@@ -406,7 +413,7 @@ impl Repository {
 
     pub fn list_tickets_by_session(&self, session_name: &str) -> Result<Vec<TicketRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at FROM tickets WHERE session_name = ? ORDER BY id"
+            "SELECT id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at, origin_session FROM tickets WHERE session_name = ? ORDER BY id"
         )?;
         let rows = stmt.query_map(params![session_name], |row| {
             Ok(TicketRow {
@@ -425,6 +432,7 @@ impl Repository {
                 summary: row.get(12)?,
                 created_at: row.get(13)?,
                 updated_at: row.get(14)?,
+                origin_session: row.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -470,6 +478,77 @@ impl Repository {
             params![ticket_id, session_name],
         )?;
         Ok(())
+    }
+
+    pub fn get_default_squad_session(&self, project_path: &str) -> Result<Option<SquadSession>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default FROM squad_sessions WHERE is_default = 1 AND project_path = ? LIMIT 1"
+        )?;
+        let mut rows = stmt.query(params![project_path])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(SquadSession {
+                name: row.get(0)?,
+                project_path: row.get(1)?,
+                worker_count: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+                completed_at: row.get(5)?,
+                is_default: row.get::<_, i32>(6)? != 0,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn delete_session_tickets(&self, session_name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM ticket_logs WHERE session_name = ?",
+            params![session_name],
+        )?;
+        self.conn.execute(
+            "DELETE FROM tickets WHERE session_name = ?",
+            params![session_name],
+        )?;
+        Ok(())
+    }
+
+    pub fn migrate_tickets_to_session(&self, from_session: &str, to_session: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tickets SET session_name = ?1, origin_session = ?2 WHERE session_name = ?2",
+            params![to_session, from_session],
+        )?;
+        self.conn.execute(
+            "UPDATE ticket_logs SET session_name = ?1 WHERE session_name = ?2",
+            params![to_session, from_session],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_pending_tickets(&self, session_name: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tickets WHERE session_name = ? AND status IN ('queued', 'in_progress')",
+            params![session_name],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn count_tickets(&self, session_name: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tickets WHERE session_name = ?",
+            params![session_name],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn count_ticket_logs(&self, session_name: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ticket_logs WHERE session_name = ?",
+            params![session_name],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 }
 
@@ -560,6 +639,7 @@ mod tests {
             status: "active".into(),
             created_at: 1000,
             completed_at: None,
+            is_default: false,
         };
         repo.upsert_squad_session(&session).unwrap();
 
@@ -600,6 +680,7 @@ mod tests {
             status: "active".into(),
             created_at: 1000,
             completed_at: None,
+            is_default: false,
         }).unwrap();
 
         // Insert a completed session
@@ -610,6 +691,7 @@ mod tests {
             status: "completed".into(),
             created_at: 900,
             completed_at: Some(1500),
+            is_default: false,
         }).unwrap();
 
         // list_squad_sessions returns both
@@ -620,5 +702,150 @@ mod tests {
         let active = repo.list_active_squad_sessions().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].name, "active-squad");
+    }
+
+    #[test]
+    fn default_squad_session() {
+        let repo = test_repo();
+
+        // No default session initially
+        assert!(repo.get_default_squad_session("/tmp/project").unwrap().is_none());
+
+        // Insert a non-default session
+        repo.upsert_squad_session(&SquadSession {
+            name: "regular".into(),
+            project_path: "/tmp/project".into(),
+            worker_count: 2,
+            status: "active".into(),
+            created_at: 1000,
+            completed_at: None,
+            is_default: false,
+        }).unwrap();
+        assert!(repo.get_default_squad_session("/tmp/project").unwrap().is_none());
+
+        // Insert a default session
+        repo.upsert_squad_session(&SquadSession {
+            name: "default-squad".into(),
+            project_path: "/tmp/project".into(),
+            worker_count: 3,
+            status: "active".into(),
+            created_at: 2000,
+            completed_at: None,
+            is_default: true,
+        }).unwrap();
+
+        let default = repo.get_default_squad_session("/tmp/project").unwrap().unwrap();
+        assert_eq!(default.name, "default-squad");
+        assert!(default.is_default);
+
+        // Different project_path returns None
+        assert!(repo.get_default_squad_session("/tmp/other").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_session_tickets_test() {
+        let repo = test_repo();
+
+        // Create a session and tickets
+        repo.upsert_squad_session(&SquadSession {
+            name: "sess1".into(),
+            project_path: "/tmp/p".into(),
+            worker_count: 1,
+            status: "active".into(),
+            created_at: 1000,
+            completed_at: None,
+            is_default: false,
+        }).unwrap();
+
+        let ticket = TicketRow {
+            id: 1,
+            session_name: "sess1".into(),
+            title: "Task 1".into(),
+            prompt: "Do something".into(),
+            context: None,
+            criteria: None,
+            status: "queued".into(),
+            assigned_worker: None,
+            team_mode: "tech_lead_team".into(),
+            iteration: 0,
+            max_iterations: 5,
+            feedback: None,
+            summary: None,
+            created_at: 1000,
+            updated_at: 1000,
+            origin_session: None,
+        };
+        repo.insert_ticket(&ticket).unwrap();
+        repo.append_ticket_log(1, "sess1", "log entry", 1000).unwrap();
+
+        assert_eq!(repo.count_tickets("sess1").unwrap(), 1);
+        assert_eq!(repo.count_ticket_logs("sess1").unwrap(), 1);
+
+        // Delete all tickets for the session
+        repo.delete_session_tickets("sess1").unwrap();
+
+        assert_eq!(repo.count_tickets("sess1").unwrap(), 0);
+        assert_eq!(repo.count_ticket_logs("sess1").unwrap(), 0);
+    }
+
+    #[test]
+    fn migrate_tickets_between_sessions() {
+        let repo = test_repo();
+
+        // Create two sessions
+        for name in &["old-sess", "new-sess"] {
+            repo.upsert_squad_session(&SquadSession {
+                name: (*name).into(),
+                project_path: "/tmp/p".into(),
+                worker_count: 1,
+                status: "active".into(),
+                created_at: 1000,
+                completed_at: None,
+                is_default: false,
+            }).unwrap();
+        }
+
+        // Insert tickets in old session
+        for i in 1..=3 {
+            repo.insert_ticket(&TicketRow {
+                id: i,
+                session_name: "old-sess".into(),
+                title: format!("Task {}", i),
+                prompt: "Do it".into(),
+                context: None,
+                criteria: None,
+                status: "queued".into(),
+                assigned_worker: None,
+                team_mode: "tech_lead_team".into(),
+                iteration: 0,
+                max_iterations: 5,
+                feedback: None,
+                summary: None,
+                created_at: 1000,
+                updated_at: 1000,
+                origin_session: None,
+            }).unwrap();
+            repo.append_ticket_log(i, "old-sess", &format!("log {}", i), 1000).unwrap();
+        }
+
+        assert_eq!(repo.count_tickets("old-sess").unwrap(), 3);
+        assert_eq!(repo.count_tickets("new-sess").unwrap(), 0);
+
+        // Migrate
+        repo.migrate_tickets_to_session("old-sess", "new-sess").unwrap();
+
+        assert_eq!(repo.count_tickets("old-sess").unwrap(), 0);
+        assert_eq!(repo.count_tickets("new-sess").unwrap(), 3);
+        assert_eq!(repo.count_ticket_logs("old-sess").unwrap(), 0);
+        assert_eq!(repo.count_ticket_logs("new-sess").unwrap(), 3);
+
+        // Verify origin_session is set
+        let tickets = repo.list_tickets_by_session("new-sess").unwrap();
+        for t in &tickets {
+            assert_eq!(t.origin_session.as_deref(), Some("old-sess"));
+        }
+
+        // Verify pending count
+        assert_eq!(repo.count_pending_tickets("new-sess").unwrap(), 3);
     }
 }

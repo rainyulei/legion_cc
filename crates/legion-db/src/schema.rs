@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS squad_sessions (
     worker_count INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     created_at INTEGER NOT NULL,
-    completed_at INTEGER
+    completed_at INTEGER,
+    is_default INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tickets (
@@ -79,7 +80,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     feedback TEXT,
     summary TEXT,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    origin_session TEXT
 );
 
 CREATE TABLE IF NOT EXISTS ticket_logs (

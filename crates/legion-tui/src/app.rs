@@ -611,6 +611,7 @@ impl App {
             status: "active".to_string(),
             created_at: now,
             completed_at: None,
+            is_default: false,
         };
 
         if let Ok(repo) = legion_db::open_db() {
