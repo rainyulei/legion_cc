@@ -256,3 +256,66 @@ pub fn remove_default_session_worktrees(
 
     Ok(())
 }
+
+/// Get the current branch name (None if detached HEAD)
+pub fn current_branch(project_path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(project_path)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if branch.is_empty() { None } else { Some(branch) }
+    } else {
+        None
+    }
+}
+
+/// Get the current HEAD commit SHA (short)
+pub fn current_commit(project_path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(project_path)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if sha.is_empty() { None } else { Some(sha) }
+    } else {
+        None
+    }
+}
+
+/// Check if a local branch exists
+pub fn branch_exists(project_path: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", branch])
+        .current_dir(project_path)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// List all local branch names
+pub fn list_local_branches(project_path: &Path) -> Vec<String> {
+    let output = Command::new("git")
+        .args(["branch", "--format=%(refname:short)"])
+        .current_dir(project_path)
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        }
+        _ => vec![],
+    }
+}
+
+/// Sanitize a branch name for use as session name (replace / with -)
+pub fn sanitize_branch_name(branch: &str) -> String {
+    branch.replace('/', "-")
+}
