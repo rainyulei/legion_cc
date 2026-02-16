@@ -92,17 +92,37 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     };
 
     if let Some(default_sess) = default_session {
-        // Auto-resume default session
-        let workers = default_sess.worker_count as u16;
-        match app.start_session(&default_sess.name, workers, true, true) {
-            Ok(()) => {
-                tracing::info!("Auto-resumed default session: {}", default_sess.name);
-                app.mode = app::AppMode::Normal;
-            }
-            Err(e) => {
-                tracing::error!("Failed to resume default session: {}", e);
-                app.mode = app::AppMode::Popup(app::PopupMenu::NewSessionInput);
-                app.session_name_input = app.default_session_name_for_default();
+        // Detect current branch
+        if let Some(ref project_path) = app.project_path {
+            app.detected_branch = crate::worktree::current_branch(project_path);
+            app.detected_commit = crate::worktree::current_commit(project_path);
+        }
+
+        // Check if session's branch was deleted
+        let branch_deleted = if let (Some(ref branch), Some(ref project_path)) = (&default_sess.base_branch, &app.project_path) {
+            !crate::worktree::branch_exists(project_path, branch)
+        } else {
+            false
+        };
+
+        if branch_deleted {
+            // Show recovery dialog instead of auto-resuming
+            app.recovery_session = Some(default_sess);
+            app.recovery_choice = 0;
+            app.mode = app::AppMode::Popup(app::PopupMenu::BranchRecovery);
+        } else {
+            // Normal auto-resume
+            let workers = default_sess.worker_count as u16;
+            match app.start_session(&default_sess.name, workers, true, true) {
+                Ok(()) => {
+                    tracing::info!("Auto-resumed default session: {}", default_sess.name);
+                    app.mode = app::AppMode::Normal;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to resume default session: {}", e);
+                    app.mode = app::AppMode::Popup(app::PopupMenu::NewSessionInput);
+                    app.session_name_input = app.default_session_name_for_default();
+                }
             }
         }
     } else {
