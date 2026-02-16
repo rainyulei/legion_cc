@@ -43,14 +43,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let focused_pane = app.panes.get(app.focused_pane);
-    let provider_name = focused_pane
+    let provider = focused_pane
         .and_then(|p| p.current_provider)
-        .and_then(|i| app.providers.get(i))
-        .map(|p| p.name.as_str())
-        .unwrap_or("No Provider");
-    let model_name = focused_pane
-        .and_then(|p| p.current_model.as_deref())
-        .unwrap_or("No Model");
+        .and_then(|i| app.providers.get(i));
+    let is_default = provider.map(|p| p.id == "__default__").unwrap_or(false);
+    let provider_name = if is_default {
+        "Native (No Proxy)"
+    } else {
+        provider.map(|p| p.name.as_str()).unwrap_or("No Provider")
+    };
+    let model_name = if is_default {
+        "Direct"
+    } else {
+        focused_pane
+            .and_then(|p| p.current_model.as_deref())
+            .unwrap_or("No Model")
+    };
 
     let indicator = if app.provider_connected {
         Span::styled(" \u{25cf}", Style::default().fg(Color::Green))
@@ -80,10 +88,16 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
     // Queue stats (squad mode)
     if app.is_squad() {
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled(
+            format!("Workers: {}", app.worker_count()),
+            Style::default().fg(Color::Cyan),
+        ));
         if let Some((total, _queued, working, done, error)) = app.queue_stats {
-            spans.push(Span::styled("  ", Style::default()));
-            spans.push(Span::styled(format!("W:{}", app.worker_count()), Style::default().fg(Color::Cyan)));
-            spans.push(Span::styled(format!(" Q:{}", total), Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                format!("  Tickets: {}", total),
+                Style::default().fg(Color::Gray),
+            ));
             spans.push(Span::styled(format!(" \u{2713}{}", done), Style::default().fg(Color::Green)));
             if working > 0 {
                 spans.push(Span::styled(format!(" \u{25b6}{}", working), Style::default().fg(Color::Yellow)));
@@ -702,11 +716,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
                     Span::styled(": Back", Style::default().fg(Color::DarkGray)),
                 ],
-                PopupMenu::CopilotAuth => vec![
-                    Span::styled(" Esc", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Cancel ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                    Span::styled(": Confirm", Style::default().fg(Color::DarkGray)),
+                PopupMenu::CopilotAuth | PopupMenu::AddWorkerConfirm => vec![
+                    Span::styled(" Enter/Y", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Confirm ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Esc/N", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Cancel", Style::default().fg(Color::DarkGray)),
                 ],
                 PopupMenu::BranchRecovery | PopupMenu::BranchList | PopupMenu::BranchChanged => vec![
                     Span::styled(" j/k", Style::default().fg(Color::Yellow)),
@@ -745,6 +759,7 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::CopilotAuth => (60, 35),
         PopupMenu::BranchRecovery | PopupMenu::BranchChanged => (60, 30),
         PopupMenu::BranchList => (50, 60),
+        PopupMenu::AddWorkerConfirm => (50, 25),
         PopupMenu::DeleteConfirm | PopupMenu::ClearConfirm => (50, 30),
         PopupMenu::SessionDeleteConfirm => (55, 40),
         PopupMenu::CompleteRecordChoice => (55, 25),
@@ -777,6 +792,7 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::BranchList => draw_branch_list(frame, app, area),
         PopupMenu::BranchChanged => draw_branch_changed(frame, app, area),
         PopupMenu::CopilotAuth => draw_copilot_auth(frame, app, area),
+        PopupMenu::AddWorkerConfirm => draw_add_worker_confirm(frame, app, area),
     }
 }
 
@@ -2139,6 +2155,38 @@ fn draw_copilot_auth(frame: &mut Frame, app: &App, area: Rect) {
             ))));
         }
     }
+
+    frame.render_widget(List::new(items).block(block), area);
+}
+
+fn draw_add_worker_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Add Worker ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let wc = app.worker_count();
+    let new_id = wc + 1;
+    let items = vec![
+        ListItem::new(""),
+        ListItem::new(Line::from(Span::styled(
+            format!("  Add Worker {} to the squad?", new_id),
+            Style::default().fg(Color::White),
+        ))),
+        ListItem::new(""),
+        ListItem::new(Line::from(Span::styled(
+            format!("  Current workers: {}/{}", wc, crate::app::MAX_WORKERS),
+            Style::default().fg(Color::Gray),
+        ))),
+        ListItem::new(""),
+        ListItem::new(Line::from(vec![
+            Span::styled("  [Enter/Y] ", Style::default().fg(Color::Green)),
+            Span::styled("Confirm  ", Style::default().fg(Color::Gray)),
+            Span::styled("[Esc/N] ", Style::default().fg(Color::Yellow)),
+            Span::styled("Cancel", Style::default().fg(Color::Gray)),
+        ])),
+    ];
 
     frame.render_widget(List::new(items).block(block), area);
 }

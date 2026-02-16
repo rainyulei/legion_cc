@@ -273,6 +273,7 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::BranchList) => handle_branch_list_keys(app, key),
         AppMode::Popup(PopupMenu::BranchChanged) => handle_branch_changed_keys(app, key),
         AppMode::Popup(PopupMenu::CopilotAuth) => handle_copilot_auth_keys(app, key),
+        AppMode::Popup(PopupMenu::AddWorkerConfirm) => handle_add_worker_confirm_keys(app, key),
         _ => {}
     }
 
@@ -1251,6 +1252,19 @@ fn handle_copilot_auth_keys(app: &mut App, key: KeyEvent) {
                 }
                 _ => {}
             }
+        }
+        _ => {}
+    }
+}
+
+fn handle_add_worker_confirm_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.pending_add_worker = true;
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.mode = AppMode::Popup(PopupMenu::Main);
         }
         _ => {}
     }

@@ -371,6 +371,18 @@ impl OrchestrateEngine {
         self.session_name.as_deref()
     }
 
+    /// Force a ticket into Error status, bypassing retry logic (e.g. timeout)
+    pub async fn force_error(&self, ticket_id: usize, reason: &str) {
+        let mut guard = self.inner.write().await;
+        if let Some(ticket) = guard.tickets.iter_mut().find(|t| t.id == ticket_id) {
+            ticket.status = TicketStatus::Error;
+            ticket.summary = Some(reason.to_string());
+            let snap = ticket.clone();
+            drop(guard);
+            self.persist_ticket_update(&snap);
+        }
+    }
+
     /// Retry a failed ticket: reset Error → Queued for re-execution
     /// Retry a failed ticket, optionally updating its fields.
     pub async fn retry_ticket(

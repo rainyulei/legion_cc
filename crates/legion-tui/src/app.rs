@@ -43,6 +43,7 @@ pub enum PopupMenu {
     BranchList,
     BranchChanged,
     CopilotAuth,
+    AddWorkerConfirm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1166,8 +1167,7 @@ impl App {
                         self.mode = AppMode::Popup(PopupMenu::MaxRetries);
                     }
                     MainMenuItem::AddWorker => {
-                        self.pending_add_worker = true;
-                        self.mode = AppMode::Normal;
+                        self.mode = AppMode::Popup(PopupMenu::AddWorkerConfirm);
                     }
                     MainMenuItem::RemoveWorker => {
                         self.remove_worker_target = 0;
