@@ -103,5 +103,8 @@ CREATE TABLE IF NOT EXISTS ticket_diffs (
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
+    // Migrations — safe to re-run (ignore "duplicate column" errors)
+    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN base_branch TEXT", []);
+    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN base_commit TEXT", []);
     Ok(())
 }

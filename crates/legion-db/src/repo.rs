@@ -31,6 +31,8 @@ pub struct SquadSession {
     pub created_at: i64,
     pub completed_at: Option<i64>,
     pub is_default: bool,
+    pub base_branch: Option<String>,
+    pub base_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,7 +299,7 @@ impl Repository {
 
     pub fn upsert_squad_session(&self, session: &SquadSession) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO squad_sessions (name, project_path, worker_count, status, created_at, completed_at, is_default) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO squad_sessions (name, project_path, worker_count, status, created_at, completed_at, is_default, base_branch, base_commit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 session.name,
                 session.project_path,
@@ -306,6 +308,8 @@ impl Repository {
                 session.created_at,
                 session.completed_at,
                 session.is_default as i32,
+                session.base_branch,
+                session.base_commit,
             ],
         )?;
         Ok(())
@@ -313,7 +317,7 @@ impl Repository {
 
     pub fn get_squad_session(&self, name: &str) -> Result<Option<SquadSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default FROM squad_sessions WHERE name = ?"
+            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default, base_branch, base_commit FROM squad_sessions WHERE name = ?"
         )?;
         let mut rows = stmt.query(params![name])?;
         if let Some(row) = rows.next()? {
@@ -325,6 +329,8 @@ impl Repository {
                 created_at: row.get(4)?,
                 completed_at: row.get(5)?,
                 is_default: row.get::<_, i32>(6)? != 0,
+                base_branch: row.get(7)?,
+                base_commit: row.get(8)?,
             }))
         } else {
             Ok(None)
@@ -333,7 +339,7 @@ impl Repository {
 
     pub fn list_squad_sessions(&self) -> Result<Vec<SquadSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default FROM squad_sessions ORDER BY created_at DESC"
+            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default, base_branch, base_commit FROM squad_sessions ORDER BY created_at DESC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(SquadSession {
@@ -344,6 +350,8 @@ impl Repository {
                 created_at: row.get(4)?,
                 completed_at: row.get(5)?,
                 is_default: row.get::<_, i32>(6)? != 0,
+                base_branch: row.get(7)?,
+                base_commit: row.get(8)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -351,7 +359,7 @@ impl Repository {
 
     pub fn list_active_squad_sessions(&self) -> Result<Vec<SquadSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default FROM squad_sessions WHERE status = 'active' ORDER BY created_at DESC"
+            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default, base_branch, base_commit FROM squad_sessions WHERE status = 'active' ORDER BY created_at DESC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(SquadSession {
@@ -362,6 +370,8 @@ impl Repository {
                 created_at: row.get(4)?,
                 completed_at: row.get(5)?,
                 is_default: row.get::<_, i32>(6)? != 0,
+                base_branch: row.get(7)?,
+                base_commit: row.get(8)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -502,7 +512,7 @@ impl Repository {
 
     pub fn get_default_squad_session(&self, project_path: &str) -> Result<Option<SquadSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default FROM squad_sessions WHERE is_default = 1 AND project_path = ? LIMIT 1"
+            "SELECT name, project_path, worker_count, status, created_at, completed_at, is_default, base_branch, base_commit FROM squad_sessions WHERE is_default = 1 AND project_path = ? LIMIT 1"
         )?;
         let mut rows = stmt.query(params![project_path])?;
         if let Some(row) = rows.next()? {
@@ -514,6 +524,8 @@ impl Repository {
                 created_at: row.get(4)?,
                 completed_at: row.get(5)?,
                 is_default: row.get::<_, i32>(6)? != 0,
+                base_branch: row.get(7)?,
+                base_commit: row.get(8)?,
             }))
         } else {
             Ok(None)
@@ -717,6 +729,8 @@ mod tests {
             created_at: 1000,
             completed_at: None,
             is_default: false,
+            base_branch: None,
+            base_commit: None,
         };
         repo.upsert_squad_session(&session).unwrap();
 
@@ -758,6 +772,8 @@ mod tests {
             created_at: 1000,
             completed_at: None,
             is_default: false,
+            base_branch: None,
+            base_commit: None,
         }).unwrap();
 
         // Insert a completed session
@@ -769,6 +785,8 @@ mod tests {
             created_at: 900,
             completed_at: Some(1500),
             is_default: false,
+            base_branch: None,
+            base_commit: None,
         }).unwrap();
 
         // list_squad_sessions returns both
@@ -797,6 +815,8 @@ mod tests {
             created_at: 1000,
             completed_at: None,
             is_default: false,
+            base_branch: None,
+            base_commit: None,
         }).unwrap();
         assert!(repo.get_default_squad_session("/tmp/project").unwrap().is_none());
 
@@ -809,6 +829,8 @@ mod tests {
             created_at: 2000,
             completed_at: None,
             is_default: true,
+            base_branch: None,
+            base_commit: None,
         }).unwrap();
 
         let default = repo.get_default_squad_session("/tmp/project").unwrap().unwrap();
@@ -832,6 +854,8 @@ mod tests {
             created_at: 1000,
             completed_at: None,
             is_default: false,
+            base_branch: None,
+            base_commit: None,
         }).unwrap();
 
         let ticket = TicketRow {
@@ -879,6 +903,8 @@ mod tests {
                 created_at: 1000,
                 completed_at: None,
                 is_default: false,
+                base_branch: None,
+                base_commit: None,
             }).unwrap();
         }
 

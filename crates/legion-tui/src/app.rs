@@ -649,6 +649,8 @@ impl App {
             created_at: now,
             completed_at: None,
             is_default,
+            base_branch: None,
+            base_commit: None,
         };
 
         if let Ok(repo) = legion_db::open_db() {
