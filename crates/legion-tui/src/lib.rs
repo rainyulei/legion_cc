@@ -97,7 +97,7 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
         let last_used_idx = app.session_list.iter()
             .enumerate()
             .filter(|(_, s)| s.status == "active")
-            .max_by_key(|(_, s)| s.last_active_at.unwrap_or(0))
+            .max_by_key(|(_, s)| s.last_active_at.unwrap_or(s.created_at))
             .map(|(i, _)| i)
             .unwrap_or(0);
         app.session_list_index = last_used_idx;

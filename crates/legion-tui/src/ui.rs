@@ -1096,10 +1096,9 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
     let active: Vec<_> = app.session_list.iter().enumerate()
         .filter(|(_, s)| s.status == "active")
         .collect();
-    // Find the most recently used active session
+    // Find the most recently used active session (fallback to created_at)
     let last_used_name: Option<&str> = active.iter()
-        .filter(|(_, s)| s.last_active_at.is_some())
-        .max_by_key(|(_, s)| s.last_active_at.unwrap_or(0))
+        .max_by_key(|(_, s)| s.last_active_at.unwrap_or(s.created_at))
         .map(|(_, s)| s.name.as_str());
 
     let completed: Vec<_> = app.session_list.iter().enumerate()
