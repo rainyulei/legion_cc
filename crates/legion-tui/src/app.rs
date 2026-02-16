@@ -247,6 +247,9 @@ pub struct App {
     pub detected_branch: Option<String>,
     pub detected_commit: Option<String>,
 
+    // Session error message (shown in NewSessionInput popup)
+    pub session_error: Option<String>,
+
     // Deferred session spawning (for in-TUI session selection)
     pub session_name_input: String,
     pub base_port: u16,
@@ -347,6 +350,7 @@ impl App {
             creating_default_session: false,
             detected_branch: None,
             detected_commit: None,
+            session_error: None,
             session_name_input: String::new(),
             base_port: 0,
             requested_workers: 0,

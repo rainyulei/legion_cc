@@ -120,8 +120,14 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
                 }
                 Err(e) => {
                     tracing::error!("Failed to resume default session: {}", e);
+                    // Use branch name if detected, otherwise fallback
+                    if let Some(ref branch) = app.detected_branch {
+                        app.session_name_input = crate::worktree::sanitize_branch_name(branch);
+                    } else {
+                        app.session_name_input = app.default_session_name_for_default();
+                    }
                     app.mode = app::AppMode::Popup(app::PopupMenu::NewSessionInput);
-                    app.session_name_input = app.default_session_name_for_default();
+                    app.creating_default_session = true;
                 }
             }
         }

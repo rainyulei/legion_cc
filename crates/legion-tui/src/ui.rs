@@ -1110,7 +1110,7 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
             if branch_exists {
                 spans.push(Span::styled(
                     format!(" \u{2190} {}", branch), // ← branch
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Cyan),
                 ));
             } else {
                 spans.push(Span::styled(
@@ -1120,7 +1120,7 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
                 if let Some(ref commit) = session.base_commit {
                     spans.push(Span::styled(
                         format!(" ({})", commit),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     ));
                 }
             }
@@ -1210,13 +1210,13 @@ fn draw_new_session_input(frame: &mut Frame, app: &App, area: Rect) {
     // Show branch info if detected
     if let Some(ref branch) = app.detected_branch {
         items.push(ListItem::new(Line::from(vec![
-            Span::styled("  Branch: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Branch: ", Style::default().fg(Color::Gray)),
             Span::styled(branch.as_str(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ])));
         if let Some(ref commit) = app.detected_commit {
             items.push(ListItem::new(Line::from(vec![
-                Span::styled("  Commit: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(commit.as_str(), Style::default().fg(Color::DarkGray)),
+                Span::styled("  Commit: ", Style::default().fg(Color::Gray)),
+                Span::styled(commit.as_str(), Style::default().fg(Color::Gray)),
             ])));
         }
         items.push(ListItem::new(Line::from(Span::raw(""))));
@@ -1237,10 +1237,19 @@ fn draw_new_session_input(frame: &mut Frame, app: &App, area: Rect) {
     ])));
     items.push(ListItem::new(Line::from(Span::raw(""))));
 
+    // Show error if any
+    if let Some(ref err) = app.session_error {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("  Error: {}", err),
+            Style::default().fg(Color::Red),
+        ))));
+        items.push(ListItem::new(Line::from(Span::raw(""))));
+    }
+
     let workers_hint = format!("  {} workers  |  [Enter=Create] [Esc=Cancel]", app.requested_workers);
     items.push(ListItem::new(Line::from(Span::styled(
         workers_hint,
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     ))));
 
     frame.render_widget(List::new(items).block(block), area);
@@ -1414,15 +1423,15 @@ fn draw_api_key_input(frame: &mut Frame, app: &App, area: Rect) {
     )));
     lines.push(Line::from(Span::styled(
         format!("  Base URL: {}", tmpl.base_url),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     )));
     lines.push(Line::from(Span::styled(
         format!("  Format:   {}", tmpl.api_format),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     )));
     lines.push(Line::from(Span::styled(
         format!("  Env var:  ${}", tmpl.env_var),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     )));
     lines.push(Line::from(Span::raw("")));
     lines.push(Line::from(Span::styled(
@@ -1449,7 +1458,7 @@ fn draw_api_key_input(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(Span::raw("")));
     lines.push(Line::from(Span::styled(
         "  [Enter] Save  [Esc] Cancel",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);

@@ -450,6 +450,7 @@ fn handle_new_session_input_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             // Go back to session list
             app.session_name_input.clear();
+            app.session_error = None;
             app.load_session_list();
             app.mode = AppMode::Popup(PopupMenu::SessionList);
             app.session_list_index = 0;
@@ -469,6 +470,7 @@ fn handle_new_session_input_keys(app: &mut App, key: KeyEvent) {
                     }
                     Err(e) => {
                         tracing::error!("Failed to create session '{}': {}", name, e);
+                        app.session_error = Some(format!("{}", e));
                     }
                 }
             }
