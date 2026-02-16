@@ -240,6 +240,8 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::RetryForm) => handle_retry_form_keys(app, key),
         AppMode::Popup(PopupMenu::DeleteConfirm) => handle_delete_confirm_keys(app, key),
         AppMode::Popup(PopupMenu::ClearConfirm) => handle_clear_confirm_keys(app, key),
+        AppMode::Popup(PopupMenu::SessionDeleteConfirm) => handle_session_delete_confirm_keys(app, key),
+        AppMode::Popup(PopupMenu::CompleteRecordChoice) => handle_complete_record_choice_keys(app, key),
         _ => {}
     }
 
@@ -298,6 +300,57 @@ fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
         KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Char('n') => {
+            // Open new session input popup
+            app.session_name_input = app.default_session_name();
+            app.mode = AppMode::Popup(PopupMenu::NewSessionInput);
+        }
+        KeyCode::Char('d') => {
+            // Delete selected session (only if active and NOT is_default)
+            if app.session_list_index < app.session_list.len() {
+                let session = &app.session_list[app.session_list_index];
+                if session.status == "active" && !session.is_default {
+                    let name = session.name.clone();
+                    // Get session stats from DB
+                    if let Ok(repo) = legion_db::open_db() {
+                        app.session_delete_pending_count = repo.count_pending_tickets(&name).unwrap_or(0);
+                        app.session_delete_ticket_count = repo.count_tickets(&name).unwrap_or(0);
+                        app.session_delete_log_count = repo.count_ticket_logs(&name).unwrap_or(0);
+                    }
+                    app.session_delete_target = Some(name);
+                    app.mode = AppMode::Popup(PopupMenu::SessionDeleteConfirm);
+                }
+            }
+        }
+        KeyCode::Char('c') => {
+            // Complete selected session (only if active and NOT is_default)
+            if app.session_list_index < app.session_list.len() {
+                let session = &app.session_list[app.session_list_index];
+                if session.status == "active" && !session.is_default {
+                    app.complete_session_name = Some(session.name.clone());
+                    app.complete_merge_index = 0;
+                    app.mode = AppMode::Popup(PopupMenu::CompleteSession);
+                }
+            }
+        }
+        KeyCode::Char('x') => {
+            // Remove completed session from history
+            if app.session_list_index < app.session_list.len() {
+                let session = &app.session_list[app.session_list_index];
+                if session.status == "completed" {
+                    let name = session.name.clone();
+                    if let Ok(repo) = legion_db::open_db() {
+                        if let Err(e) = repo.delete_squad_session(&name) {
+                            tracing::error!("Failed to remove session '{}': {}", name, e);
+                        } else {
+                            tracing::info!("Removed completed session: {}", name);
+                        }
+                    }
+                    app.load_session_list();
+                    app.session_list_index = 0;
+                }
+            }
+        }
         KeyCode::Enter => {
             if app.session_list_index >= app.session_list.len() {
                 // "New Session" selected → show text input with default name
@@ -307,7 +360,8 @@ fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
                 // Resume existing session
                 let session = app.session_list[app.session_list_index].clone();
                 let workers = session.worker_count as u16;
-                match app.start_session(&session.name, workers, true) {
+                let is_default = session.is_default;
+                match app.start_session(&session.name, workers, true, is_default) {
                     Ok(()) => {
                         tracing::info!("Resumed session: {}", session.name);
                         update_proxy_config(app);
@@ -326,32 +380,21 @@ fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
 fn handle_complete_session_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
-            app.mode = AppMode::Popup(PopupMenu::Main);
+            app.complete_session_name = None;
+            app.mode = AppMode::Popup(PopupMenu::SessionList);
         }
-        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
         KeyCode::Enter => {
-            let strategy = match app.complete_merge_index {
-                0 => "merge",
-                1 => "keep",
-                _ => "discard",
-            };
-
-            app.kill_all();
-
-            match app.complete_current_session(strategy) {
-                Ok(true) => {
-                    tracing::info!("Session completed with strategy: {}", strategy);
-                }
-                Ok(false) => {
-                    tracing::warn!("No active session to complete");
+            match app.complete_session_merge() {
+                Ok(_) => {
+                    app.complete_record_choice = 0;
+                    app.mode = AppMode::Popup(PopupMenu::CompleteRecordChoice);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to complete session: {}", e);
+                    tracing::error!("Failed to merge session: {}", e);
+                    app.complete_session_name = None;
+                    app.mode = AppMode::Popup(PopupMenu::SessionList);
                 }
             }
-            app.mode = AppMode::Normal;
-            app.should_quit = true;
         }
         _ => {}
     }
@@ -370,10 +413,12 @@ fn handle_new_session_input_keys(app: &mut App, key: KeyEvent) {
             let name = app.session_name_input.trim().to_string();
             if !name.is_empty() {
                 let workers = app.requested_workers;
-                match app.start_session(&name, workers, false) {
+                let is_default = app.creating_default_session;
+                match app.start_session(&name, workers, false, is_default) {
                     Ok(()) => {
                         tracing::info!("Created new session: {}", name);
                         app.session_name_input.clear();
+                        app.creating_default_session = false;
                         update_proxy_config(app);
                         app.mode = AppMode::Normal;
                     }
@@ -676,6 +721,55 @@ fn handle_delete_confirm_keys(app: &mut App, key: KeyEvent) {
             app.mode = AppMode::Normal;
         }
         _ => {}
+    }
+}
+
+fn handle_session_delete_confirm_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('y') => {
+            if let Some(name) = app.session_delete_target.clone() {
+                match app.delete_session(&name) {
+                    Ok(()) => tracing::info!("Deleted session: {}", name),
+                    Err(e) => tracing::error!("Failed to delete session: {}", e),
+                }
+            }
+            app.session_delete_target = None;
+            app.load_session_list();
+            app.session_list_index = 0;
+            app.mode = AppMode::Popup(PopupMenu::SessionList);
+        }
+        KeyCode::Esc | KeyCode::Char('n') => {
+            app.session_delete_target = None;
+            app.mode = AppMode::Popup(PopupMenu::SessionList);
+        }
+        _ => {}
+    }
+}
+
+fn handle_complete_record_choice_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.complete_record_choice > 0 {
+                app.complete_record_choice -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.complete_record_choice < 1 {
+                app.complete_record_choice += 1;
+            }
+        }
+        KeyCode::Enter => {
+            let migrate = app.complete_record_choice == 1;
+            match app.complete_session_records(migrate) {
+                Ok(()) => tracing::info!("Session completed"),
+                Err(e) => tracing::error!("Failed: {}", e),
+            }
+            app.complete_session_name = None;
+            app.load_session_list();
+            app.session_list_index = 0;
+            app.mode = AppMode::Popup(PopupMenu::SessionList);
+        }
+        _ => {} // No Esc — must make a choice (merge already done)
     }
 }
 

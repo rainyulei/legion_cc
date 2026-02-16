@@ -35,6 +35,8 @@ pub enum PopupMenu {
     RetryForm,
     DeleteConfirm,
     ClearConfirm,
+    SessionDeleteConfirm,
+    CompleteRecordChoice,
 }
 
 /// Which column is active in the matrix view
@@ -219,6 +221,15 @@ pub struct App {
     pub session_list_index: usize,
     pub complete_merge_index: usize,
 
+    // Session delete/complete state
+    pub session_delete_target: Option<String>,
+    pub session_delete_pending_count: usize,
+    pub session_delete_ticket_count: usize,
+    pub session_delete_log_count: usize,
+    pub complete_record_choice: usize,
+    pub complete_session_name: Option<String>,
+    pub creating_default_session: bool,
+
     // Deferred session spawning (for in-TUI session selection)
     pub session_name_input: String,
     pub base_port: u16,
@@ -291,6 +302,13 @@ impl App {
             session_list: Vec::new(),
             session_list_index: 0,
             complete_merge_index: 0,
+            session_delete_target: None,
+            session_delete_pending_count: 0,
+            session_delete_ticket_count: 0,
+            session_delete_log_count: 0,
+            complete_record_choice: 0,
+            complete_session_name: None,
+            creating_default_session: false,
             session_name_input: String::new(),
             base_port: 0,
             requested_workers: 0,
@@ -593,11 +611,15 @@ impl App {
     }
 
     /// Create a new session: create worktrees, save to DB
-    pub fn create_session(&mut self, name: &str, worker_count: u16) -> anyhow::Result<Vec<PathBuf>> {
+    pub fn create_session(&mut self, name: &str, worker_count: u16, is_default: bool) -> anyhow::Result<Vec<PathBuf>> {
         let project_path = self.project_path.as_ref()
             .ok_or_else(|| anyhow::anyhow!("No project path set"))?;
 
-        let paths = crate::worktree::create_session_worktrees(project_path, name, worker_count)?;
+        let paths = if is_default {
+            crate::worktree::create_default_session_worktrees(project_path, name, worker_count)?
+        } else {
+            crate::worktree::create_session_worktrees(project_path, name, worker_count)?
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -611,7 +633,7 @@ impl App {
             status: "active".to_string(),
             created_at: now,
             completed_at: None,
-            is_default: false,
+            is_default,
         };
 
         if let Ok(repo) = legion_db::open_db() {
@@ -629,9 +651,20 @@ impl App {
         Some(crate::worktree::pane_worktree_path(project_path, &session.name, pane_label))
     }
 
-    /// Mark current session as completed with given merge strategy
-    pub fn complete_current_session(&mut self, strategy: &str) -> anyhow::Result<bool> {
-        let session = match self.current_session.take() {
+    /// Get the default session name based on the git default branch
+    pub fn default_session_name_for_default(&self) -> String {
+        if let Some(ref project_path) = self.project_path {
+            crate::worktree::default_branch(project_path)
+        } else {
+            "main".to_string()
+        }
+    }
+
+    /// Phase 1 of session completion: merge branches to git default branch, remove worktrees.
+    /// Does NOT take/clear current_session (that happens in phase 2 via complete_session_records).
+    /// Returns Ok(false) if no current session.
+    pub fn complete_session_merge(&mut self) -> anyhow::Result<bool> {
+        let session = match self.current_session.as_ref() {
             Some(s) => s,
             None => return Ok(false),
         };
@@ -640,49 +673,109 @@ impl App {
             None => return Ok(false),
         };
 
+        let default_branch = crate::worktree::default_branch(&project_path);
+        let _ = std::process::Command::new("git")
+            .args(["checkout", &default_branch])
+            .current_dir(&project_path)
+            .output();
+
+        if session.is_default {
+            // Default session: only merge worker branches (Leader is on the main repo)
+            for i in 1..=session.worker_count {
+                let label = format!("Worker {}", i);
+                if let Err(e) = crate::worktree::merge_branch(&project_path, &session.name, &label) {
+                    tracing::error!("Merge failed for {}: {}", label, e);
+                    return Err(e);
+                }
+            }
+            crate::worktree::remove_default_session_worktrees(
+                &project_path, &session.name, session.worker_count as u16, false,
+            )?;
+        } else {
+            // Non-default session: merge Leader + all workers
+            let pane_labels = std::iter::once("Leader".to_string())
+                .chain((1..=session.worker_count).map(|i| format!("Worker {}", i)));
+
+            for label in pane_labels {
+                if let Err(e) = crate::worktree::merge_branch(&project_path, &session.name, &label) {
+                    tracing::error!("Merge failed for {}: {}", label, e);
+                    return Err(e);
+                }
+            }
+            crate::worktree::remove_session_worktrees(
+                &project_path, &session.name, session.worker_count as u16, false,
+            )?;
+        }
+
+        Ok(true)
+    }
+
+    /// Phase 2 of session completion: handle ticket records (migrate or delete), mark session completed.
+    /// Takes current_session and clears in-memory ticket data.
+    pub fn complete_session_records(&mut self, migrate: bool) -> anyhow::Result<()> {
+        let session = match self.current_session.take() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        match strategy {
-            "merge" => {
-                let default_branch = crate::worktree::default_branch(&project_path);
-                let _ = std::process::Command::new("git")
-                    .args(["checkout", &default_branch])
-                    .current_dir(&project_path)
-                    .output();
-
-                let pane_labels = std::iter::once("Leader".to_string())
-                    .chain((1..=session.worker_count).map(|i| format!("Worker {}", i)));
-
-                for label in pane_labels {
-                    if let Err(e) = crate::worktree::merge_branch(&project_path, &session.name, &label) {
-                        tracing::error!("Merge failed for {}: {}", label, e);
-                        self.current_session = Some(session);
-                        return Err(e);
-                    }
-                }
-
-                crate::worktree::remove_session_worktrees(
-                    &project_path, &session.name, session.worker_count as u16, false,
-                )?;
-            }
-            "discard" => {
-                crate::worktree::remove_session_worktrees(
-                    &project_path, &session.name, session.worker_count as u16, true,
-                )?;
-            }
-            _ => {
-                // "keep" — do nothing to worktrees
-            }
-        }
-
         if let Ok(repo) = legion_db::open_db() {
+            if migrate {
+                let default_session_name = self.default_session_name_for_default();
+                repo.migrate_tickets_to_session(&session.name, &default_session_name)?;
+            } else {
+                repo.delete_session_tickets(&session.name)?;
+            }
             repo.complete_squad_session(&session.name, now)?;
         }
 
-        Ok(true)
+        // Clear in-memory ticket data
+        self.ticket_logs.clear();
+        self.ticket_snapshot = None;
+        self.queue_stats = None;
+
+        Ok(())
+    }
+
+    /// Delete a session entirely: remove worktrees, delete all tickets/logs, delete DB record.
+    /// Cannot delete a default session.
+    pub fn delete_session(&mut self, session_name: &str) -> anyhow::Result<()> {
+        let repo = legion_db::open_db()?;
+        let session = repo.get_squad_session(session_name)?
+            .ok_or_else(|| anyhow::anyhow!("Session '{}' not found", session_name))?;
+
+        if session.is_default {
+            anyhow::bail!("Cannot delete the default session '{}'", session_name);
+        }
+
+        // Remove worktrees with force
+        if let Some(ref project_path) = self.project_path {
+            let _ = crate::worktree::remove_session_worktrees(
+                project_path, session_name, session.worker_count as u16, true,
+            );
+        }
+
+        // Delete all tickets/logs from DB
+        repo.delete_session_tickets(session_name)?;
+
+        // Delete squad_session record from DB
+        repo.delete_squad_session(session_name)?;
+
+        // If this is the current session, clear it
+        if self.current_session.as_ref().map(|s| s.name.as_str()) == Some(session_name) {
+            self.current_session = None;
+        }
+
+        // Clear in-memory ticket data
+        self.ticket_logs.clear();
+        self.ticket_snapshot = None;
+        self.queue_stats = None;
+
+        Ok(())
     }
 
     pub fn load_session_list(&mut self) {
@@ -707,7 +800,7 @@ impl App {
     }
 
     /// Start a session: create/verify worktrees, spawn PTY panes, set up orchestration
-    pub fn start_session(&mut self, name: &str, worker_count: u16, is_resume: bool) -> anyhow::Result<()> {
+    pub fn start_session(&mut self, name: &str, worker_count: u16, is_resume: bool, is_default: bool) -> anyhow::Result<()> {
         // Kill existing panes if switching sessions
         self.kill_all();
         self.panes.clear();
@@ -719,21 +812,34 @@ impl App {
 
         // Create or verify worktrees
         let worktree_paths = if is_resume {
+            // Load session from DB to check is_default
+            if let Ok(repo) = legion_db::open_db() {
+                self.current_session = repo.get_squad_session(name).ok().flatten();
+            }
+            let session_is_default = self.current_session.as_ref().map(|s| s.is_default).unwrap_or(is_default);
+
             let mut paths = Vec::new();
-            for i in 0..=worker_count {
-                let label = if i == 0 { "Leader".to_string() } else { format!("Worker {}", i) };
+            if session_is_default {
+                // Default session: Leader path = project_path (no worktree)
+                paths.push(project_path.clone());
+            } else {
+                let wt = crate::worktree::pane_worktree_path(&project_path, name, "Leader");
+                if !crate::worktree::worktree_exists(&wt) {
+                    let _ = crate::worktree::create_worktree(&project_path, name, "Leader");
+                }
+                paths.push(wt);
+            }
+            for i in 1..=worker_count {
+                let label = format!("Worker {}", i);
                 let wt = crate::worktree::pane_worktree_path(&project_path, name, &label);
                 if !crate::worktree::worktree_exists(&wt) {
                     let _ = crate::worktree::create_worktree(&project_path, name, &label);
                 }
                 paths.push(wt);
             }
-            if let Ok(repo) = legion_db::open_db() {
-                self.current_session = repo.get_squad_session(name).ok().flatten();
-            }
             paths
         } else {
-            self.create_session(name, worker_count)?
+            self.create_session(name, worker_count, is_default)?
         };
 
         // Calculate PTY sizes from cached terminal dimensions
@@ -958,8 +1064,13 @@ impl App {
                         self.session_list_index = 0;
                     }
                     MainMenuItem::CompleteSession => {
-                        self.mode = AppMode::Popup(PopupMenu::CompleteSession);
-                        self.complete_merge_index = 0;
+                        if let Some(ref session) = self.current_session {
+                            if !session.is_default {
+                                self.complete_session_name = Some(session.name.clone());
+                                self.mode = AppMode::Popup(PopupMenu::CompleteSession);
+                                self.complete_merge_index = 0;
+                            }
+                        }
                     }
                     MainMenuItem::Quit => {
                         self.should_quit = true;

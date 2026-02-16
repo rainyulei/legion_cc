@@ -82,15 +82,33 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     let size = terminal.size()?;
     app.term_size = (size.width, size.height);
 
-    // Show session selection popup on startup (no pre-TUI text prompts)
-    app.load_session_list();
-    let has_active = app.session_list.iter().any(|s| s.status == "active");
-    if has_active {
-        app.mode = app::AppMode::Popup(app::PopupMenu::SessionList);
-        app.session_list_index = 0;
+    // Check for default session — auto-resume if exists
+    let default_session = if let Ok(repo) = legion_db::open_db() {
+        let pp = app.project_path.as_ref().unwrap().to_string_lossy().to_string();
+        repo.get_default_squad_session(&pp).ok().flatten()
     } else {
+        None
+    };
+
+    if let Some(default_sess) = default_session {
+        // Auto-resume default session
+        let workers = default_sess.worker_count as u16;
+        match app.start_session(&default_sess.name, workers, true, true) {
+            Ok(()) => {
+                tracing::info!("Auto-resumed default session: {}", default_sess.name);
+                app.mode = app::AppMode::Normal;
+            }
+            Err(e) => {
+                tracing::error!("Failed to resume default session: {}", e);
+                app.mode = app::AppMode::Popup(app::PopupMenu::NewSessionInput);
+                app.session_name_input = app.default_session_name_for_default();
+            }
+        }
+    } else {
+        // No default session — first-time setup
         app.mode = app::AppMode::Popup(app::PopupMenu::NewSessionInput);
-        app.session_name_input = app.default_session_name();
+        app.session_name_input = app.default_session_name_for_default();
+        app.creating_default_session = true;
     }
 
     // Main event loop

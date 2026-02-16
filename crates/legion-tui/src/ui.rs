@@ -721,6 +721,8 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
     let (pw, ph) = match menu {
         PopupMenu::RetryForm => (70, 80),
         PopupMenu::DeleteConfirm | PopupMenu::ClearConfirm => (50, 30),
+        PopupMenu::SessionDeleteConfirm => (55, 40),
+        PopupMenu::CompleteRecordChoice => (55, 25),
         _ => (60, 60),
     };
     let area = centered_rect(pw, ph, frame.area());
@@ -742,6 +744,8 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::RetryForm => draw_retry_form(frame, app, area),
         PopupMenu::DeleteConfirm => draw_delete_confirm(frame, app, area),
         PopupMenu::ClearConfirm => draw_clear_confirm(frame, app, area),
+        PopupMenu::SessionDeleteConfirm => draw_session_delete_confirm(frame, app, area),
+        PopupMenu::CompleteRecordChoice => draw_complete_record_choice(frame, app, area),
     }
 }
 
@@ -1021,7 +1025,7 @@ fn draw_model_menu(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
-        .title(" Sessions [ESC] ")
+        .title(" Sessions ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::DarkGray));
@@ -1029,32 +1033,77 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     let current_name = app.current_session.as_ref().map(|s| s.name.as_str());
 
-    for (i, session) in app.session_list.iter().enumerate() {
-        let selected = i == app.session_list_index;
+    // Collect active and completed sessions separately
+    // Active: default first, then others
+    let mut active: Vec<_> = app.session_list.iter().enumerate()
+        .filter(|(_, s)| s.status == "active")
+        .collect();
+    active.sort_by(|(_, a), (_, b)| b.is_default.cmp(&a.is_default));
+
+    let completed: Vec<_> = app.session_list.iter().enumerate()
+        .filter(|(_, s)| s.status == "completed")
+        .collect();
+
+    // "Active:" header
+    items.push(ListItem::new(Line::from(Span::styled(
+        "  Active:", Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    ))));
+
+    for (i, session) in &active {
+        let selected = *i == app.session_list_index;
         let prefix = if selected { "> " } else { "  " };
         let icon = if current_name == Some(session.name.as_str()) {
             "\u{25cf} "
-        } else if session.status == "completed" {
-            "\u{2713} "
         } else {
             "\u{25cb} "
         };
         let style = if selected {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else if session.status == "completed" {
-            Style::default().fg(Color::DarkGray)
         } else {
             Style::default().fg(Color::White)
         };
-        let pane_count = 1 + session.worker_count;
-        items.push(ListItem::new(Line::from(vec![
+        let mut spans = vec![
             Span::raw(prefix.to_string()),
             Span::styled(icon, style),
             Span::styled(session.name.clone(), style),
-            Span::styled(format!("  {} panes", pane_count), Style::default().fg(Color::DarkGray)),
-        ])));
+        ];
+        if session.is_default {
+            spans.push(Span::styled(" [default]", Style::default().fg(Color::Cyan)));
+        }
+        spans.push(Span::styled(
+            format!("  {} workers", session.worker_count),
+            Style::default().fg(Color::DarkGray),
+        ));
+        items.push(ListItem::new(Line::from(spans)));
     }
 
+    // Completed section
+    if !completed.is_empty() {
+        items.push(ListItem::new("")); // spacer
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  Completed:", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        ))));
+
+        for (i, session) in &completed {
+            let selected = *i == app.session_list_index;
+            let prefix = if selected { "> " } else { "  " };
+            let style = if selected {
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let date = format_relative_time(session.completed_at.unwrap_or(session.created_at));
+            items.push(ListItem::new(Line::from(vec![
+                Span::raw(prefix.to_string()),
+                Span::styled("\u{2713} ", style),
+                Span::styled(session.name.clone(), style),
+                Span::styled(format!("  {}", date), Style::default().fg(Color::DarkGray)),
+            ])));
+        }
+    }
+
+    // "New Session" entry
+    items.push(ListItem::new("")); // spacer
     let new_selected = app.session_list_index >= app.session_list.len();
     let new_prefix = if new_selected { "> " } else { "  " };
     let new_style = if new_selected {
@@ -1067,7 +1116,35 @@ fn draw_session_list(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("[+] New Session", new_style),
     ])));
 
+    // Footer hints
+    items.push(ListItem::new("")); // spacer
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled("  [Enter", Style::default().fg(Color::DarkGray)),
+        Span::styled("=Resume] ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[n", Style::default().fg(Color::DarkGray)),
+        Span::styled("=New] ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[d", Style::default().fg(Color::DarkGray)),
+        Span::styled("=Delete] ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[c", Style::default().fg(Color::DarkGray)),
+        Span::styled("=Complete]", Style::default().fg(Color::DarkGray)),
+    ])));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "  [x=Remove completed]",
+        Style::default().fg(Color::DarkGray),
+    ))));
+
     frame.render_widget(List::new(items).block(block), area);
+}
+
+fn format_relative_time(ts: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let diff = now.saturating_sub(ts as u64);
+    if diff < 86400 { "today".to_string() }
+    else if diff < 172800 { "yesterday".to_string() }
+    else { format!("{}d ago", diff / 86400) }
 }
 
 fn draw_new_session_input(frame: &mut Frame, app: &App, area: Rect) {
@@ -1482,6 +1559,73 @@ fn draw_clear_confirm(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
         ]),
     ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_session_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let name = app.session_delete_target.as_deref().unwrap_or("?");
+    let block = Block::default()
+        .title(" Delete Session ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(Span::raw("")),
+        Line::from(Span::styled(
+            format!("  Delete session \"{}\"?", name),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::raw("")),
+        Line::from(Span::styled(
+            format!("  Tickets: {}  Pending: {}  Logs: {}",
+                app.session_delete_ticket_count,
+                app.session_delete_pending_count,
+                app.session_delete_log_count),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled("  [Enter/y]", Style::default().fg(Color::Yellow)),
+            Span::styled(" Confirm  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Esc/n]", Style::default().fg(Color::Yellow)),
+            Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_complete_record_choice(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Session Records ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let choices = ["Discard tickets & logs", "Migrate to default session"];
+    let mut lines = vec![
+        Line::from(Span::raw("")),
+        Line::from(Span::styled(
+            "  What to do with session records?",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::raw("")),
+    ];
+    for (i, label) in choices.iter().enumerate() {
+        let prefix = if i == app.complete_record_choice { "▸ " } else { "  " };
+        let style = if i == app.complete_record_choice {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        lines.push(Line::from(Span::styled(format!("  {}{}", prefix, label), style)));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
