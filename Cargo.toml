@@ -21,10 +21,10 @@ authors = ["rainlei"]
 tokio = { version = "1", features = ["full"] }
 
 # TUI
-ratatui = "0.29"
-crossterm = "0.28"
-tui-term = "0.2"
-vt100 = "0.15"
+ratatui = "0.30"
+crossterm = "0.29"
+tui-term = "0.3"
+vt100 = "0.16"
 portable-pty = "0.8"
 
 # HTTP

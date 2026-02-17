@@ -181,10 +181,27 @@ async fn run_event_loop(
         // Check if any --continue panes failed and need respawn
         app.check_continue_fallback();
 
-        // Handle pending add worker
-        if app.pending_add_worker {
-            app.pending_add_worker = false;
-            handle_add_worker(app).await;
+        // Handle pending set worker count (add/remove workers to reach target)
+        if let Some(target) = app.pending_set_worker_count.take() {
+            let current = app.worker_count() as u16;
+            if target > current {
+                for _ in 0..(target - current) {
+                    handle_add_worker(app).await;
+                }
+            } else if target < current {
+                // Remove from the end, merging worktrees
+                for _ in 0..(current - target) {
+                    let pane_index = app.panes.len() - 1; // last worker pane
+                    match app.remove_single_worker(pane_index, "merge") {
+                        Ok(()) => tracing::info!("Worker removed (scaling down)"),
+                        Err(e) => {
+                            tracing::error!("Failed to remove worker: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            app.persist_worker_count();
         }
 
         // Sync max iterations to engine
@@ -198,7 +215,10 @@ async fn run_event_loop(
         // Handle pending remove worker
         if let Some((pane_index, strategy)) = app.pending_remove_worker.take() {
             match app.remove_single_worker(pane_index, &strategy) {
-                Ok(()) => tracing::info!("Worker removed successfully"),
+                Ok(()) => {
+                    app.persist_worker_count();
+                    tracing::info!("Worker removed successfully");
+                }
                 Err(e) => tracing::error!("Failed to remove worker: {}", e),
             }
         }
@@ -541,10 +561,14 @@ async fn handle_add_worker(app: &mut App) {
         current_ticket_id: None,
         sdk_log_buffer: None,
         last_sdk_activity: None,
+        scroll_offset: 0,
     });
 
     // Resize all panes to accommodate the new worker
     app.apply_resize();
+
+    // Persist updated worker count to DB
+    app.persist_worker_count();
 
     tracing::info!("Worker '{}' added successfully", label);
 }

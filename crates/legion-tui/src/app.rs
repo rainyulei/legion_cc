@@ -43,7 +43,7 @@ pub enum PopupMenu {
     BranchList,
     BranchChanged,
     CopilotAuth,
-    AddWorkerConfirm,
+    SetWorkerCount,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +83,7 @@ pub enum MainMenuItem {
     SwitchModels,
     ConnectProvider,
     MaxRetries,
-    AddWorker,
+    SetWorkers,
     RemoveWorker,
     SwitchSession,
     SwitchBranch,
@@ -97,12 +97,26 @@ impl MainMenuItem {
             Self::SwitchModels => "Switch Models",
             Self::ConnectProvider => "Connect Provider",
             Self::MaxRetries => "Max Retries",
-            Self::AddWorker => "Add Worker",
+            Self::SetWorkers => "Set Workers",
             Self::RemoveWorker => "Remove Worker",
             Self::SwitchSession => "Switch Session",
             Self::SwitchBranch => "Switch Branch",
             Self::CompleteSession => "Complete Session",
             Self::Quit => "Quit",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::SwitchModels => "Change AI model for leader or worker panes",
+            Self::ConnectProvider => "Add API provider (Anthropic, OpenAI, etc.)",
+            Self::MaxRetries => "Set max retry attempts for failed tickets",
+            Self::SetWorkers => "Scale worker count from 1 to 8",
+            Self::RemoveWorker => "Remove a specific worker from the squad",
+            Self::SwitchSession => "Switch to a different squad session",
+            Self::SwitchBranch => "Change the git branch for this session",
+            Self::CompleteSession => "Mark current session as complete",
+            Self::Quit => "Exit Legion",
         }
     }
 }
@@ -181,6 +195,10 @@ pub const MAX_WORKERS: u16 = 8;
 
 /// Worker timeout: kill SDK process if no output for this many seconds
 pub const WORKER_TIMEOUT_SECS: u64 = 300;
+/// Scrollback buffer size for vt100 parser (number of lines kept in history).
+pub const SCROLLBACK_LINES: usize = 100_000;
+/// Max scroll input offset to prevent unbounded accumulation from fast trackpad scrolling.
+pub const MAX_SCROLL_OFFSET: usize = 100_000;
 
 /// A single pane in the TUI - each runs its own Claude Code instance
 pub struct Pane {
@@ -202,6 +220,8 @@ pub struct Pane {
     pub sdk_log_buffer: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
     /// Last time SDK produced output (for timeout detection)
     pub last_sdk_activity: Option<Instant>,
+    /// Scrollback offset (0 = normal view, >0 = scrolled up)
+    pub scroll_offset: usize,
 }
 
 impl Pane {
@@ -282,11 +302,13 @@ pub struct App {
     pub pending_orchestrate_port: Option<u16>,
 
     // Dynamic worker management
-    pub pending_add_worker: bool,
+    pub pending_set_worker_count: Option<u16>,  // target worker count to apply
+    pub set_worker_count_selection: u16,         // currently selected number in popup
     pub pending_sync_max_iterations: bool,
     pub pending_remove_worker: Option<(usize, String)>, // (pane index, strategy: "merge"/"keep"/"discard")
     pub next_worker_id: u16,
     pub remove_worker_target: usize,
+    pub remove_worker_confirming: bool,
     pub remove_worker_strategy_index: usize,
 
     // Saved per-pane configs (label → (provider_id, model))
@@ -388,11 +410,13 @@ impl App {
             base_port: 0,
             requested_workers: 0,
             pending_orchestrate_port: None,
-            pending_add_worker: false,
+            pending_set_worker_count: None,
+            set_worker_count_selection: 2,
             pending_sync_max_iterations: false,
             pending_remove_worker: None,
             next_worker_id: 1,
             remove_worker_target: 0,
+            remove_worker_confirming: false,
             remove_worker_strategy_index: 0,
             saved_pane_configs: HashMap::new(),
             board_selected: 0,
@@ -478,6 +502,7 @@ impl App {
             current_ticket_id: None,
             sdk_log_buffer: None,
             last_sdk_activity: None,
+            scroll_offset: 0,
         });
     }
 
@@ -1014,6 +1039,7 @@ impl App {
                 current_ticket_id: None,
                 sdk_log_buffer: None,
                 last_sdk_activity: None,
+                scroll_offset: 0,
             });
         }
 
@@ -1119,10 +1145,8 @@ impl App {
         let mut items = vec![MainMenuItem::SwitchModels, MainMenuItem::ConnectProvider];
         if self.is_squad() {
             items.push(MainMenuItem::MaxRetries);
+            items.push(MainMenuItem::SetWorkers);
             let wc = self.panes.len().saturating_sub(1) as u16;
-            if wc < MAX_WORKERS {
-                items.push(MainMenuItem::AddWorker);
-            }
             if wc > 0 {
                 items.push(MainMenuItem::RemoveWorker);
             }
@@ -1132,13 +1156,23 @@ impl App {
         }
         items.push(MainMenuItem::SwitchSession);
         items.push(MainMenuItem::CompleteSession);
-        items.push(MainMenuItem::Quit);
         items
     }
 
     /// Number of worker panes (excludes leader)
     pub fn worker_count(&self) -> usize {
         if self.is_squad() { self.panes.len() - 1 } else { 0 }
+    }
+
+    /// Persist the current worker count to the DB session record.
+    pub fn persist_worker_count(&mut self) {
+        let wc = self.worker_count() as i64;
+        if let Some(ref mut session) = self.current_session {
+            session.worker_count = wc;
+            if let Ok(repo) = legion_db::open_db() {
+                let _ = repo.upsert_squad_session(session);
+            }
+        }
     }
 
     pub fn toggle_popup(&mut self) {
@@ -1174,11 +1208,13 @@ impl App {
                         self.submenu_index = (self.default_max_iterations as usize).saturating_sub(1);
                         self.mode = AppMode::Popup(PopupMenu::MaxRetries);
                     }
-                    MainMenuItem::AddWorker => {
-                        self.mode = AppMode::Popup(PopupMenu::AddWorkerConfirm);
+                    MainMenuItem::SetWorkers => {
+                        self.set_worker_count_selection = self.worker_count() as u16;
+                        self.mode = AppMode::Popup(PopupMenu::SetWorkerCount);
                     }
                     MainMenuItem::RemoveWorker => {
                         self.remove_worker_target = 0;
+                        self.remove_worker_confirming = false;
                         self.mode = AppMode::Popup(PopupMenu::RemoveWorkerList);
                     }
                     MainMenuItem::SwitchBranch => {
@@ -1298,7 +1334,7 @@ impl App {
             AppMode::Popup(PopupMenu::SessionList) => self.session_list.len() + 1,
             AppMode::Popup(PopupMenu::CompleteSession) => 3,
             AppMode::Popup(PopupMenu::RemoveWorkerList) => self.worker_count(),
-            AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => 3,
+            AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => 0,
             _ => return,
         };
         let idx = match self.mode {
@@ -1324,7 +1360,7 @@ impl App {
             AppMode::Popup(PopupMenu::SessionList) => self.session_list.len() + 1,
             AppMode::Popup(PopupMenu::CompleteSession) => 3,
             AppMode::Popup(PopupMenu::RemoveWorkerList) => self.worker_count(),
-            AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => 3,
+            AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => 0,
             _ => return,
         };
         let idx = match self.mode {
@@ -1474,7 +1510,7 @@ impl App {
         let lw = (term_w as u32 * self.leader_ratio as u32 / 100) as u16;
         let ww = term_w.saturating_sub(lw).saturating_sub(1);
         let parser = std::sync::Arc::new(std::sync::Mutex::new(
-            vt100::Parser::new(term_h.saturating_sub(4), ww.saturating_sub(2), 1000)
+            vt100::Parser::new(term_h.saturating_sub(4), ww.saturating_sub(2), SCROLLBACK_LINES)
         ));
 
         // Generate system prompt based on team mode

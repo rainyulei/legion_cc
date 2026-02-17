@@ -115,7 +115,7 @@ impl SdkHandle {
             if let Ok(mut p) = parser.lock() {
                 let (rows, cols) = p.screen().size();
                 // Reset parser
-                *p = vt100::Parser::new(rows, cols, 1000);
+                *p = vt100::Parser::new(rows, cols, crate::app::SCROLLBACK_LINES);
                 // Write header
                 let header = format!(
                     "\x1b[1;36m━━━ SDK Execution Mode ━━━\x1b[0m\r\n\r\n"

@@ -102,7 +102,7 @@ impl PtyHandle {
             .context("Failed to spawn claude in PTY")?;
         drop(pair.slave);
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, crate::app::SCROLLBACK_LINES)));
 
         // Reader thread: PTY stdout -> vt100 parser
         let reader = pair
@@ -175,7 +175,7 @@ impl PtyHandle {
             .context("Failed to resize PTY master")?;
         // Update vt100 parser to match
         if let Ok(mut p) = self.parser.lock() {
-            p.set_size(rows, cols);
+            p.screen_mut().set_size(rows, cols);
         }
         Ok(())
     }

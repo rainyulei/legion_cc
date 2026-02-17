@@ -213,27 +213,46 @@ fn draw_pane(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     let is_focused = app.focused_pane == index && !app.right_panel_focused;
     let border_color = if is_focused { Color::Blue } else { Color::DarkGray };
 
-    let title = if app.is_squad() {
+    // Build title helper
+    let base_title = if app.is_squad() {
         let model = pane.current_model.as_deref().unwrap_or("--");
-        format!(" {} | {} ", pane.label, model)
+        format!("{} | {}", pane.label, model)
     } else {
-        " Claude Code ".to_string()
+        "Claude Code".to_string()
     };
 
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
-
     if let Some(parser) = app.parser_at(index) {
-        if let Ok(p) = parser.lock() {
+        if let Ok(mut p) = parser.lock() {
+            let offset = pane.scroll_offset;
+
+            let title = if offset > 0 {
+                format!(" {} [SCROLLBACK +{}] ", base_title, offset)
+            } else {
+                format!(" {} ", base_title)
+            };
+            let block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color));
+
+            if offset > 0 {
+                p.screen_mut().set_scrollback(offset);
+            }
             let pseudo_term = PseudoTerminal::new(p.screen()).block(block);
             frame.render_widget(pseudo_term, area);
+            if offset > 0 {
+                p.screen_mut().set_scrollback(0);
+            }
             return;
         }
     }
 
     // Fallback: no PTY running yet
+    let title = format!(" {} ", base_title);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
     let content = Paragraph::new(" Starting Claude Code...")
         .style(Style::default().fg(Color::Gray))
         .block(block);
@@ -720,7 +739,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
                     Span::styled(": Back", Style::default().fg(Color::Gray)),
                 ],
-                PopupMenu::CopilotAuth | PopupMenu::AddWorkerConfirm => vec![
+                PopupMenu::CopilotAuth | PopupMenu::SetWorkerCount => vec![
                     Span::styled(" Enter/Y", Style::default().fg(Color::Yellow)),
                     Span::styled(": Confirm ", Style::default().fg(Color::Gray)),
                     Span::styled("Esc/N", Style::default().fg(Color::Yellow)),
@@ -763,7 +782,7 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::CopilotAuth => (60, 35),
         PopupMenu::BranchRecovery | PopupMenu::BranchChanged => (60, 30),
         PopupMenu::BranchList => (50, 60),
-        PopupMenu::AddWorkerConfirm => (50, 25),
+        PopupMenu::SetWorkerCount => (40, 60),
         PopupMenu::DeleteConfirm | PopupMenu::ClearConfirm => (50, 30),
         PopupMenu::SessionDeleteConfirm => (55, 40),
         PopupMenu::CompleteRecordChoice => (55, 25),
@@ -782,7 +801,7 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::CompleteSession => draw_complete_session(frame, app, area),
         PopupMenu::NewSessionInput => draw_new_session_input(frame, app, area),
         PopupMenu::RemoveWorkerList => draw_remove_worker_list(frame, app, area),
-        PopupMenu::RemoveWorkerConfirm => draw_remove_worker_confirm(frame, app, area),
+        PopupMenu::RemoveWorkerConfirm => {} // handled by RemoveWorkerList now
         PopupMenu::ConnectProvider => draw_connect_provider(frame, app, area),
         PopupMenu::ProviderApiKeyInput => draw_api_key_input(frame, app, area),
         PopupMenu::MaxRetries => draw_max_retries(frame, app, area),
@@ -796,31 +815,47 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::BranchList => draw_branch_list(frame, app, area),
         PopupMenu::BranchChanged => draw_branch_changed(frame, app, area),
         PopupMenu::CopilotAuth => draw_copilot_auth(frame, app, area),
-        PopupMenu::AddWorkerConfirm => draw_add_worker_confirm(frame, app, area),
+        PopupMenu::SetWorkerCount => draw_set_worker_count(frame, app, area),
     }
 }
 
 fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
+    let menu_items = app.main_menu_items();
+
+    // Get description for highlighted item
+    let description = menu_items
+        .get(app.menu_index)
+        .map(|item| item.description())
+        .unwrap_or("");
+
+    // Layout: menu list + description + key hints
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),    // menu items
+            Constraint::Length(3), // description + keys
+        ])
+        .split(area);
+
     let block = Block::default()
-        .title(" Legion [ESC] ")
+        .title(" Settings ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::DarkGray));
 
-    let menu_items = app.main_menu_items();
     let items: Vec<ListItem> = menu_items
         .iter()
         .enumerate()
         .map(|(i, item)| {
             let selected = i == app.menu_index;
-            let prefix = if selected { "> " } else { "  " };
+            let prefix = if selected { " \u{25b8} " } else { "   " };
             let value = match item {
                 MainMenuItem::SwitchModels => {
                     let n = app.panes.len();
                     if n == 0 { "[no panes]".to_string() }
                     else { format!("[{} pane{}]", n, if n == 1 { "" } else { "s" }) }
                 }
-                MainMenuItem::AddWorker => {
+                MainMenuItem::SetWorkers => {
                     let wc = app.worker_count();
                     format!("[{}/{}]", wc, crate::app::MAX_WORKERS)
                 }
@@ -873,20 +908,23 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    // Separator before the last item (Quit)
-    let quit_idx = items.len() - 1;
-    let mut final_items = Vec::new();
-    for (i, item) in items.into_iter().enumerate() {
-        if i == quit_idx {
-            final_items.push(ListItem::new(Line::from(Span::styled(
-                "  \u{2500}".repeat(12),
-                Style::default().fg(Color::Gray),
-            ))));
-        }
-        final_items.push(item);
-    }
+    frame.render_widget(List::new(items).block(block), chunks[0]);
 
-    frame.render_widget(List::new(final_items).block(block), area);
+    // Bottom: description + key hints
+    let bottom = Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!(" {}", description),
+            Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+        )),
+        Line::from(vec![
+            Span::styled(" Enter", Style::default().fg(Color::Green)),
+            Span::styled(": Select  ", Style::default().fg(Color::Gray)),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled(": Close", Style::default().fg(Color::Gray)),
+        ]),
+    ])
+    .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(bottom, chunks[1]);
 }
 
 fn draw_matrix(frame: &mut Frame, app: &App, area: Rect) {
@@ -1324,69 +1362,88 @@ fn draw_complete_session(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_remove_worker_list(frame: &mut Frame, app: &App, area: Rect) {
+    let branch = app.current_session.as_ref()
+        .and_then(|s| s.base_branch.as_deref())
+        .unwrap_or("leader");
+
+    let worker_label = app.panes.get(app.remove_worker_target + 1)
+        .map(|p| p.label.as_str())
+        .unwrap_or("Worker");
+
+    let bottom_h = if app.remove_worker_confirming { 6 } else { 3 };
+
+    // Layout: worker list + bottom hints
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(bottom_h),
+        ])
+        .split(area);
+
     let block = Block::default()
-        .title(" Remove Worker [ESC] ")
+        .title(" Remove Worker ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red))
         .style(Style::default().bg(Color::DarkGray));
 
     let mut items: Vec<ListItem> = Vec::new();
-
-    // Workers only (skip leader at index 0)
     for (wi, pane) in app.panes.iter().enumerate().skip(1) {
         let selected = (wi - 1) == app.remove_worker_target;
-        let prefix = if selected { "> " } else { "  " };
+        let prefix = if selected { " \u{25b8} " } else { "   " };
         let model = pane.current_model.as_deref().unwrap_or("--");
-        let style = if selected {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        let (style, check) = if selected && app.remove_worker_confirming {
+            (Style::default().fg(Color::Red).add_modifier(Modifier::BOLD), " \u{2717}")
+        } else if selected {
+            (Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD), "")
         } else {
-            Style::default().fg(Color::White)
+            (Style::default().fg(Color::White), "")
         };
         items.push(ListItem::new(Line::from(vec![
             Span::raw(prefix),
             Span::styled(&pane.label, style),
             Span::styled(format!("  [{}]", model), Style::default().fg(Color::Gray)),
+            Span::styled(check, Style::default().fg(Color::Red)),
         ])));
     }
 
-    frame.render_widget(List::new(items).block(block), area);
-}
+    frame.render_widget(List::new(items).block(block), chunks[0]);
 
-fn draw_remove_worker_confirm(frame: &mut Frame, app: &App, area: Rect) {
-    let worker_label = app.panes.get(app.remove_worker_target + 1)
-        .map(|p| p.label.as_str())
-        .unwrap_or("Worker");
-
-    let block = Block::default()
-        .title(format!(" Remove '{}' [ESC] ", worker_label))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
-        .style(Style::default().bg(Color::DarkGray));
-
-    let options = ["Merge to main", "Keep worktree", "Discard changes"];
-    let descriptions = [
-        "Merge branch into main, then remove worktree",
-        "Keep worktree for manual handling later",
-        "Delete worktree and branch (destructive!)",
-    ];
-
-    let items: Vec<ListItem> = options.iter().zip(descriptions.iter()).enumerate()
-        .map(|(i, (opt, desc))| {
-            let selected = i == app.remove_worker_strategy_index;
-            let prefix = if selected { "> " } else { "  " };
-            let style = if selected {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            ListItem::new(vec![
-                Line::from(vec![Span::raw(prefix), Span::styled(*opt, style)]),
-                Line::from(Span::styled(format!("    {}", desc), Style::default().fg(Color::Gray))),
-            ])
-        })
-        .collect();
-
-    frame.render_widget(List::new(items).block(block), area);
+    // Bottom section
+    let hints = if app.remove_worker_confirming {
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!(" Remove {}?", worker_label),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" Enter", Style::default().fg(Color::Green)),
+                Span::styled(format!(": Merge to {}", branch), Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled(" K", Style::default().fg(Color::Cyan)),
+                Span::styled(": Keep worktree  ", Style::default().fg(Color::Gray)),
+                Span::styled("D", Style::default().fg(Color::Red)),
+                Span::styled(": Discard changes", Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Esc", Style::default().fg(Color::Yellow)),
+                Span::styled(": Back", Style::default().fg(Color::Gray)),
+            ]),
+        ])
+    } else {
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(" Enter", Style::default().fg(Color::Green)),
+                Span::styled(": Select  ", Style::default().fg(Color::Gray)),
+                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled(": Cancel", Style::default().fg(Color::Gray)),
+            ]),
+        ])
+    }
+    .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(hints, chunks[1]);
 }
 
 fn format_elapsed(secs: u64) -> String {
@@ -2169,34 +2226,48 @@ fn draw_copilot_auth(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(List::new(items).block(block), area);
 }
 
-fn draw_add_worker_confirm(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_set_worker_count(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
-        .title(" Add Worker ")
+        .title(" Set Workers [1-8] ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::DarkGray));
 
-    let wc = app.worker_count();
-    let new_id = wc + 1;
-    let items = vec![
-        ListItem::new(""),
+    let current = app.worker_count() as u16;
+    let selected = app.set_worker_count_selection;
+
+    let mut items = vec![
         ListItem::new(Line::from(Span::styled(
-            format!("  Add Worker {} to the squad?", new_id),
-            Style::default().fg(Color::White),
-        ))),
-        ListItem::new(""),
-        ListItem::new(Line::from(Span::styled(
-            format!("  Current workers: {}/{}", wc, crate::app::MAX_WORKERS),
+            format!("  Current: {} workers", current),
             Style::default().fg(Color::Gray),
         ))),
         ListItem::new(""),
-        ListItem::new(Line::from(vec![
-            Span::styled("  [Enter/Y] ", Style::default().fg(Color::Green)),
-            Span::styled("Confirm  ", Style::default().fg(Color::Gray)),
-            Span::styled("[Esc/N] ", Style::default().fg(Color::Yellow)),
-            Span::styled("Cancel", Style::default().fg(Color::Gray)),
-        ])),
     ];
+
+    for n in 1..=crate::app::MAX_WORKERS {
+        let marker = if n == selected { " ▶ " } else { "   " };
+        let label = if n == current {
+            format!("{}{}  (current)", marker, n)
+        } else {
+            format!("{}{}", marker, n)
+        };
+        let style = if n == selected {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else if n == current {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        items.push(ListItem::new(Line::from(Span::styled(label, style))));
+    }
+
+    items.push(ListItem::new(""));
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled("  [Enter] ", Style::default().fg(Color::Green)),
+        Span::styled("Apply  ", Style::default().fg(Color::Gray)),
+        Span::styled("[Esc] ", Style::default().fg(Color::Yellow)),
+        Span::styled("Cancel", Style::default().fg(Color::Gray)),
+    ])));
 
     frame.render_widget(List::new(items).block(block), area);
 }

@@ -168,6 +168,34 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
         }
     }
 
+    // Shift+PageUp/Down: scroll focused pane (clamped to scrollback buffer size)
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::PageUp => {
+                if let Some(pane) = app.panes.get_mut(app.focused_pane) {
+                    pane.scroll_offset = pane.scroll_offset.saturating_add(10).min(crate::app::MAX_SCROLL_OFFSET);
+                }
+                return InputResult::Continue;
+            }
+            KeyCode::PageDown => {
+                if let Some(pane) = app.panes.get_mut(app.focused_pane) {
+                    pane.scroll_offset = pane.scroll_offset.saturating_sub(10);
+                }
+                return InputResult::Continue;
+            }
+            _ => {}
+        }
+    }
+
+    // Any non-scroll key resets scroll offset (back to live view)
+    if let Some(pane) = app.panes.get_mut(app.focused_pane) {
+        if pane.scroll_offset > 0
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            pane.scroll_offset = 0;
+        }
+    }
+
     // Everything else goes to PTY
     let bytes = key_to_bytes(key);
     if !bytes.is_empty() {
@@ -179,7 +207,21 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
 
 /// Handle mouse events for divider hover and dragging (squad mode only)
 pub fn handle_mouse(app: &mut App, event: MouseEvent) {
+    // Single mode: only handle scroll
     if !app.is_squad() {
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                if let Some(pane) = app.panes.get_mut(app.focused_pane) {
+                    pane.scroll_offset = pane.scroll_offset.saturating_add(3).min(crate::app::MAX_SCROLL_OFFSET);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(pane) = app.panes.get_mut(app.focused_pane) {
+                    pane.scroll_offset = pane.scroll_offset.saturating_sub(3);
+                }
+            }
+            _ => {}
+        }
         return;
     }
 
@@ -218,22 +260,30 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
         }
         MouseEventKind::ScrollUp => {
             if matches!(app.mode, AppMode::Popup(PopupMenu::FileDiff)) {
-                // In file diff popup: scroll diff content up
                 app.diff_scroll = app.diff_scroll.saturating_sub(3);
             } else if app.board_detail_open {
                 app.board_detail_scroll = app.board_detail_scroll.saturating_sub(3);
             } else if app.right_panel_focused {
                 navigate_ticket_up(app);
+            } else if matches!(app.mode, AppMode::Normal) {
+                // Scroll focused pane up (into scrollback)
+                if let Some(pane) = app.panes.get_mut(app.focused_pane) {
+                    pane.scroll_offset = pane.scroll_offset.saturating_add(3).min(crate::app::MAX_SCROLL_OFFSET);
+                }
             }
         }
         MouseEventKind::ScrollDown => {
             if matches!(app.mode, AppMode::Popup(PopupMenu::FileDiff)) {
-                // In file diff popup: scroll diff content down
                 app.diff_scroll = app.diff_scroll.saturating_add(3);
             } else if app.board_detail_open {
                 app.board_detail_scroll = app.board_detail_scroll.saturating_add(3);
             } else if app.right_panel_focused {
                 navigate_ticket_down(app);
+            } else if matches!(app.mode, AppMode::Normal) {
+                // Scroll focused pane down (towards live view)
+                if let Some(pane) = app.panes.get_mut(app.focused_pane) {
+                    pane.scroll_offset = pane.scroll_offset.saturating_sub(3);
+                }
             }
         }
         _ => {}
@@ -259,7 +309,6 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::CompleteSession) => handle_complete_session_keys(app, key),
         AppMode::Popup(PopupMenu::NewSessionInput) => handle_new_session_input_keys(app, key),
         AppMode::Popup(PopupMenu::RemoveWorkerList) => handle_remove_worker_list_keys(app, key),
-        AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => handle_remove_worker_confirm_keys(app, key),
         AppMode::Popup(PopupMenu::ConnectProvider) => handle_connect_provider_keys(app, key),
         AppMode::Popup(PopupMenu::ProviderApiKeyInput) => handle_api_key_input_keys(app, key),
         AppMode::Popup(PopupMenu::MaxRetries) => handle_max_retries_keys(app, key),
@@ -273,7 +322,7 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::BranchList) => handle_branch_list_keys(app, key),
         AppMode::Popup(PopupMenu::BranchChanged) => handle_branch_changed_keys(app, key),
         AppMode::Popup(PopupMenu::CopilotAuth) => handle_copilot_auth_keys(app, key),
-        AppMode::Popup(PopupMenu::AddWorkerConfirm) => handle_add_worker_confirm_keys(app, key),
+        AppMode::Popup(PopupMenu::SetWorkerCount) => handle_set_worker_count_keys(app, key),
         _ => {}
     }
 
@@ -492,41 +541,57 @@ fn handle_new_session_input_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_remove_worker_list_keys(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => {
-            app.mode = AppMode::Popup(PopupMenu::Main);
-        }
-        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
-        KeyCode::Enter => {
-            // Proceed to confirm dialog
-            app.remove_worker_strategy_index = 0;
-            app.mode = AppMode::Popup(PopupMenu::RemoveWorkerConfirm);
-        }
-        _ => {}
-    }
-}
+    let wc = app.worker_count();
 
-fn handle_remove_worker_confirm_keys(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => {
-            // Back to worker list
-            app.mode = AppMode::Popup(PopupMenu::RemoveWorkerList);
+    if app.remove_worker_confirming {
+        // Stage 2: confirm action
+        match key.code {
+            KeyCode::Esc => {
+                // Back to worker selection
+                app.remove_worker_confirming = false;
+            }
+            KeyCode::Enter => {
+                // Default: merge
+                let pane_index = app.remove_worker_target + 1;
+                app.pending_remove_worker = Some((pane_index, "merge".to_string()));
+                app.remove_worker_confirming = false;
+                app.mode = AppMode::Normal;
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                let pane_index = app.remove_worker_target + 1;
+                app.pending_remove_worker = Some((pane_index, "keep".to_string()));
+                app.remove_worker_confirming = false;
+                app.mode = AppMode::Normal;
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                let pane_index = app.remove_worker_target + 1;
+                app.pending_remove_worker = Some((pane_index, "discard".to_string()));
+                app.remove_worker_confirming = false;
+                app.mode = AppMode::Normal;
+            }
+            _ => {}
         }
-        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
-        KeyCode::Enter => {
-            let strategy = match app.remove_worker_strategy_index {
-                0 => "merge",
-                1 => "keep",
-                _ => "discard",
-            };
-            // pane_index = remove_worker_target + 1 (skip leader)
-            let pane_index = app.remove_worker_target + 1;
-            app.pending_remove_worker = Some((pane_index, strategy.to_string()));
-            app.mode = AppMode::Normal;
+    } else {
+        // Stage 1: select worker
+        match key.code {
+            KeyCode::Esc => {
+                app.mode = AppMode::Popup(PopupMenu::Main);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if app.remove_worker_target > 0 {
+                    app.remove_worker_target -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if app.remove_worker_target + 1 < wc {
+                    app.remove_worker_target += 1;
+                }
+            }
+            KeyCode::Enter => {
+                app.remove_worker_confirming = true;
+            }
+            _ => {}
         }
-        _ => {}
     }
 }
 
@@ -1264,13 +1329,33 @@ fn handle_copilot_auth_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_add_worker_confirm_keys(app: &mut App, key: KeyEvent) {
+fn handle_set_worker_count_keys(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.pending_add_worker = true;
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.set_worker_count_selection > 1 {
+                app.set_worker_count_selection -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.set_worker_count_selection < crate::app::MAX_WORKERS {
+                app.set_worker_count_selection += 1;
+            }
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() => {
+            let n = c.to_digit(10).unwrap() as u16;
+            if n >= 1 && n <= crate::app::MAX_WORKERS {
+                app.set_worker_count_selection = n;
+            }
+        }
+        KeyCode::Enter => {
+            let target = app.set_worker_count_selection;
+            let current = app.worker_count() as u16;
+            if target != current {
+                app.pending_set_worker_count = Some(target);
+            }
             app.mode = AppMode::Normal;
         }
-        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+        KeyCode::Esc => {
             app.mode = AppMode::Popup(PopupMenu::Main);
         }
         _ => {}
