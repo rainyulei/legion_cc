@@ -154,6 +154,128 @@ pub fn merge_branch(
     Ok(())
 }
 
+/// Auto-merge: merge a worker's branch into the leader's worktree.
+/// Runs in the leader worktree directory. On conflict: aborts and returns Err.
+pub fn merge_worker_into_leader(
+    project_path: &Path,
+    session_name: &str,
+    worker_label: &str,
+    is_default_session: bool,
+) -> Result<()> {
+    let worker_branch = pane_branch_name(session_name, worker_label);
+
+    let leader_dir = if is_default_session {
+        project_path.to_path_buf()
+    } else {
+        pane_worktree_path(project_path, session_name, "Leader")
+    };
+
+    if !leader_dir.exists() {
+        anyhow::bail!("Leader worktree not found: {}", leader_dir.display());
+    }
+
+    // Stash any uncommitted changes in leader
+    let stash_output = Command::new("git")
+        .args(["stash", "push", "-m", "legion-auto-merge-stash"])
+        .current_dir(&leader_dir)
+        .output()
+        .context("Failed to stash leader changes")?;
+    let did_stash =
+        String::from_utf8_lossy(&stash_output.stdout).contains("Saved working directory");
+
+    // Merge worker branch
+    let output = Command::new("git")
+        .args([
+            "merge",
+            &worker_branch,
+            "--no-ff",
+            "-m",
+            &format!("Auto-merge: {} completed", worker_label),
+        ])
+        .current_dir(&leader_dir)
+        .output()
+        .context("Failed to run git merge in leader worktree")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Abort the conflicted merge
+        let _ = Command::new("git")
+            .args(["merge", "--abort"])
+            .current_dir(&leader_dir)
+            .output();
+        // Restore stash if we stashed
+        if did_stash {
+            let _ = Command::new("git")
+                .args(["stash", "pop"])
+                .current_dir(&leader_dir)
+                .output();
+        }
+        anyhow::bail!(
+            "Auto-merge conflict for {}: {}",
+            worker_label,
+            stderr.trim()
+        );
+    }
+
+    // Restore stash
+    if did_stash {
+        let _ = Command::new("git")
+            .args(["stash", "pop"])
+            .current_dir(&leader_dir)
+            .output();
+    }
+
+    tracing::info!(
+        "Auto-merged {} into leader ({})",
+        worker_branch,
+        leader_dir.display()
+    );
+    Ok(())
+}
+
+/// Rebase-on-start: pull leader's latest code into a worker's worktree.
+/// Runs in the worker worktree directory. On failure: hard reset to leader HEAD.
+pub fn rebase_worker_from_leader(
+    project_path: &Path,
+    session_name: &str,
+    worker_label: &str,
+    is_default_session: bool,
+) -> Result<()> {
+    let leader_branch = if is_default_session {
+        default_branch(project_path)
+    } else {
+        pane_branch_name(session_name, "Leader")
+    };
+
+    let worker_dir = pane_worktree_path(project_path, session_name, worker_label);
+
+    if !worker_dir.exists() {
+        anyhow::bail!("Worker worktree not found: {}", worker_dir.display());
+    }
+
+    let output = Command::new("git")
+        .args(["merge", &leader_branch, "--no-edit"])
+        .current_dir(&worker_dir)
+        .output()
+        .context("Failed to merge leader into worker")?;
+
+    if !output.status.success() {
+        tracing::warn!("Worker rebase failed, hard resetting to leader HEAD");
+        let _ = Command::new("git")
+            .args(["merge", "--abort"])
+            .current_dir(&worker_dir)
+            .output();
+        // Hard reset to leader's HEAD so worker starts clean
+        let _ = Command::new("git")
+            .args(["reset", "--hard", &leader_branch])
+            .current_dir(&worker_dir)
+            .output();
+    }
+
+    tracing::info!("Rebased {} from {}", worker_label, leader_branch);
+    Ok(())
+}
+
 /// Get the default branch name (main or master)
 pub fn default_branch(project_path: &Path) -> String {
     let output = Command::new("git")
