@@ -316,4 +316,37 @@ mod tests {
         assert!(prompt.contains("任务分解提示"));
         assert!(prompt.contains("不要直接开始执行"));
     }
+
+    #[test]
+    fn split_tickets_command_contains_key_elements() {
+        let cmd = split_tickets_command(3);
+        assert!(cmd.contains("legion-dispatch"));
+        assert!(cmd.contains("--after"));
+        assert!(cmd.contains("-t"));
+        assert!(cmd.contains("-c"));
+        assert!(cmd.contains("-k"));
+        assert!(cmd.contains("3")); // worker count
+        assert!(cmd.contains("context"));
+        assert!(cmd.contains("criteria"));
+        assert!(cmd.contains("DAG"));
+        assert!(cmd.contains("prompt"));
+    }
+
+    #[test]
+    fn write_leader_commands_creates_files() {
+        let dir = std::env::temp_dir().join("legion-test-commands");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_leader_commands(&dir, 3).unwrap();
+
+        let path = dir.join(".claude/commands/split-tickets.md");
+        assert!(path.exists());
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Split Tickets"));
+        assert!(content.contains("legion-dispatch"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
