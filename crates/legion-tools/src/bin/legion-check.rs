@@ -117,6 +117,15 @@ fn main() {
             let worker = t.get("assigned_worker").and_then(|v| v.as_u64());
             let elapsed = t.get("elapsed_secs").and_then(|v| v.as_u64()).unwrap_or(0);
 
+            let blocked_by: Vec<u64> = t.get("blocked_by")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+
+            let merge_status = t.get("merge_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pending");
+
             let display_ticket = if !title.is_empty() {
                 title.to_string()
             } else if ticket_text.chars().count() > 50 {
@@ -126,14 +135,33 @@ fn main() {
                 ticket_text.to_string()
             };
 
-            let worker_str = match worker {
-                Some(w) => format!(" worker={}", w),
-                None => String::new(),
+            let mut extras = Vec::new();
+            if let Some(w) = worker {
+                extras.push(format!("worker={}", w));
+            }
+            if !blocked_by.is_empty() {
+                let dep_strs: Vec<String> = blocked_by.iter().map(|dep_id| {
+                    let dep_status = tickets.iter()
+                        .find(|dt| dt.get("id").and_then(|v| v.as_u64()) == Some(*dep_id))
+                        .and_then(|dt| dt.get("status").and_then(|v| v.as_str()))
+                        .unwrap_or("?");
+                    format!("#{} {}", dep_id, dep_status)
+                }).collect();
+                extras.push(format!("after: {}", dep_strs.join(" ")));
+            }
+            if merge_status != "pending" {
+                extras.push(format!("[{}]", merge_status));
+            }
+
+            let extras_str = if extras.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", extras.join("  "))
             };
 
             println!(
                 "  [{}] \"{}\"{}  ({}s)",
-                ticket_id, display_ticket, worker_str, elapsed
+                ticket_id, display_ticket, extras_str, elapsed
             );
 
             // Show summary if available

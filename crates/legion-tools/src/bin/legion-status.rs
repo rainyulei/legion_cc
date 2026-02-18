@@ -76,12 +76,26 @@ fn main() {
             _ => "??",
         };
 
+        let merge_status = t.get("merge_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending");
+
+        let merge_badge = match merge_status {
+            "merged" => "M",
+            "conflict" => "!",
+            _ => "",
+        };
+
         let worker_str = match worker {
             Some(w) => format!("W{}", w),
             None => format!("#{}", id),
         };
 
-        parts.push(format!("{}[{}]", worker_str, badge));
+        if merge_badge.is_empty() {
+            parts.push(format!("{}[{}]", worker_str, badge));
+        } else {
+            parts.push(format!("{}[{}{}]", worker_str, badge, merge_badge));
+        }
     }
 
     println!("{}", parts.join(" "));
