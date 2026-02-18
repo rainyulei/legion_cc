@@ -14,6 +14,20 @@ pub enum TicketStatus {
     Error,
 }
 
+/// Merge status of a completed ticket's code into the leader branch
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStatus {
+    Pending,
+    Merged,
+    Conflict,
+    Skipped,
+}
+
+impl Default for MergeStatus {
+    fn default() -> Self { Self::Pending }
+}
+
 /// Team execution mode for a ticket
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +63,8 @@ pub struct TaskTicket {
     pub completed_elapsed_secs: Option<u64>,
     /// Git commit SHA when worker started this ticket (for diff base)
     pub base_commit: Option<String>,
+    pub blocked_by: Vec<usize>,
+    pub merge_status: MergeStatus,
 }
 
 impl TaskTicket {
@@ -77,6 +93,8 @@ pub struct TicketSnapshot {
     pub summary: Option<String>,
     pub elapsed_secs: u64,
     pub base_commit: Option<String>,
+    pub blocked_by: Vec<usize>,
+    pub merge_status: MergeStatus,
 }
 
 struct EngineInner {
@@ -153,6 +171,8 @@ impl OrchestrateEngine {
                         started_at: None,
                         completed_elapsed_secs: None,
                         base_commit: row.base_commit.clone(),
+                        blocked_by: Vec::new(),
+                        merge_status: MergeStatus::Pending,
                     });
                     if row.id as usize >= next_id {
                         next_id = row.id as usize + 1;
@@ -279,6 +299,8 @@ impl OrchestrateEngine {
             started_at: None,
             completed_elapsed_secs: None,
             base_commit: None,
+            blocked_by: Vec::new(),
+            merge_status: MergeStatus::Pending,
         };
         guard.tickets.push(ticket.clone());
         drop(guard);
@@ -527,5 +549,7 @@ fn ticket_to_snapshot(t: &TaskTicket) -> TicketSnapshot {
         summary: t.summary.clone(),
         elapsed_secs: t.elapsed_secs(),
         base_commit: t.base_commit.clone(),
+        blocked_by: t.blocked_by.clone(),
+        merge_status: t.merge_status,
     }
 }
