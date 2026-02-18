@@ -171,8 +171,13 @@ impl OrchestrateEngine {
                         started_at: None,
                         completed_elapsed_secs: None,
                         base_commit: row.base_commit.clone(),
-                        blocked_by: Vec::new(),
-                        merge_status: MergeStatus::Pending,
+                        blocked_by: serde_json::from_str(&row.blocked_by).unwrap_or_default(),
+                        merge_status: match row.merge_status.as_str() {
+                            "merged" => MergeStatus::Merged,
+                            "conflict" => MergeStatus::Conflict,
+                            "skipped" => MergeStatus::Skipped,
+                            _ => MergeStatus::Pending,
+                        },
                     });
                     if row.id as usize >= next_id {
                         next_id = row.id as usize + 1;
@@ -230,6 +235,13 @@ impl OrchestrateEngine {
                 updated_at: now,
                 origin_session: None,
                 base_commit: ticket.base_commit.clone(),
+                blocked_by: serde_json::to_string(&ticket.blocked_by).unwrap_or_else(|_| "[]".into()),
+                merge_status: match ticket.merge_status {
+                    MergeStatus::Pending => "pending".to_string(),
+                    MergeStatus::Merged => "merged".to_string(),
+                    MergeStatus::Conflict => "conflict".to_string(),
+                    MergeStatus::Skipped => "skipped".to_string(),
+                },
             };
             if let Ok(db) = db.lock() {
                 let _ = db.insert_ticket(&row);
@@ -269,6 +281,13 @@ impl OrchestrateEngine {
                 updated_at: now,
                 origin_session: None,
                 base_commit: ticket.base_commit.clone(),
+                blocked_by: serde_json::to_string(&ticket.blocked_by).unwrap_or_else(|_| "[]".into()),
+                merge_status: match ticket.merge_status {
+                    MergeStatus::Pending => "pending".to_string(),
+                    MergeStatus::Merged => "merged".to_string(),
+                    MergeStatus::Conflict => "conflict".to_string(),
+                    MergeStatus::Skipped => "skipped".to_string(),
+                },
             };
             if let Ok(db) = db.lock() {
                 let _ = db.update_ticket(&row);

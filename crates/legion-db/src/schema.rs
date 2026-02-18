@@ -111,5 +111,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN max_iterations INTEGER", []);
     let _ = conn.execute("ALTER TABLE tickets ADD COLUMN origin_session TEXT", []);
     let _ = conn.execute("ALTER TABLE tickets ADD COLUMN base_commit TEXT", []);
+    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN blocked_by TEXT DEFAULT '[]'", []);
+    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN merge_status TEXT DEFAULT 'pending'", []);
     Ok(())
 }
