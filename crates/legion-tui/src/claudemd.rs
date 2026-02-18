@@ -17,12 +17,13 @@ You coordinate a team of {} autonomous Workers.
 Every `legion-dispatch` call MUST include ALL four parts. The command WILL FAIL without -t, -c, and -k:
 
 ```
-legion-dispatch <worker_id> -t "title" -c "context" -k "criteria" "task description"
+legion-dispatch <worker_id> -t "title" -c "context" -k "criteria" [--after N,M] "task description"
 ```
 
 - `-t` — Short title (3-6 words): "Implement heart animation"
 - `-c` — Context (language, dependencies, constraints): "Python 3, no external deps, terminal ANSI output"
 - `-k` — Success criteria (testable conditions): "heart.py exists, python3 heart.py runs, uses math curve"
+- `--after` — (Optional) Comma-separated ticket IDs this task depends on: "--after 1,3"
 - Last arg — Full task description with all implementation details
 
 **IMPORTANT:** Do NOT include working directory paths in `-c`. Each Worker has its own dedicated worktree — they will create files in their current directory automatically.
@@ -30,6 +31,12 @@ legion-dispatch <worker_id> -t "title" -c "context" -k "criteria" "task descript
 Example:
 ```bash
 legion-dispatch 1 -t "Implement heart animation" -c "Python 3, no external deps, terminal ANSI output" -k "heart.py exists, python3 heart.py shows animated heart, uses math-based curve" "Create heart.py with parametric heart curve animation using ANSI colors"
+```
+
+With dependency:
+```bash
+# With dependency:
+legion-dispatch 2 -t "Add unit tests" -c "Python 3, pytest" -k "all tests pass" --after 1 "Write tests for heart.py animation"
 ```
 
 ## Workflow
@@ -40,6 +47,16 @@ legion-dispatch 1 -t "Implement heart animation" -c "Python 3, no external deps,
 5. Monitor with: `legion-check`
 6. When all Workers complete, verify integration
 7. Report results to user
+
+## Task Dependencies
+
+Use `--after` when tasks have file dependencies:
+- Task B reads files Task A creates → `--after A`  (where A is the ticket ID)
+- Task C depends on both A and B → `--after A,B`
+- Independent tasks need no `--after` (they run in parallel)
+
+Workers auto-receive code from completed dependencies via auto-merge.
+Do NOT include `--after` for tasks that are truly independent.
 
 ## Tools
 - `legion-dispatch` — Dispatch task (see format above)
@@ -162,5 +179,6 @@ mod tests {
         assert!(prompt.contains("MANDATORY DISPATCH FORMAT"));
         assert!(prompt.contains("legion-dispatch"));
         assert!(prompt.contains("legion-check"));
+        assert!(prompt.contains("--after"));
     }
 }
