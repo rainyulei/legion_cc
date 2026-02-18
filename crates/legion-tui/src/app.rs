@@ -1008,6 +1008,11 @@ impl App {
         // Generate system prompts (leader only — workers get prompts via SDK dispatch)
         let leader_prompt = crate::claudemd::leader_instructions(worker_count);
 
+        // Write /split-tickets command to leader worktree
+        if let Err(e) = crate::claudemd::write_leader_commands(&worktree_paths[0], worker_count) {
+            tracing::warn!("Failed to write leader commands: {}", e);
+        }
+
         // Port assignments
         let base_port = self.base_port;
         let orchestrate_port = base_port + 2000;
