@@ -38,28 +38,87 @@ pub fn anthropic_to_openai(body: &[u8], model_override: Option<&str>) -> Result<
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
 
             // Handle content - can be string or array of content blocks
-            let content = if let Some(content_str) = msg.get("content").and_then(|c| c.as_str()) {
-                content_str.to_string()
+            if let Some(content_str) = msg.get("content").and_then(|c| c.as_str()) {
+                messages.push(json!({
+                    "role": role,
+                    "content": content_str
+                }));
             } else if let Some(content_arr) = msg.get("content").and_then(|c| c.as_array()) {
-                content_arr
-                    .iter()
-                    .filter_map(|block| {
-                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            block.get("text").and_then(|t| t.as_str())
-                        } else {
-                            None
+                // Separate text, tool_use, and tool_result blocks
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                let mut tool_results: Vec<(String, String)> = Vec::new(); // (tool_call_id, content)
+
+                for block in content_arr {
+                    match block.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                text_parts.push(text.to_string());
+                            }
                         }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("")
+                        Some("tool_use") => {
+                            // Anthropic tool_use → OpenAI tool_call
+                            let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let input = block.get("input").cloned().unwrap_or(json!({}));
+                            tool_calls.push(json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": serde_json::to_string(&input).unwrap_or_default()
+                                }
+                            }));
+                        }
+                        Some("tool_result") => {
+                            let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            // Content can be string or array of content blocks
+                            let content = if let Some(s) = block.get("content").and_then(|c| c.as_str()) {
+                                s.to_string()
+                            } else if let Some(arr) = block.get("content").and_then(|c| c.as_array()) {
+                                arr.iter()
+                                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            } else {
+                                String::new()
+                            };
+                            tool_results.push((tool_use_id, content));
+                        }
+                        _ => {
+                            // Skip thinking and other block types
+                        }
+                    }
+                }
+
+                // Emit assistant message with tool_calls if present
+                if role == "assistant" && !tool_calls.is_empty() {
+                    let mut assistant_msg = json!({
+                        "role": "assistant",
+                        "tool_calls": tool_calls
+                    });
+                    if !text_parts.is_empty() {
+                        assistant_msg["content"] = json!(text_parts.join(""));
+                    }
+                    messages.push(assistant_msg);
+                } else if !text_parts.is_empty() {
+                    messages.push(json!({
+                        "role": role,
+                        "content": text_parts.join("")
+                    }));
+                }
+
+                // Emit tool result messages (OpenAI: role=tool, one message per result)
+                for (tool_call_id, content) in tool_results {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": content
+                    }));
+                }
             } else {
                 continue;
-            };
-
-            messages.push(json!({
-                "role": role,
-                "content": content
-            }));
+            }
         }
     }
 
@@ -83,12 +142,35 @@ pub fn anthropic_to_openai(body: &[u8], model_override: Option<&str>) -> Result<
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
-    let openai_request = json!({
+    let mut openai_request = json!({
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "stream": stream
     });
+
+    // Convert Anthropic tools to OpenAI tools (function calling)
+    if let Some(tools) = anthropic.get("tools").and_then(|t| t.as_array()) {
+        let openai_tools: Vec<Value> = tools
+            .iter()
+            .map(|tool| {
+                let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let description = tool.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                let parameters = tool.get("input_schema").cloned().unwrap_or(json!({"type": "object"}));
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters
+                    }
+                })
+            })
+            .collect();
+        if !openai_tools.is_empty() {
+            openai_request["tools"] = json!(openai_tools);
+        }
+    }
 
     serde_json::to_vec(&openai_request)
         .map_err(|e| anyhow!("Failed to serialize OpenAI request: {}", e))
@@ -99,15 +181,67 @@ pub fn openai_to_anthropic(body: &[u8]) -> Result<Vec<u8>> {
     let openai: Value = serde_json::from_slice(body)
         .map_err(|e| anyhow!("Failed to parse OpenAI response: {}", e))?;
 
-    // Extract content from choices[0].message.content
-    let content = openai
+    let choices = openai
         .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|msg| msg.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
+        .and_then(|c| c.as_array());
+
+    // Build content blocks by merging ALL choices
+    // (Copilot may split text and tool_calls into separate choice objects)
+    let mut content_blocks: Vec<Value> = Vec::new();
+    let mut final_finish_reason = "stop";
+
+    if let Some(choices_arr) = choices {
+        for choice in choices_arr {
+            let message = choice.get("message");
+
+            // Extract text content
+            if let Some(text) = message.and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+                if !text.is_empty() {
+                    content_blocks.push(json!({
+                        "type": "text",
+                        "text": text
+                    }));
+                }
+            }
+
+            // Extract tool_calls → Anthropic tool_use blocks
+            if let Some(tool_calls) = message.and_then(|m| m.get("tool_calls")).and_then(|t| t.as_array()) {
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let empty_obj = json!({});
+                    let func = tc.get("function").unwrap_or(&empty_obj);
+                    let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let args_str = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+                    let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+
+                    content_blocks.push(json!({
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": input
+                    }));
+                }
+            }
+
+            // Use the most specific finish_reason (tool_calls > stop > length)
+            if let Some(fr) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+                match fr {
+                    "tool_calls" => final_finish_reason = "tool_calls",
+                    "stop" if final_finish_reason != "tool_calls" => final_finish_reason = "stop",
+                    "length" if final_finish_reason == "stop" => final_finish_reason = "length",
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // If no content blocks at all, add an empty text block
+    if content_blocks.is_empty() {
+        content_blocks.push(json!({
+            "type": "text",
+            "text": ""
+        }));
+    }
 
     // Extract usage information
     let usage = openai.get("usage").cloned().unwrap_or_else(|| {
@@ -118,7 +252,6 @@ pub fn openai_to_anthropic(body: &[u8]) -> Result<Vec<u8>> {
         })
     });
 
-    // Convert usage format
     let input_tokens = usage
         .get("prompt_tokens")
         .and_then(|t| t.as_u64())
@@ -141,32 +274,23 @@ pub fn openai_to_anthropic(body: &[u8]) -> Result<Vec<u8>> {
         .and_then(|m| m.as_str())
         .unwrap_or("claude-3-5-sonnet-20241022");
 
-    // Determine stop reason
-    let stop_reason = openai
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|choice| choice.get("finish_reason"))
-        .and_then(|r| r.as_str())
-        .map(|reason| match reason {
-            "stop" => "end_turn",
-            "length" => "max_tokens",
-            "content_filter" => "end_turn",
-            _ => "end_turn",
-        })
-        .unwrap_or("end_turn");
+    // Map finish_reason to Anthropic stop_reason
+    let finish_reason = final_finish_reason;
+
+    let stop_reason = match finish_reason {
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        "content_filter" => "end_turn",
+        _ => "end_turn",
+    };
 
     let anthropic_response = json!({
         "id": id,
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [
-            {
-                "type": "text",
-                "text": content
-            }
-        ],
+        "content": content_blocks,
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
@@ -217,31 +341,63 @@ pub fn wrap_anthropic_json_as_sse(anthropic_json: &[u8]) -> Result<Vec<u8>> {
     if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
         for (i, block) in content.iter().enumerate() {
             let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("text");
-            if block_type == "text" {
-                let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            match block_type {
+                "text" => {
+                    let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
 
-                // content_block_start
-                let block_start = json!({
-                    "type": "content_block_start",
-                    "index": i,
-                    "content_block": {"type": "text", "text": ""}
-                });
-                sse.push_str(&format!("event: content_block_start\ndata: {}\n\n", serde_json::to_string(&block_start).unwrap()));
+                    let block_start = json!({
+                        "type": "content_block_start",
+                        "index": i,
+                        "content_block": {"type": "text", "text": ""}
+                    });
+                    sse.push_str(&format!("event: content_block_start\ndata: {}\n\n", serde_json::to_string(&block_start).unwrap()));
 
-                // content_block_delta (send all text at once)
-                let delta = json!({
-                    "type": "content_block_delta",
-                    "index": i,
-                    "delta": {"type": "text_delta", "text": text}
-                });
-                sse.push_str(&format!("event: content_block_delta\ndata: {}\n\n", serde_json::to_string(&delta).unwrap()));
+                    let delta = json!({
+                        "type": "content_block_delta",
+                        "index": i,
+                        "delta": {"type": "text_delta", "text": text}
+                    });
+                    sse.push_str(&format!("event: content_block_delta\ndata: {}\n\n", serde_json::to_string(&delta).unwrap()));
 
-                // content_block_stop
-                let block_stop = json!({
-                    "type": "content_block_stop",
-                    "index": i
-                });
-                sse.push_str(&format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&block_stop).unwrap()));
+                    let block_stop = json!({
+                        "type": "content_block_stop",
+                        "index": i
+                    });
+                    sse.push_str(&format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&block_stop).unwrap()));
+                }
+                "tool_use" => {
+                    let tool_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let input = block.get("input").cloned().unwrap_or(json!({}));
+
+                    let block_start = json!({
+                        "type": "content_block_start",
+                        "index": i,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": tool_name,
+                            "input": {}
+                        }
+                    });
+                    sse.push_str(&format!("event: content_block_start\ndata: {}\n\n", serde_json::to_string(&block_start).unwrap()));
+
+                    // Send input as a single JSON delta
+                    let input_str = serde_json::to_string(&input).unwrap_or_default();
+                    let delta = json!({
+                        "type": "content_block_delta",
+                        "index": i,
+                        "delta": {"type": "input_json_delta", "partial_json": input_str}
+                    });
+                    sse.push_str(&format!("event: content_block_delta\ndata: {}\n\n", serde_json::to_string(&delta).unwrap()));
+
+                    let block_stop = json!({
+                        "type": "content_block_stop",
+                        "index": i
+                    });
+                    sse.push_str(&format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&block_stop).unwrap()));
+                }
+                _ => {}
             }
         }
     }
@@ -365,5 +521,128 @@ mod tests {
         assert_eq!(anthropic["stop_reason"], "end_turn");
         assert_eq!(anthropic["usage"]["input_tokens"], 10);
         assert_eq!(anthropic["usage"]["output_tokens"], 20);
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_with_tools() {
+        let anthropic = json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "name": "Write",
+                    "description": "Writes a file",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["file_path", "content"]
+                    }
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "Create a file"}
+            ]
+        });
+
+        let result = anthropic_to_openai(anthropic.to_string().as_bytes(), None).unwrap();
+        let openai: Value = serde_json::from_slice(&result).unwrap();
+
+        assert!(openai.get("tools").is_some());
+        let tools = openai["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "Write");
+        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_tool_use_messages() {
+        let anthropic = json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "Create a file"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "I'll create the file."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_123",
+                            "name": "Write",
+                            "input": {"file_path": "/tmp/test.py", "content": "print('hello')"}
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_123",
+                            "content": "File written successfully"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let result = anthropic_to_openai(anthropic.to_string().as_bytes(), None).unwrap();
+        let openai: Value = serde_json::from_slice(&result).unwrap();
+
+        let messages = openai["messages"].as_array().unwrap();
+        // user, assistant (with tool_calls), tool result
+        assert_eq!(messages.len(), 3);
+
+        // Assistant message should have tool_calls
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "I'll create the file.");
+        let tool_calls = messages[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls[0]["function"]["name"], "Write");
+        assert_eq!(tool_calls[0]["id"], "toolu_123");
+
+        // Tool result message
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "toolu_123");
+        assert_eq!(messages[2]["content"], "File written successfully");
+    }
+
+    #[test]
+    fn test_openai_to_anthropic_with_tool_calls() {
+        let openai = json!({
+            "id": "chatcmpl-456",
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "Write",
+                            "arguments": "{\"file_path\":\"/tmp/test.py\",\"content\":\"print('hello')\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+        });
+
+        let result = openai_to_anthropic(openai.to_string().as_bytes()).unwrap();
+        let anthropic: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(anthropic["stop_reason"], "tool_use");
+        let content = anthropic["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1); // Only tool_use, no text (content was null)
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["name"], "Write");
+        assert_eq!(content[0]["id"], "call_abc");
+        assert_eq!(content[0]["input"]["file_path"], "/tmp/test.py");
     }
 }

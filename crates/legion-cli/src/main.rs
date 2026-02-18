@@ -73,7 +73,8 @@ enum CopilotAction {
 
 fn setup_logging(to_file: bool) {
     let filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("legion=info".parse().unwrap());
+        .add_directive("legion=info".parse().unwrap())
+        .add_directive("legion_core::proxy=debug".parse().unwrap());
 
     if to_file {
         // TUI mode: log to file so we don't corrupt the terminal
@@ -362,13 +363,6 @@ async fn cmd_copilot(action: CopilotAction) -> Result<()> {
 
     match action {
         CopilotAction::Login => {
-            // Try to read existing token first
-            if let Some(token) = copilot::read_github_token_from_opencode() {
-                println!("Found existing GitHub token from OpenCode: gho_{}...", &token[4..12.min(token.len())]);
-                println!("Use 'legion copilot setup' to exchange and save.");
-                return Ok(());
-            }
-
             println!("Starting GitHub OAuth device flow...");
             let device = copilot::request_device_code().await?;
             println!("\nPlease visit: {}", device.verification_uri);
@@ -459,14 +453,9 @@ async fn cmd_copilot(action: CopilotAction) -> Result<()> {
     Ok(())
 }
 
-/// Try to get token from OpenCode auth.json, or run device flow login
+/// Run device flow login to get a GitHub token
 async fn try_get_or_login_token() -> Result<String> {
     use legion_core::copilot;
-
-    if let Some(token) = copilot::read_github_token_from_opencode() {
-        println!("Found GitHub token from OpenCode.");
-        return Ok(token);
-    }
 
     println!("No token found. Starting GitHub OAuth device flow...");
     let device = copilot::request_device_code().await?;

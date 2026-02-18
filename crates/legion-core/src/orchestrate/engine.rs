@@ -45,10 +45,17 @@ pub struct TaskTicket {
     pub summary: Option<String>,
     #[serde(skip)]
     pub started_at: Option<std::time::Instant>,
+    /// Frozen elapsed time for Done/Error tickets (so it stops counting)
+    pub completed_elapsed_secs: Option<u64>,
+    /// Git commit SHA when worker started this ticket (for diff base)
+    pub base_commit: Option<String>,
 }
 
 impl TaskTicket {
     pub fn elapsed_secs(&self) -> u64 {
+        if let Some(frozen) = self.completed_elapsed_secs {
+            return frozen;
+        }
         self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
     }
 }
@@ -69,6 +76,7 @@ pub struct TicketSnapshot {
     pub feedback: Option<String>,
     pub summary: Option<String>,
     pub elapsed_secs: u64,
+    pub base_commit: Option<String>,
 }
 
 struct EngineInner {
@@ -143,6 +151,8 @@ impl OrchestrateEngine {
                         feedback: row.feedback,
                         summary: row.summary,
                         started_at: None,
+                        completed_elapsed_secs: None,
+                        base_commit: row.base_commit.clone(),
                     });
                     if row.id as usize >= next_id {
                         next_id = row.id as usize + 1;
@@ -199,6 +209,7 @@ impl OrchestrateEngine {
                 created_at: now,
                 updated_at: now,
                 origin_session: None,
+                base_commit: ticket.base_commit.clone(),
             };
             if let Ok(db) = db.lock() {
                 let _ = db.insert_ticket(&row);
@@ -237,6 +248,7 @@ impl OrchestrateEngine {
                 created_at: 0, // not updated
                 updated_at: now,
                 origin_session: None,
+                base_commit: ticket.base_commit.clone(),
             };
             if let Ok(db) = db.lock() {
                 let _ = db.update_ticket(&row);
@@ -265,6 +277,8 @@ impl OrchestrateEngine {
             feedback: None,
             summary: None,
             started_at: None,
+            completed_elapsed_secs: None,
+            base_commit: None,
         };
         guard.tickets.push(ticket.clone());
         drop(guard);
@@ -291,6 +305,17 @@ impl OrchestrateEngine {
         Some(snap)
     }
 
+    /// Set the base commit for a ticket (captured when worker starts processing)
+    pub async fn set_base_commit(&self, ticket_id: usize, commit: String) {
+        let mut guard = self.inner.write().await;
+        if let Some(ticket) = guard.tickets.iter_mut().find(|t| t.id == ticket_id) {
+            ticket.base_commit = Some(commit);
+            let snap = ticket.clone();
+            drop(guard);
+            self.persist_ticket_update(&snap);
+        }
+    }
+
     pub async fn report_iteration(
         &self, ticket_id: usize, success: bool, feedback: Option<String>,
     ) -> bool {
@@ -301,6 +326,7 @@ impl OrchestrateEngine {
         };
 
         if success {
+            ticket.completed_elapsed_secs = Some(ticket.elapsed_secs());
             ticket.status = TicketStatus::Done;
             ticket.summary = feedback;
             let snap = ticket.clone();
@@ -310,6 +336,7 @@ impl OrchestrateEngine {
         }
 
         if ticket.iteration >= ticket.max_iterations {
+            ticket.completed_elapsed_secs = Some(ticket.elapsed_secs());
             ticket.status = TicketStatus::Error;
             ticket.summary = feedback;
             let snap = ticket.clone();
@@ -375,6 +402,7 @@ impl OrchestrateEngine {
     pub async fn force_error(&self, ticket_id: usize, reason: &str) {
         let mut guard = self.inner.write().await;
         if let Some(ticket) = guard.tickets.iter_mut().find(|t| t.id == ticket_id) {
+            ticket.completed_elapsed_secs = Some(ticket.elapsed_secs());
             ticket.status = TicketStatus::Error;
             ticket.summary = Some(reason.to_string());
             let snap = ticket.clone();
@@ -415,6 +443,7 @@ impl OrchestrateEngine {
         ticket.iteration = 0;
         ticket.summary = None;
         ticket.started_at = None;
+        ticket.completed_elapsed_secs = None;
         let snap = ticket.clone();
         drop(guard);
         self.persist_ticket_update(&snap);
@@ -469,6 +498,7 @@ impl OrchestrateEngine {
         let mut stopped = Vec::new();
         for ticket in guard.tickets.iter_mut() {
             if ticket.status == TicketStatus::Working {
+                ticket.completed_elapsed_secs = Some(ticket.elapsed_secs());
                 ticket.status = TicketStatus::Error;
                 ticket.summary = Some("Stopped by user".into());
                 stopped.push(ticket.clone());
@@ -496,5 +526,6 @@ fn ticket_to_snapshot(t: &TaskTicket) -> TicketSnapshot {
         feedback: t.feedback.clone(),
         summary: t.summary.clone(),
         elapsed_secs: t.elapsed_secs(),
+        base_commit: t.base_commit.clone(),
     }
 }

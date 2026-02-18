@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use super::transform::{anthropic_to_openai, openai_to_anthropic, wrap_anthropic_json_as_sse};
-use crate::copilot::{self, CopilotTokenInfo};
+use crate::copilot::{self, CopilotTokenInfo, COPILOT_USER_AGENT, COPILOT_API_VERSION, EDITOR_PLUGIN_VERSION, VSCODE_VERSION};
 
 /// A boxed stream of frames for SSE passthrough
 type BoxStream = Pin<Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>>;
@@ -205,6 +205,24 @@ async fn handle_request(
         ));
     }
 
+    // For OpenAI-compat formats (github_copilot, openai_chat): count_tokens endpoint doesn't exist.
+    // Return a mock response so Claude Code doesn't fail.
+    let is_openai_compat_format = matches!(
+        proxy_config.api_format.as_deref(),
+        Some("openai_chat") | Some("github_copilot")
+    );
+    if is_openai_compat_format && path.contains("count_tokens") {
+        debug!("Returning mock count_tokens response for OpenAI-compat format");
+        let mock_response = r#"{"input_tokens": 0}"#;
+        let body = Full::new(Bytes::from(mock_response));
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Either::Left(body))
+            .unwrap();
+        return Ok(resp);
+    }
+
     // Collect the request body
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -224,6 +242,12 @@ async fn handle_request(
         Some("openai_chat") | Some("github_copilot")
     );
 
+    // Log the model override for debugging (info level for easy visibility)
+    if is_openai_compat {
+        info!("Proxy config: api_format={:?}, model_override={:?}, target_url={:?}",
+            proxy_config.api_format, proxy_config.model, proxy_config.target_url);
+    }
+
     let (request_body, content_type) = match proxy_config.api_format.as_deref() {
         Some("openai_chat") | Some("github_copilot") => {
             match anthropic_to_openai(&body_bytes, proxy_config.model.as_deref()) {
@@ -231,6 +255,12 @@ async fn handle_request(
                     // Force stream=false — we'll wrap the buffered response as Anthropic SSE
                     let final_body = match serde_json::from_slice::<serde_json::Value>(&transformed) {
                         Ok(mut v) => {
+                            // Log tools count for debugging
+                            let tools_count = v.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
+                            let messages_count = v.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0);
+                            debug!("OpenAI request: model={}, messages={}, tools={}",
+                                v.get("model").and_then(|m| m.as_str()).unwrap_or("?"),
+                                messages_count, tools_count);
                             v["stream"] = serde_json::Value::Bool(false);
                             serde_json::to_vec(&v).unwrap_or(transformed)
                         }
@@ -310,11 +340,23 @@ async fn handle_request(
         Some("github_copilot") => {
             // GitHub Copilot: use the resolved short-lived token, not the gho_* OAuth token
             if let Some(ref info) = copilot_resolved {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+                let cnt = COUNTER.fetch_add(1, Ordering::Relaxed);
+                let request_id = format!("{:016x}-{:04x}", ts, cnt);
                 request_builder = request_builder
                     .header("Authorization", format!("Bearer {}", info.token))
                     .header("Copilot-Integration-Id", "vscode-chat")
-                    .header("Editor-Version", "vscode/1.99.0")
-                    .header("Editor-Plugin-Version", "copilot-chat/0.27.0");
+                    .header("User-Agent", COPILOT_USER_AGENT)
+                    .header("Editor-Version", format!("vscode/{}", VSCODE_VERSION))
+                    .header("Editor-Plugin-Version", EDITOR_PLUGIN_VERSION)
+                    .header("openai-intent", "conversation-panel")
+                    .header("x-github-api-version", COPILOT_API_VERSION)
+                    .header("x-request-id", &request_id)
+                    .header("x-vscode-user-agent-library-version", "electron-fetch")
+                    .header("X-Initiator", "agent");
             }
         }
         Some("openai_chat") => {
@@ -372,7 +414,7 @@ async fn handle_request(
         .to_string();
     let is_sse = upstream_content_type.contains("text/event-stream");
 
-    debug!("Received {} response from upstream (sse={})", status, is_sse);
+    debug!("Received {} response from upstream (sse={}, openai_compat={})", status, is_sse, is_openai_compat);
 
     // --- SSE passthrough for anthropic/anthropic_bearer streaming responses ---
     if is_sse && !is_openai_compat {
@@ -407,10 +449,75 @@ async fn handle_request(
         }
     };
 
+    // Log non-success responses for debugging
+    if !status.is_success() {
+        if let Ok(resp_str) = std::str::from_utf8(&response_body) {
+            let truncated = if resp_str.len() > 500 { &resp_str[..500] } else { resp_str };
+            warn!("Upstream error ({}): {}", status, truncated);
+        }
+    }
+
+    // For openai_chat/github_copilot: convert error responses to Anthropic format
+    if is_openai_compat && !status.is_success() {
+        // Map HTTP status to Anthropic error type
+        let error_type = match status.as_u16() {
+            429 => "overloaded_error",
+            404 => "not_found_error",
+            401 | 403 => "authentication_error",
+            400 => "invalid_request_error",
+            _ => "api_error",
+        };
+
+        // Try to extract error message from OpenAI error response
+        let error_message = std::str::from_utf8(&response_body)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| {
+                // OpenAI error format: {"error": {"message": "...", "type": "...", "code": "..."}}
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| {
+                std::str::from_utf8(&response_body)
+                    .unwrap_or("Unknown upstream error")
+                    .to_string()
+            });
+
+        warn!("OpenAI-compat upstream error ({}): {} — mapped to Anthropic {}", status, error_message, error_type);
+
+        let anthropic_error = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": error_message
+            }
+        });
+
+        return Ok(Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .body(Either::Left(Full::new(Bytes::from(
+                serde_json::to_vec(&anthropic_error).unwrap_or_else(|_| response_body.to_vec())
+            ))))
+            .unwrap());
+    }
+
     // For openai_chat: transform OpenAI JSON → Anthropic JSON → Anthropic SSE
     if is_openai_compat && status.is_success() {
+        // Log upstream response for debugging
+        if let Ok(resp_str) = std::str::from_utf8(&response_body) {
+            let truncated = if resp_str.len() > 500 { &resp_str[..500] } else { resp_str };
+            debug!("OpenAI upstream response ({}): {}", response_body.len(), truncated);
+        }
         match openai_to_anthropic(&response_body) {
             Ok(anthropic_json) => {
+                // Log transformed response
+                if let Ok(resp_str) = std::str::from_utf8(&anthropic_json) {
+                    let truncated = if resp_str.len() > 500 { &resp_str[..500] } else { resp_str };
+                    debug!("Anthropic transformed ({}): {}", anthropic_json.len(), truncated);
+                }
                 match wrap_anthropic_json_as_sse(&anthropic_json) {
                     Ok(sse_bytes) => {
                         return Ok(Response::builder()
@@ -446,8 +553,8 @@ async fn handle_request(
 
 /// Resolve a valid Copilot API token, refreshing from the gho_* OAuth token if expired.
 ///
-/// When token exchange fails (e.g. 404 for certain token types), falls back to using
-/// the gho_* token directly as the API token (same behavior as OpenCode/ccswitch).
+/// Returns an error if token exchange fails — gho_* tokens cannot be used directly
+/// for Copilot API calls.
 async fn resolve_copilot_token(
     config: &ProxyConfig,
     cache: &CopilotTokenCache,
@@ -478,13 +585,7 @@ async fn resolve_copilot_token(
             info
         }
         Err(e) => {
-            // Fallback: use gho_* token directly (some token types don't support exchange)
-            warn!("Copilot token exchange failed ({}), using gho token directly", e);
-            CopilotTokenInfo {
-                token: gho_token.to_string(),
-                base_url: copilot::DEFAULT_COPILOT_API_BASE.to_string(),
-                expires_at: Instant::now() + Duration::from_secs(60 * 60),
-            }
+            return Err(anyhow::anyhow!("Copilot token exchange failed: {}", e));
         }
     };
 

@@ -8,13 +8,17 @@
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-const GITHUB_CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
+const GITHUB_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 pub const DEFAULT_COPILOT_API_BASE: &str = "https://api.githubcopilot.com";
+pub const EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.26.7";
+pub const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
+pub const VSCODE_VERSION: &str = "1.99.0";
+pub const COPILOT_API_VERSION: &str = "2025-04-01";
 
 /// Result of GitHub device code initiation
 pub struct DeviceCodeResponse {
@@ -40,7 +44,11 @@ pub async fn request_device_code() -> Result<DeviceCodeResponse> {
     let resp = client
         .post(DEVICE_CODE_URL)
         .header("Accept", "application/json")
-        .form(&[("client_id", GITHUB_CLIENT_ID)])
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "client_id": GITHUB_CLIENT_ID,
+            "scope": "read:user"
+        }))
         .timeout(Duration::from_secs(10))
         .send()
         .await?;
@@ -80,11 +88,12 @@ pub async fn poll_for_access_token(device_code: &str, interval: u64) -> Result<S
         let resp = client
             .post(ACCESS_TOKEN_URL)
             .header("Accept", "application/json")
-            .form(&[
-                ("client_id", GITHUB_CLIENT_ID),
-                ("device_code", device_code),
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ])
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "client_id": GITHUB_CLIENT_ID,
+                "device_code": device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+            }))
             .timeout(Duration::from_secs(10))
             .send()
             .await?;
@@ -127,8 +136,11 @@ pub async fn exchange_copilot_token(github_token: &str) -> Result<CopilotTokenIn
     let resp = client
         .get(COPILOT_TOKEN_URL)
         .header("Accept", "application/json")
-        .header("Authorization", format!("Bearer {}", github_token))
-        .header("User-Agent", "GithubCopilot/1.0")
+        .header("Authorization", format!("token {}", github_token))
+        .header("User-Agent", COPILOT_USER_AGENT)
+        .header("editor-version", format!("vscode/{}", VSCODE_VERSION))
+        .header("editor-plugin-version", EDITOR_PLUGIN_VERSION)
+        .header("x-github-api-version", COPILOT_API_VERSION)
         .timeout(Duration::from_secs(10))
         .send()
         .await?;
@@ -212,7 +224,11 @@ pub async fn fetch_models(copilot_token: &str, base_url: &str) -> Result<Vec<Str
         .header("Accept", "application/json")
         .header("Authorization", format!("Bearer {}", copilot_token))
         .header("Copilot-Integration-Id", "vscode-chat")
-        .header("User-Agent", "GithubCopilot/1.0")
+        .header("User-Agent", COPILOT_USER_AGENT)
+        .header("editor-version", format!("vscode/{}", VSCODE_VERSION))
+        .header("editor-plugin-version", EDITOR_PLUGIN_VERSION)
+        .header("x-github-api-version", COPILOT_API_VERSION)
+        .header("openai-intent", "conversation-panel")
         .timeout(Duration::from_secs(10))
         .send()
         .await?;
@@ -238,58 +254,11 @@ pub async fn fetch_models(copilot_token: &str, base_url: &str) -> Result<Vec<Str
     Ok(models)
 }
 
-// ─── Utility: Read OpenCode auth.json ───
-
-/// Read GitHub Copilot OAuth token from OpenCode's auth.json
-pub fn read_github_token_from_opencode() -> Option<String> {
-    let auth_path = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        std::path::PathBuf::from(xdg).join("opencode/auth.json")
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".local/share/opencode/auth.json")
-    } else {
-        return None;
-    };
-
-    let content = std::fs::read_to_string(&auth_path).ok()?;
-    let auth: Value = serde_json::from_str(&content).ok()?;
-
-    // Try "github-copilot" key
-    if let Some(entry) = auth.get("github-copilot") {
-        if let Some(access) = entry.get("access").and_then(|v| v.as_str()) {
-            if !access.is_empty() {
-                return Some(access.to_string());
-            }
-        }
-        if let Some(key) = entry.get("key").and_then(|v| v.as_str()) {
-            if !key.is_empty() {
-                return Some(key.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-/// Full setup: read or login → exchange → fetch models → return everything
+/// Full setup: exchange token → fetch models → return everything
 pub async fn full_setup(github_token: &str) -> Result<(CopilotTokenInfo, Vec<String>)> {
-    // Step 1: Exchange token
-    let token_info = match exchange_copilot_token(github_token).await {
-        Ok(info) => info,
-        Err(e) => {
-            warn!("Token exchange failed ({}), using gho token directly", e);
-            CopilotTokenInfo {
-                token: github_token.to_string(),
-                base_url: DEFAULT_COPILOT_API_BASE.to_string(),
-                expires_at: Instant::now() + Duration::from_secs(60 * 60),
-            }
-        }
-    };
-
-    // Step 2: Fetch models
+    let token_info = exchange_copilot_token(github_token).await?;
     let models = fetch_models(&token_info.token, &token_info.base_url).await?;
-
     info!("GitHub Copilot setup complete: {} models, base_url: {}", models.len(), token_info.base_url);
-
     Ok((token_info, models))
 }
 

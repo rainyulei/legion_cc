@@ -66,6 +66,7 @@ pub struct TicketRow {
     pub created_at: i64,
     pub updated_at: i64,
     pub origin_session: Option<String>,
+    pub base_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,7 +421,7 @@ impl Repository {
 
     pub fn insert_ticket(&self, ticket: &TicketRow) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO tickets (id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at, origin_session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT OR REPLACE INTO tickets (id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at, origin_session, base_commit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 ticket.id,
                 ticket.session_name,
@@ -438,6 +439,7 @@ impl Repository {
                 ticket.created_at,
                 ticket.updated_at,
                 ticket.origin_session,
+                ticket.base_commit,
             ],
         )?;
         Ok(())
@@ -445,7 +447,7 @@ impl Repository {
 
     pub fn update_ticket(&self, ticket: &TicketRow) -> Result<()> {
         self.conn.execute(
-            "UPDATE tickets SET status = ?1, assigned_worker = ?2, iteration = ?3, feedback = ?4, summary = ?5, updated_at = ?6 WHERE id = ?7 AND session_name = ?8",
+            "UPDATE tickets SET status = ?1, assigned_worker = ?2, iteration = ?3, feedback = ?4, summary = ?5, updated_at = ?6, base_commit = ?9 WHERE id = ?7 AND session_name = ?8",
             params![
                 ticket.status,
                 ticket.assigned_worker,
@@ -455,6 +457,7 @@ impl Repository {
                 ticket.updated_at,
                 ticket.id,
                 ticket.session_name,
+                ticket.base_commit,
             ],
         )?;
         Ok(())
@@ -462,7 +465,7 @@ impl Repository {
 
     pub fn list_tickets_by_session(&self, session_name: &str) -> Result<Vec<TicketRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at, origin_session FROM tickets WHERE session_name = ? ORDER BY id"
+            "SELECT id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at, origin_session, base_commit FROM tickets WHERE session_name = ? ORDER BY id"
         )?;
         let rows = stmt.query_map(params![session_name], |row| {
             Ok(TicketRow {
@@ -482,6 +485,7 @@ impl Repository {
                 created_at: row.get(13)?,
                 updated_at: row.get(14)?,
                 origin_session: row.get(15)?,
+                base_commit: row.get(16)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -912,6 +916,7 @@ mod tests {
             created_at: 1000,
             updated_at: 1000,
             origin_session: None,
+            base_commit: None,
         };
         repo.insert_ticket(&ticket).unwrap();
         repo.append_ticket_log(1, "sess1", "log entry", 1000).unwrap();
@@ -966,6 +971,7 @@ mod tests {
                 created_at: 1000,
                 updated_at: 1000,
                 origin_session: None,
+                base_commit: None,
             }).unwrap();
             repo.append_ticket_log(i, "old-sess", &format!("log {}", i), 1000).unwrap();
         }

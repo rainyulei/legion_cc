@@ -28,9 +28,19 @@ impl OrchestrateApi {
     }
 
     /// Start the API server, optionally signaling when the listener is bound.
+    /// If `shutdown_rx` is provided, the server will stop when it receives a signal.
     pub async fn start_with_signal(
         &self,
         ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
+        self.start_with_shutdown(ready_tx, None).await
+    }
+
+    /// Start the API server with an optional shutdown signal.
+    pub async fn start_with_shutdown(
+        &self,
+        ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        mut shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<()> {
         let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
         let listener = TcpListener::bind(addr).await?;
@@ -43,27 +53,41 @@ impl OrchestrateApi {
         let engine = self.engine.clone();
 
         loop {
-            let (stream, remote_addr) = listener.accept().await?;
-            let io = TokioIo::new(stream);
-            let engine = engine.clone();
-
-            tokio::spawn(async move {
-                let service = service_fn(move |req| {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    let (stream, remote_addr) = accept_result?;
+                    let io = TokioIo::new(stream);
                     let engine = engine.clone();
-                    async move { handle_request(req, engine).await }
-                });
 
-                if let Err(err) = http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await
-                {
-                    debug!(
-                        "Error serving orchestrate connection from {}: {:?}",
-                        remote_addr, err
-                    );
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req| {
+                            let engine = engine.clone();
+                            async move { handle_request(req, engine).await }
+                        });
+
+                        if let Err(err) = http1::Builder::new()
+                            .serve_connection(io, service)
+                            .await
+                        {
+                            debug!(
+                                "Error serving orchestrate connection from {}: {:?}",
+                                remote_addr, err
+                            );
+                        }
+                    });
                 }
-            });
+                _ = async {
+                    match shutdown_rx.as_mut() {
+                        Some(rx) => { let _ = rx.await; },
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    info!("Orchestrate API on port {} shutting down", self.port);
+                    break;
+                }
+            }
         }
+        Ok(())
     }
 }
 

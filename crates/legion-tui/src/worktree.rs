@@ -309,6 +309,7 @@ pub fn list_local_branches(project_path: &Path) -> Vec<String> {
                 .lines()
                 .map(|l| l.trim().to_string())
                 .filter(|l| !l.is_empty())
+                .filter(|l| !l.starts_with("legion/")) // exclude worktree branches
                 .collect()
         }
         _ => vec![],
