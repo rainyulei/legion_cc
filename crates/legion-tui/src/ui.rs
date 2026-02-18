@@ -324,7 +324,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         let content_full = format!("{}{}\u{2502}",
             content_line, " ".repeat(content_pad.min(200)));
         let content_display: String = content_full.chars().take(inner.width as usize).collect();
-        lines.push(Line::from(Span::styled(content_display, Style::default().fg(Color::White))));
+        lines.push(Line::from(Span::styled(content_display, Style::default().fg(Color::Yellow))));
 
         // Bottom border
         let bot_inner = card_width.saturating_sub(0);
@@ -366,9 +366,9 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         let sel = app.right_panel_focused && app.board_selected == t.id;
         let prefix = if sel { "\u{25b6} " } else { "  " };
         let row_style = if sel {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(Color::Red)
         };
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(Color::Yellow)),
@@ -439,10 +439,10 @@ fn ticket_compact_line<'a>(ticket: &TicketSnapshot, app: &App, show_elapsed: boo
     let base_color = match ticket.status {
         TicketStatus::Done => Color::Green,
         TicketStatus::Queued => Color::Cyan,
-        _ => Color::White,
+        _ => Color::Yellow,
     };
     let row_style = if sel {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default().fg(base_color).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(base_color)
     };
@@ -692,14 +692,20 @@ fn wrap_to_lines(s: &str, width: usize) -> Vec<String> {
         }
         let mut remaining = line;
         while !remaining.is_empty() {
-            if remaining.len() <= width {
+            let char_count = remaining.chars().count();
+            if char_count <= width {
                 out.push(remaining.to_string());
                 break;
             }
-            let break_at = remaining[..width]
+            // Find byte offset for the width-th character
+            let byte_at_width = remaining.char_indices()
+                .nth(width)
+                .map(|(i, _)| i)
+                .unwrap_or(remaining.len());
+            let break_at = remaining[..byte_at_width]
                 .rfind(|c: char| c.is_whitespace())
-                .unwrap_or(width);
-            let break_at = if break_at == 0 { width } else { break_at };
+                .unwrap_or(byte_at_width);
+            let break_at = if break_at == 0 { byte_at_width } else { break_at };
             out.push(remaining[..break_at].to_string());
             remaining = remaining[break_at..].trim_start();
         }
@@ -754,7 +760,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled(": Back", Style::default().fg(Color::Gray)),
                 ],
                 PopupMenu::NewSessionInput => vec![
-                    Span::styled(" Enter", Style::default().fg(Color::Yellow)),
+                    Span::styled(" Tab", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Switch ", Style::default().fg(Color::Gray)),
+                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
                     Span::styled(": Create ", Style::default().fg(Color::Gray)),
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
                     Span::styled(": Back", Style::default().fg(Color::Gray)),
@@ -1277,35 +1285,83 @@ fn draw_new_session_input(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(Color::Green))
         .style(Style::default().bg(Color::DarkGray));
 
+    let branch_focused = app.new_session_branch_focused;
+
     let mut items = vec![];
 
-    // Show branch info if detected
-    if let Some(ref branch) = app.detected_branch {
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled("  Branch: ", Style::default().fg(Color::Gray)),
-            Span::styled(branch.as_str(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ])));
-        if let Some(ref commit) = app.detected_commit {
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled("  Commit: ", Style::default().fg(Color::Gray)),
-                Span::styled(commit.as_str(), Style::default().fg(Color::Gray)),
-            ])));
+    // Branch selector section
+    let branch_label_style = if branch_focused {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    items.push(ListItem::new(Line::from(Span::styled(
+        "  Branch:",
+        branch_label_style,
+    ))));
+
+    // Show max 8 branches around selected index to avoid overflow
+    let max_visible = 8usize;
+    let total = app.branch_list.len();
+    let start = if total <= max_visible {
+        0
+    } else {
+        app.new_session_branch_index.saturating_sub(max_visible / 2)
+            .min(total.saturating_sub(max_visible))
+    };
+    let end = (start + max_visible).min(total);
+
+    let current_branch = app.detected_branch.as_deref();
+    for i in start..end {
+        let branch = &app.branch_list[i];
+        let selected = i == app.new_session_branch_index;
+        let is_current = current_branch == Some(branch.as_str());
+        let prefix = if selected && branch_focused { "  \u{25b8} " } else { "    " };
+        let style = if selected && branch_focused {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mut spans = vec![
+            Span::raw(prefix),
+            Span::styled(branch.as_str(), style),
+        ];
+        if is_current {
+            spans.push(Span::styled("  (current)", Style::default().fg(Color::Green)));
         }
-        items.push(ListItem::new(Line::from(Span::raw(""))));
+        items.push(ListItem::new(Line::from(spans)));
+    }
+    if app.branch_list.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "    (no local branches)",
+            Style::default().fg(Color::DarkGray),
+        ))));
     }
 
-    items.push(ListItem::new(Line::from(Span::styled(
-        "  Enter session name:",
-        Style::default().fg(Color::White),
-    ))));
     items.push(ListItem::new(Line::from(Span::raw(""))));
+
+    // Name input section
+    let name_label_style = if !branch_focused {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    items.push(ListItem::new(Line::from(Span::styled(
+        "  Session name:",
+        name_label_style,
+    ))));
+    let cursor = if !branch_focused { "\u{2588}" } else { "" };
     items.push(ListItem::new(Line::from(vec![
-        Span::styled("  > ", Style::default().fg(Color::Yellow)),
+        Span::styled("  > ", Style::default().fg(if !branch_focused { Color::Yellow } else { Color::Gray })),
         Span::styled(
             app.session_name_input.as_str(),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("\u{2588}", Style::default().fg(Color::Yellow)),
+        Span::styled(cursor, Style::default().fg(Color::Yellow)),
     ])));
     items.push(ListItem::new(Line::from(Span::raw(""))));
 
@@ -1318,9 +1374,9 @@ fn draw_new_session_input(frame: &mut Frame, app: &App, area: Rect) {
         items.push(ListItem::new(Line::from(Span::raw(""))));
     }
 
-    let workers_hint = format!("  {} workers  |  [Enter=Create] [Esc=Cancel]", app.requested_workers);
+    let hints = format!("  {} workers  |  [Tab=Switch] [Enter=Create] [Esc=Cancel]", app.requested_workers);
     items.push(ListItem::new(Line::from(Span::styled(
-        workers_hint,
+        hints,
         Style::default().fg(Color::Gray),
     ))));
 
@@ -1534,11 +1590,13 @@ fn draw_api_key_input(frame: &mut Frame, app: &App, area: Rect) {
     let masked: String = if app.api_key_input.is_empty() {
         "\u{2588}".to_string() // block cursor
     } else {
-        let visible_len = app.api_key_input.len().min(4);
-        let masked_len = app.api_key_input.len().saturating_sub(4);
+        let char_count = app.api_key_input.chars().count();
+        let visible_len = char_count.min(4);
+        let masked_len = char_count.saturating_sub(4);
+        let visible_part: String = app.api_key_input.chars().skip(masked_len).take(visible_len).collect();
         format!("{}{}\u{2588}",
             "\u{2022}".repeat(masked_len), // bullets
-            &app.api_key_input[masked_len..masked_len + visible_len], // last 4 chars visible
+            visible_part, // last 4 chars visible
         )
     };
     lines.push(Line::from(Span::styled(
@@ -1635,8 +1693,11 @@ fn draw_retry_form(frame: &mut Frame, app: &App, area: Rect) {
         // Show field value (truncated to fit) with cursor if focused
         let val = &app.retry_form_fields[i];
         let max_width = inner.width.saturating_sub(6) as usize;
-        let display = if val.len() > max_width {
-            format!("...{}", &val[val.len() - max_width + 3..])
+        let char_count = val.chars().count();
+        let display = if char_count > max_width {
+            let skip = char_count.saturating_sub(max_width.saturating_sub(3));
+            let tail: String = val.chars().skip(skip).collect();
+            format!("...{}", tail)
         } else {
             val.clone()
         };
@@ -1798,10 +1859,11 @@ fn draw_complete_record_choice(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -1897,8 +1959,11 @@ fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
 
         // Truncate path to fit
         let max_path_len = file_inner.width.saturating_sub(stats.len() as u16 + 5) as usize;
-        let display_path = if f.path.len() > max_path_len && max_path_len > 3 {
-            format!("...{}", &f.path[f.path.len().saturating_sub(max_path_len - 3)..])
+        let path_char_count = f.path.chars().count();
+        let display_path = if path_char_count > max_path_len && max_path_len > 3 {
+            let skip = path_char_count.saturating_sub(max_path_len - 3);
+            let tail: String = f.path.chars().skip(skip).collect();
+            format!("...{}", tail)
         } else {
             f.path.clone()
         };
@@ -2098,8 +2163,20 @@ fn draw_branch_changed(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_branch_list(frame: &mut Frame, app: &App, area: Rect) {
+    let current_branch = app.current_session.as_ref()
+        .and_then(|s| s.base_branch.as_deref());
+
+    // Layout: list + bottom hints
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
     let block = Block::default()
-        .title(" Select Branch [ESC] ")
+        .title(" Select Branch ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::DarkGray));
@@ -2107,16 +2184,23 @@ fn draw_branch_list(frame: &mut Frame, app: &App, area: Rect) {
     let mut items = vec![];
     for (i, branch) in app.branch_list.iter().enumerate() {
         let selected = i == app.branch_list_index;
-        let prefix = if selected { "> " } else { "  " };
+        let is_current = current_branch == Some(branch.as_str());
+        let prefix = if selected { " \u{25b8} " } else { "   " };
         let style = if selected {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::White)
         };
-        items.push(ListItem::new(Line::from(Span::styled(
-            format!("{}{}", prefix, branch),
-            style,
-        ))));
+        let mut spans = vec![
+            Span::raw(prefix),
+            Span::styled(branch.as_str(), style),
+        ];
+        if is_current {
+            spans.push(Span::styled("  (current)", Style::default().fg(Color::Green)));
+        }
+        items.push(ListItem::new(Line::from(spans)));
     }
 
     if items.is_empty() {
@@ -2126,7 +2210,16 @@ fn draw_branch_list(frame: &mut Frame, app: &App, area: Rect) {
         ))));
     }
 
-    frame.render_widget(List::new(items).block(block), area);
+    frame.render_widget(List::new(items).block(block), chunks[0]);
+
+    let hints = Paragraph::new(Line::from(vec![
+        Span::styled(" Enter", Style::default().fg(Color::Green)),
+        Span::styled(": Select  ", Style::default().fg(Color::Gray)),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::styled(": Cancel", Style::default().fg(Color::Gray)),
+    ]))
+    .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(hints, chunks[1]);
 }
 
 fn draw_copilot_auth(frame: &mut Frame, app: &App, area: Rect) {

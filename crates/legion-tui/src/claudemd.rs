@@ -21,13 +21,15 @@ legion-dispatch <worker_id> -t "title" -c "context" -k "criteria" "task descript
 ```
 
 - `-t` — Short title (3-6 words): "Implement heart animation"
-- `-c` — Context (working dir, language, files): "Python 3, working dir: ./scripts, no deps"
+- `-c` — Context (language, dependencies, constraints): "Python 3, no external deps, terminal ANSI output"
 - `-k` — Success criteria (testable conditions): "heart.py exists, python3 heart.py runs, uses math curve"
 - Last arg — Full task description with all implementation details
 
+**IMPORTANT:** Do NOT include working directory paths in `-c`. Each Worker has its own dedicated worktree — they will create files in their current directory automatically.
+
 Example:
 ```bash
-legion-dispatch 1 -t "Implement heart animation" -c "Working dir: ./scripts, Python 3, no external deps" -k "heart.py exists, python3 heart.py shows animated heart, uses math-based curve" "Create heart.py with parametric heart curve animation using ANSI colors"
+legion-dispatch 1 -t "Implement heart animation" -c "Python 3, no external deps, terminal ANSI output" -k "heart.py exists, python3 heart.py shows animated heart, uses math-based curve" "Create heart.py with parametric heart curve animation using ANSI colors"
 ```
 
 ## Workflow
@@ -55,11 +57,14 @@ legion-dispatch 1 -t "Implement heart animation" -c "Working dir: ./scripts, Pyt
 }
 
 /// Generate a Worker's system prompt: Agent Team lead with TechLeader/Engineer/QA
-pub fn worker_instructions(worker_id: u16) -> String {
+pub fn worker_instructions(worker_id: u16, working_dir: Option<&str>) -> String {
+    let wd_note = working_dir.map(|d| format!(
+        "\n\n## Working Directory\n\nYour working directory is: `{}`\nAll files you create MUST be in this directory. Use relative paths (e.g., `./heart.py`) or this absolute path. NEVER write files to any other location.\n", d
+    )).unwrap_or_default();
     format!(
         r#"# Worker {} — Autonomous Task Executor
 
-You are Worker {}, running in headless non-interactive mode inside a Ralph Loop.
+You are Worker {}, running in headless non-interactive mode inside a Ralph Loop.{}
 You receive a structured task with title, context, success criteria, and description.
 Your job is to complete the task autonomously — no user interaction is possible.
 
@@ -100,11 +105,16 @@ Summary: [brief description of what was implemented and verified]
 
 - You are autonomous. Do NOT ask questions or wait for input.
 - Follow TDD: test first, then implement.
+- **STAY in the current working directory (pwd).** This is YOUR dedicated worktree. NEVER use `cd` to change to another directory. IGNORE any "working dir" path mentioned in the task context — it may point to the leader's directory, NOT yours. Your current directory is always correct. All file creation and commands must happen here.
+- **When done, ALWAYS commit your work:**
+  ```bash
+  git add -A && git commit -m "feat: <short description of changes>"
+  ```
 - The `<promise>DONE</promise>` tag MUST appear in your output when the task is complete.
 - Check EVERY success criterion before declaring done.
-- Keep your working directory clean — commit your changes when done.
+- Do NOT run long-running processes (servers, animations, infinite loops). Only create files and run quick tests/verifications.
 "#,
-        worker_id, worker_id
+        worker_id, worker_id, wd_note
     )
 }
 
@@ -119,7 +129,7 @@ pub fn write_squad_claude_md(worker_count: u16) -> Result<(PathBuf, Vec<PathBuf>
     let mut worker_paths = Vec::new();
     for i in 1..=worker_count {
         let path = dir.join(format!("worker-{}-CLAUDE.md", i));
-        fs::write(&path, worker_instructions(i))?;
+        fs::write(&path, worker_instructions(i, None))?;
         worker_paths.push(path);
     }
 
@@ -132,13 +142,18 @@ mod tests {
 
     #[test]
     fn worker_prompt_contains_key_elements() {
-        let prompt = worker_instructions(1);
+        let prompt = worker_instructions(1, Some("/test/worktree"));
         assert!(prompt.contains("Worker 1"));
         assert!(prompt.contains("headless"));
         assert!(prompt.contains("TDD"));
         assert!(prompt.contains("<promise>DONE</promise>"));
         assert!(prompt.contains("success criteria") || prompt.contains("success criterion"));
         assert!(prompt.contains("autonomous"));
+        assert!(prompt.contains("STAY in the current working directory"));
+        assert!(prompt.contains("NEVER use `cd`"));
+        assert!(prompt.contains("git add -A && git commit"));
+        assert!(prompt.contains("/test/worktree"));
+        assert!(prompt.contains("Your working directory is"));
     }
 
     #[test]

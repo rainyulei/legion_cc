@@ -59,6 +59,7 @@ impl SdkHandle {
             prompt.to_string()
         };
 
+        tracing::info!("SDK spawn: working_dir={:?}, iteration={}", working_dir, iteration);
         let mut cmd = Command::new("claude");
         cmd.arg("-p")
             .arg(&effective_prompt)
@@ -381,7 +382,11 @@ fn process_message(msg: &ClaudeJson, elapsed_secs: u64) -> (Option<String>, Opti
                     "\x1b[90m[{}s] Model: {} | Session: {}\x1b[0m\r\n",
                     elapsed_secs,
                     model_str,
-                    &session_id.as_deref().unwrap_or("-")[..8.min(session_id.as_deref().unwrap_or("-").len())],
+                    {
+                        let sid = session_id.as_deref().unwrap_or("-");
+                        let short: String = sid.chars().take(8).collect();
+                        short
+                    },
                 );
                 (Some(formatted), None)
             }
@@ -570,10 +575,11 @@ fn tool_icon(tool_name: &str) -> &'static str {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.min(s.len())])
+        let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }
 

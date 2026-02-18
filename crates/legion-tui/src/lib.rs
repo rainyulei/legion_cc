@@ -168,14 +168,32 @@ async fn run_event_loop(
     loop {
         // Start orchestration API if a session was just spawned
         if let Some(orch_port) = app.pending_orchestrate_port.take() {
+            // Shutdown previous orchestrate API if running (prevents port conflict)
+            if let Some(tx) = app.orchestrate_shutdown.take() {
+                let _ = tx.send(());
+                // Brief yield to let old server release the port
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
             if let Some(engine) = app.orchestrate.clone() {
+                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                app.orchestrate_shutdown = Some(shutdown_tx);
                 let orch_api = legion_core::OrchestrateApi::new(engine, orch_port);
                 tokio::spawn(async move {
-                    if let Err(e) = orch_api.start_with_signal(None).await {
+                    if let Err(e) = orch_api.start_with_shutdown(None, Some(shutdown_rx)).await {
                         tracing::error!("Orchestrate API error on port {}: {}", orch_port, e);
                     }
                 });
             }
+        }
+
+        // Start proxy servers for workers queued by start_session
+        if !app.pending_worker_proxies.is_empty() {
+            let proxies = std::mem::take(&mut app.pending_worker_proxies);
+            for (proxy_port, control_port, label) in &proxies {
+                start_worker_proxy(*proxy_port, *control_port, label).await;
+            }
+            // Send proxy configs to all worker proxies
+            send_proxy_configs_sync(app).await;
         }
 
         // Check if any --continue panes failed and need respawn
@@ -305,9 +323,16 @@ async fn run_event_loop(
             app.queue_stats = Some(engine.queue_stats().await);
 
             // Auto-select first ticket if current selection is invalid
+            // Prefer highest-priority status: Working > Queued > Done > Error
             if let Some(ref tickets) = app.ticket_snapshot {
                 if !tickets.is_empty() && !tickets.iter().any(|t| t.id == app.board_selected) {
-                    app.board_selected = tickets[0].id;
+                    use legion_core::orchestrate::engine::TicketStatus;
+                    let first_by_priority = tickets.iter().find(|t| t.status == TicketStatus::Working)
+                        .or_else(|| tickets.iter().find(|t| t.status == TicketStatus::Queued))
+                        .or_else(|| tickets.iter().find(|t| t.status == TicketStatus::Done))
+                        .or_else(|| tickets.iter().find(|t| t.status == TicketStatus::Error))
+                        .unwrap_or(&tickets[0]);
+                    app.board_selected = first_by_priority.id;
                 }
             }
 
@@ -407,8 +432,14 @@ async fn run_event_loop(
                         }
                     }
 
-                    // Cache diff for Done/Error tickets
+                    // Cache diff for Done/Error tickets (synchronous to ensure it completes
+                    // before worktrees are potentially removed on session stop)
                     if should_cache_diff {
+                        // Get base_commit from ticket for accurate diff
+                        let base_commit = {
+                            let tickets = engine.all_tickets().await;
+                            tickets.iter().find(|t| t.id == ticket_id).and_then(|t| t.base_commit.clone())
+                        };
                         if let (Some(project_path), Some(session)) = (&app.project_path, &app.current_session) {
                             let wt_path = crate::worktree::pane_worktree_path(
                                 project_path, &session.name, &format!("Worker {}", wi),
@@ -418,8 +449,14 @@ async fn run_event_loop(
                             );
                             let session_name = session.name.clone();
                             let db = engine.db().cloned();
-                            tokio::task::spawn_blocking(move || {
-                                match crate::diff::get_worktree_diff(&wt_path, &leader_ref, false) {
+                            let cache_handle = tokio::task::spawn_blocking(move || {
+                                // Use base_commit for direct diff if available, otherwise fall back to merge-base
+                                let diff_result = if let Some(ref base) = base_commit {
+                                    crate::diff::get_worktree_diff_from_commit(&wt_path, base)
+                                } else {
+                                    crate::diff::get_worktree_diff(&wt_path, &leader_ref, true)
+                                };
+                                match diff_result {
                                     Ok(data) => {
                                         let file_summary: Vec<legion_db::FileDiffSummary> = data.files.iter().map(|f| {
                                             legion_db::FileDiffSummary {
@@ -450,6 +487,11 @@ async fn run_event_loop(
                                     }
                                 }
                             });
+                            // Wait for diff caching to complete (with timeout)
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                cache_handle,
+                            ).await;
                         }
                     }
 
@@ -464,6 +506,22 @@ async fn run_event_loop(
                 if app.panes[wi].sdk_task.is_none() {
                     if let Some(ts) = engine.take_next(wi as u16).await {
                         tracing::info!("Worker {} taking ticket {}", wi, ts.id);
+                        // Capture base commit before SDK starts making changes
+                        if let (Some(project_path), Some(session)) = (&app.project_path, &app.current_session) {
+                            let wt_path = crate::worktree::pane_worktree_path(
+                                project_path, &session.name, &format!("Worker {}", wi),
+                            );
+                            if let Ok(output) = std::process::Command::new("git")
+                                .args(["rev-parse", "HEAD"])
+                                .current_dir(&wt_path)
+                                .output()
+                            {
+                                if output.status.success() {
+                                    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                                    engine.set_base_commit(ts.id, commit).await;
+                                }
+                            }
+                        }
                         app.start_sdk_task(wi, ts.id, &ts.prompt, &ts.team_mode, 1, None,
                             ts.title.as_str(), ts.context.as_deref(), ts.criteria.as_deref());
                     }
@@ -478,33 +536,9 @@ async fn run_event_loop(
     Ok(())
 }
 
-/// Spawn a new worker: create proxy+control servers, worktree, add pane (SDK-based)
-async fn handle_add_worker(app: &mut App) {
-    let worker_id = app.next_worker_id;
-    app.next_worker_id += 1;
-
-    let label = format!("Worker {}", worker_id);
-    let base_port = app.base_port;
-    let proxy_port = base_port + worker_id;
-    let control_port = base_port + 1000 + worker_id;
-    tracing::info!("Adding worker '{}': proxy={}, control={}", label, proxy_port, control_port);
-
-    // Create and start proxy server
+/// Create and start proxy + control API servers for a worker pane.
+async fn start_worker_proxy(proxy_port: u16, control_port: u16, label: &str) {
     let proxy = ProxyServer::new(proxy_port);
-
-    // Apply current provider config to the new proxy
-    if let Some(provider) = app.current_provider.and_then(|i| app.providers.get(i)) {
-        if provider.id != "__default__" {
-            let config = legion_core::ProxyConfig {
-                target_url: Some(provider.base_url.clone()),
-                api_key: provider.api_key.clone(),
-                api_format: Some(provider.api_format.clone()),
-                model: app.current_model.clone(),
-            };
-            proxy.update_config(config).await;
-        }
-    }
-
     let (proxy_tx, proxy_rx) = tokio::sync::oneshot::channel();
     let proxy_config_ref = proxy.config_ref();
     tokio::spawn(async move {
@@ -521,11 +555,27 @@ async fn handle_add_worker(app: &mut App) {
         }
     });
 
-    // Wait briefly for servers to be ready
+    // Wait for servers to be ready
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         proxy_rx.await.ok();
         control_rx.await.ok();
     }).await;
+    tracing::info!("Proxy+control started for '{}': proxy={}, control={}", label, proxy_port, control_port);
+}
+
+/// Spawn a new worker: create proxy+control servers, worktree, add pane (SDK-based)
+async fn handle_add_worker(app: &mut App) {
+    let worker_id = app.next_worker_id;
+    app.next_worker_id += 1;
+
+    let label = format!("Worker {}", worker_id);
+    let base_port = app.base_port;
+    let proxy_port = base_port + worker_id;
+    let control_port = base_port + 1000 + worker_id;
+    tracing::info!("Adding worker '{}': proxy={}, control={}", label, proxy_port, control_port);
+
+    // Start proxy + control servers
+    start_worker_proxy(proxy_port, control_port, &label).await;
 
     // Create worktree for the new worker
     if let (Some(ref project_path), Some(ref session)) = (&app.project_path, &app.current_session) {
@@ -547,6 +597,7 @@ async fn handle_add_worker(app: &mut App) {
     } else {
         (app.current_provider, app.current_model.clone())
     };
+    let pane_model_for_config = pane_model.clone();
     app.panes.push(app::Pane {
         pty: None,
         proxy_port,
@@ -564,6 +615,28 @@ async fn handle_add_worker(app: &mut App) {
         scroll_offset: 0,
     });
 
+    // Apply the pane's provider config (from saved config), not app-level
+    if let Some(provider) = pane_provider.and_then(|i| app.providers.get(i)) {
+        if provider.id != "__default__" {
+            let body = serde_json::json!({
+                "target_url": provider.base_url,
+                "api_format": provider.api_format,
+                "api_key": provider.api_key,
+                "model": pane_model_for_config,
+            });
+            let client = reqwest::Client::new();
+            match client
+                .post(format!("http://127.0.0.1:{}/legion/config", control_port))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => tracing::info!("Worker '{}' proxy configured: {}", label, r.status()),
+                Err(e) => tracing::error!("Failed to configure proxy for '{}': {}", label, e),
+            }
+        }
+    }
+
     // Resize all panes to accommodate the new worker
     app.apply_resize();
 
@@ -571,6 +644,33 @@ async fn handle_add_worker(app: &mut App) {
     app.persist_worker_count();
 
     tracing::info!("Worker '{}' added successfully", label);
+}
+
+/// Send proxy configs to all worker panes synchronously (awaited, not fire-and-forget).
+/// Used after start_session to ensure proxy config is in place before SDK starts.
+async fn send_proxy_configs_sync(app: &App) {
+    let client = reqwest::Client::new();
+    for pane in &app.panes {
+        let provider = match pane.current_provider.and_then(|i| app.providers.get(i)) {
+            Some(p) if p.id != "__default__" => p,
+            _ => continue,
+        };
+        let body = serde_json::json!({
+            "target_url": provider.base_url,
+            "api_format": provider.api_format,
+            "api_key": provider.api_key,
+            "model": pane.current_model,
+        });
+        match client
+            .post(format!("http://127.0.0.1:{}/legion/config", pane.control_port))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => tracing::info!("Worker '{}' proxy configured: {}", pane.label, r.status()),
+            Err(e) => tracing::error!("Failed to configure proxy for '{}': {}", pane.label, e),
+        }
+    }
 }
 
 /// Read leader context status from the statusLine hook output file.

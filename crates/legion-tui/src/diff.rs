@@ -50,15 +50,19 @@ pub fn get_worktree_diff(
 
     let mut raw_diff = committed_diff;
 
-    // For Working tickets, also get uncommitted changes
-    if include_uncommitted {
+    // Fallback: capture uncommitted changes only when committed diff is empty
+    // This prevents cross-ticket contamination when multiple tickets share a worker
+    if include_uncommitted && raw_diff.trim().is_empty() {
+        // Mark untracked files as intent-to-add so they appear in git diff
+        let _ = Command::new("git")
+            .args(["add", "-N", "."])
+            .current_dir(worktree_path)
+            .output();
+
         // Staged changes
         let staged = run_git_diff(worktree_path, &["--cached", "--unified=3"])?;
         if !staged.is_empty() {
-            if !raw_diff.is_empty() {
-                raw_diff.push('\n');
-            }
-            raw_diff.push_str(&staged);
+            raw_diff = staged;
         }
 
         // Unstaged changes
@@ -73,6 +77,47 @@ pub fn get_worktree_diff(
 
     let files = parse_diff(&raw_diff);
 
+    Ok(DiffData { files, raw_diff })
+}
+
+/// Get diff for a worker worktree from a specific base commit to HEAD.
+/// More reliable than merge-base approach since it uses the exact commit
+/// captured when the worker started processing the ticket.
+/// If no committed changes found, falls back to capturing uncommitted changes
+/// (worker may have forgotten to commit).
+pub fn get_worktree_diff_from_commit(
+    worktree_path: &Path,
+    base_commit: &str,
+) -> Result<DiffData> {
+    let mut raw_diff = run_git_diff(worktree_path, &[&format!("{}..HEAD", base_commit), "--unified=3"])?;
+
+    // Only capture uncommitted changes as fallback when no committed changes exist.
+    // This prevents showing other tickets' uncommitted work when multiple tickets
+    // share the same worker worktree.
+    if raw_diff.trim().is_empty() {
+        // Mark untracked files as intent-to-add so they appear in git diff
+        let _ = Command::new("git")
+            .args(["add", "-N", "."])
+            .current_dir(worktree_path)
+            .output();
+
+        // Staged changes
+        let staged = run_git_diff(worktree_path, &["--cached", "--unified=3"])?;
+        if !staged.is_empty() {
+            raw_diff = staged;
+        }
+
+        // Unstaged changes (includes intent-to-add files)
+        let unstaged = run_git_diff(worktree_path, &["--unified=3"])?;
+        if !unstaged.is_empty() {
+            if !raw_diff.is_empty() {
+                raw_diff.push('\n');
+            }
+            raw_diff.push_str(&unstaged);
+        }
+    }
+
+    let files = parse_diff(&raw_diff);
     Ok(DiffData { files, raw_diff })
 }
 
@@ -107,7 +152,7 @@ fn run_git_diff(worktree_path: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// Parse unified diff output into structured DiffFile entries
-fn parse_diff(raw: &str) -> Vec<DiffFile> {
+pub fn parse_diff(raw: &str) -> Vec<DiffFile> {
     let mut files: Vec<DiffFile> = Vec::new();
     let mut current_path = String::new();
     let mut current_status = String::from("M");

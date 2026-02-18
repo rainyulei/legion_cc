@@ -156,7 +156,7 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
         id: "github_copilot",
         name: "GitHub Copilot",
         base_url: "https://api.githubcopilot.com",
-        api_format: "anthropic_bearer",
+        api_format: "github_copilot",
         models: &["claude-sonnet-4-5-20250929", "claude-opus-4-6", "gpt-4o"],
         env_var: "GITHUB_TOKEN",
         auth_method: "device_flow",
@@ -302,6 +302,7 @@ pub struct App {
     pub pending_orchestrate_port: Option<u16>,
 
     // Dynamic worker management
+    pub pending_worker_proxies: Vec<(u16, u16, String)>,  // (proxy_port, control_port, label) queued by start_session
     pub pending_set_worker_count: Option<u16>,  // target worker count to apply
     pub set_worker_count_selection: u16,         // currently selected number in popup
     pub pending_sync_max_iterations: bool,
@@ -344,6 +345,8 @@ pub struct App {
     pub recovery_choice: usize,                   // 0-3 selected option
     pub branch_list: Vec<String>,                 // cached local branches
     pub branch_list_index: usize,                 // selected branch in list
+    pub new_session_branch_index: usize,          // selected branch index in new session popup
+    pub new_session_branch_focused: bool,         // true = branch selector focused, false = name input
 
     // Runtime branch change detection
     pub last_branch_check: Option<std::time::Instant>,
@@ -356,6 +359,9 @@ pub struct App {
     pub diff_scroll: usize,
     pub diff_loading: bool,
     pub diff_error: Option<String>,
+
+    // Orchestrate API shutdown handle
+    pub orchestrate_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 
     // Copilot device auth flow state
     pub copilot_auth_status: CopilotAuthStatus,
@@ -410,6 +416,7 @@ impl App {
             base_port: 0,
             requested_workers: 0,
             pending_orchestrate_port: None,
+            pending_worker_proxies: Vec::new(),
             pending_set_worker_count: None,
             set_worker_count_selection: 2,
             pending_sync_max_iterations: false,
@@ -436,6 +443,8 @@ impl App {
             recovery_choice: 0,
             branch_list: Vec::new(),
             branch_list_index: 0,
+            new_session_branch_index: 0,
+            new_session_branch_focused: false,
             last_branch_check: None,
             branch_changed_to: None,
             diff_ticket_id: 0,
@@ -444,6 +453,7 @@ impl App {
             diff_scroll: 0,
             diff_loading: false,
             diff_error: None,
+            orchestrate_shutdown: None,
             copilot_auth_status: CopilotAuthStatus::RequestingCode,
             copilot_auth_rx: None,
             copilot_user_code: None,
@@ -1043,6 +1053,14 @@ impl App {
             });
         }
 
+        // Queue proxy creation for each worker pane (consumed in event loop)
+        for i in 0..worker_count {
+            let proxy = base_port + i + 1;
+            let control = base_port + 1000 + i + 1;
+            let label = format!("Worker {}", i + 1);
+            self.pending_worker_proxies.push((proxy, control, label));
+        }
+
         // Track next worker ID for dynamic add
         self.next_worker_id = worker_count + 1;
 
@@ -1115,13 +1133,14 @@ impl App {
             let orchestrate_port = self.base_port + 2000;
             let worker_id: Option<u16> = if i > 0 { Some(i as u16) } else { None };
             let skip_perms = i > 0;
+            let use_proxy = self.pane_uses_proxy(&label);
+            let working_dir = self.pane_worktree(&label);
             let prompt = if i == 0 {
                 crate::claudemd::leader_instructions(worker_count)
             } else {
-                crate::claudemd::worker_instructions(i as u16)
+                let wd_str = working_dir.as_ref().map(|p| p.to_string_lossy().to_string());
+                crate::claudemd::worker_instructions(i as u16, wd_str.as_deref())
             };
-            let use_proxy = self.pane_uses_proxy(&label);
-            let working_dir = self.pane_worktree(&label);
 
             match crate::pty::PtyHandle::spawn(
                 rows, cols, proxy_port, control_port,
@@ -1501,8 +1520,14 @@ impl App {
         criteria: Option<&str>,
     ) {
         // Compute values before mutable borrow
-        let working_dir = self.pane_worktree(&self.panes[pane_index].label.clone());
-        let use_proxy = self.pane_uses_proxy(&self.panes[pane_index].label.clone());
+        let pane_label = self.panes[pane_index].label.clone();
+        let working_dir = self.pane_worktree(&pane_label);
+        tracing::info!(
+            "SDK task: pane_index={}, label={:?}, working_dir={:?}, project_path={:?}, session={:?}",
+            pane_index, pane_label, working_dir,
+            self.project_path, self.current_session.as_ref().map(|s| &s.name)
+        );
+        let use_proxy = self.pane_uses_proxy(&pane_label);
         let proxy_port = self.panes[pane_index].proxy_port;
 
         // Create SDK parser
@@ -1514,10 +1539,11 @@ impl App {
         ));
 
         // Generate system prompt based on team mode
+        let wd_str = working_dir.as_ref().map(|p| p.to_string_lossy().to_string());
         let sys_prompt = match team_mode {
             legion_core::TeamMode::TechLeadTeam => {
                 let worker_id = pane_index as u16;
-                crate::claudemd::worker_instructions(worker_id)
+                crate::claudemd::worker_instructions(worker_id, wd_str.as_deref())
             }
             legion_core::TeamMode::Solo => {
                 "You are a solo developer. Follow TDD: write failing tests first, then implement. Run tests to verify. Output <promise>DONE</promise> when complete.".to_string()
@@ -1528,7 +1554,20 @@ impl App {
         };
 
         // Build structured effective prompt with title, context, and criteria
-        let structured_prompt = build_structured_prompt(title, prompt, context, criteria);
+        // Prepend working directory instruction directly in the user prompt (higher priority than system prompt)
+        let wd_prefix = if let Some(ref wd) = working_dir {
+            format!(
+                "IMPORTANT: Your working directory is `{}`. Run `pwd` first to confirm. Create ALL files here using relative paths (e.g. `./heart.py`). NEVER use `cd ~` or `cd /Users/...` or any absolute path outside this directory.\n\n",
+                wd.display()
+            )
+        } else {
+            String::new()
+        };
+        let structured_prompt = format!("{}{}", wd_prefix, build_structured_prompt(title, prompt, context, criteria));
+
+        // DEBUG: dump system prompt to file for verification
+        let _ = std::fs::write("/tmp/legion-debug-sysprompt.txt", &sys_prompt);
+        let _ = std::fs::write("/tmp/legion-debug-wd.txt", format!("working_dir={:?}\nwd_str={:?}\npane_label={}\npane_index={}", working_dir, wd_str, pane_label, pane_index));
 
         let wd = working_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
 

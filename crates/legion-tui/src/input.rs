@@ -107,14 +107,14 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
                             | legion_core::orchestrate::engine::TicketStatus::Done
                             | legion_core::orchestrate::engine::TicketStatus::Error
                         ) {
-                            Some((t.id, t.status, t.assigned_worker))
+                            Some((t.id, t.status, t.assigned_worker, t.base_commit.clone()))
                         } else {
                             None
                         }
                     })
                 });
-                if let Some((tid, status, worker)) = ticket_info {
-                    open_file_diff(app, tid, &status, worker);
+                if let Some((tid, status, worker, base_commit)) = ticket_info {
+                    open_file_diff(app, tid, &status, worker, base_commit);
                 }
                 return InputResult::Continue;
             }
@@ -382,8 +382,9 @@ fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
         KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
         KeyCode::Char('n') => {
-            // Open new session input popup
+            // Open new session input popup with branch selector
             app.session_name_input = app.default_session_name();
+            init_new_session_branch_list(app);
             app.mode = AppMode::Popup(PopupMenu::NewSessionInput);
         }
         KeyCode::Char('d') => {
@@ -434,8 +435,9 @@ fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             if app.session_list_index >= app.session_list.len() {
-                // "New Session" selected → show text input with default name
+                // "New Session" selected → show text input with branch selector
                 app.session_name_input = app.default_session_name();
+                init_new_session_branch_list(app);
                 app.mode = AppMode::Popup(PopupMenu::NewSessionInput);
             } else {
                 // Resume existing session
@@ -460,6 +462,11 @@ fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
                 match app.start_session(&session.name, workers, true, is_default) {
                     Ok(()) => {
                         tracing::info!("Resumed session: {}", session.name);
+                        // Sync detected_branch/commit from the resumed session
+                        if let Some(ref current) = app.current_session {
+                            app.detected_branch = current.base_branch.clone();
+                            app.detected_commit = current.base_commit.clone();
+                        }
                         update_proxy_config(app);
                         app.mode = AppMode::Normal;
                     }
@@ -502,34 +509,64 @@ fn handle_new_session_input_keys(app: &mut App, key: KeyEvent) {
             // Go back to session list
             app.session_name_input.clear();
             app.session_error = None;
+            app.new_session_branch_focused = false;
             app.load_session_list();
             app.mode = AppMode::Popup(PopupMenu::SessionList);
             app.session_list_index = 0;
         }
+        KeyCode::Tab | KeyCode::BackTab => {
+            // Toggle focus between branch selector and name input
+            app.new_session_branch_focused = !app.new_session_branch_focused;
+        }
         KeyCode::Enter => {
-            let name = app.session_name_input.trim().to_string();
-            if !name.is_empty() {
-                let workers = app.requested_workers;
-                let is_default = app.creating_default_session;
-                match app.start_session(&name, workers, false, is_default) {
-                    Ok(()) => {
-                        tracing::info!("Created new session: {}", name);
-                        app.session_name_input.clear();
-                        app.creating_default_session = false;
-                        update_proxy_config(app);
-                        app.mode = AppMode::Normal;
+            if app.new_session_branch_focused {
+                // On branch: Enter confirms branch, switch focus to name
+                app.new_session_branch_focused = false;
+            } else {
+                // On name: create session
+                let name = app.session_name_input.trim().to_string();
+                if !name.is_empty() {
+                    // Set detected_branch to selected branch
+                    if app.new_session_branch_index < app.branch_list.len() {
+                        let branch = app.branch_list[app.new_session_branch_index].clone();
+                        app.detected_branch = Some(branch);
+                        if let Some(ref project_path) = app.project_path {
+                            app.detected_commit = crate::worktree::current_commit(project_path);
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to create session '{}': {}", name, e);
-                        app.session_error = Some(format!("{}", e));
+                    let workers = app.requested_workers;
+                    let is_default = app.creating_default_session;
+                    match app.start_session(&name, workers, false, is_default) {
+                        Ok(()) => {
+                            tracing::info!("Created new session: {}", name);
+                            app.session_name_input.clear();
+                            app.creating_default_session = false;
+                            app.new_session_branch_focused = false;
+                            update_proxy_config(app);
+                            app.mode = AppMode::Normal;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create session '{}': {}", name, e);
+                            app.session_error = Some(format!("{}", e));
+                        }
                     }
                 }
             }
         }
-        KeyCode::Backspace => {
+        KeyCode::Up | KeyCode::Char('k') if app.new_session_branch_focused => {
+            if app.new_session_branch_index > 0 {
+                app.new_session_branch_index -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') if app.new_session_branch_focused => {
+            if app.new_session_branch_index < app.branch_list.len().saturating_sub(1) {
+                app.new_session_branch_index += 1;
+            }
+        }
+        KeyCode::Backspace if !app.new_session_branch_focused => {
             app.session_name_input.pop();
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if !app.new_session_branch_focused => {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && (c.is_alphanumeric() || c == '-' || c == '_')
             {
@@ -538,6 +575,18 @@ fn handle_new_session_input_keys(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// Load branch list and pre-select detected_branch for new session popup
+fn init_new_session_branch_list(app: &mut App) {
+    if let Some(ref project_path) = app.project_path {
+        app.branch_list = crate::worktree::list_local_branches(project_path);
+    }
+    app.new_session_branch_index = app.detected_branch.as_ref()
+        .and_then(|db| app.branch_list.iter().position(|b| b == db))
+        .unwrap_or(0);
+    app.new_session_branch_focused = true; // start with branch selector focused
+    app.session_error = None;
 }
 
 fn handle_remove_worker_list_keys(app: &mut App, key: KeyEvent) {
@@ -746,12 +795,32 @@ fn handle_max_retries_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Build ticket IDs in the same visual order as the board renders them:
+/// Working → Queued → Done → Error (matching ui.rs render_squad_board)
+fn board_visual_order(tickets: &[legion_core::orchestrate::engine::TicketSnapshot]) -> Vec<usize> {
+    use legion_core::orchestrate::engine::TicketStatus;
+    let mut ids = Vec::new();
+    for t in tickets.iter().filter(|t| t.status == TicketStatus::Working) {
+        ids.push(t.id);
+    }
+    for t in tickets.iter().filter(|t| t.status == TicketStatus::Queued) {
+        ids.push(t.id);
+    }
+    for t in tickets.iter().filter(|t| t.status == TicketStatus::Done) {
+        ids.push(t.id);
+    }
+    for t in tickets.iter().filter(|t| t.status == TicketStatus::Error) {
+        ids.push(t.id);
+    }
+    ids
+}
+
 fn navigate_ticket_down(app: &mut App) {
     if let Some(ref tickets) = app.ticket_snapshot {
         if tickets.is_empty() {
             return;
         }
-        let ids: Vec<usize> = tickets.iter().map(|t| t.id).collect();
+        let ids = board_visual_order(tickets);
         let current_pos = ids.iter().position(|&id| id == app.board_selected).unwrap_or(0);
         let next = if current_pos + 1 < ids.len() {
             current_pos + 1
@@ -767,7 +836,7 @@ fn navigate_ticket_up(app: &mut App) {
         if tickets.is_empty() {
             return;
         }
-        let ids: Vec<usize> = tickets.iter().map(|t| t.id).collect();
+        let ids = board_visual_order(tickets);
         let current_pos = ids.iter().position(|&id| id == app.board_selected).unwrap_or(0);
         let prev = if current_pos > 0 {
             current_pos - 1
@@ -814,11 +883,15 @@ fn update_proxy_config(app: &App) {
                 "api_key": api_key,
                 "model": model,
             });
-            let _ = client
+            match client
                 .post(format!("http://127.0.0.1:{}/legion/config", port))
                 .json(&body)
                 .send()
-                .await;
+                .await
+            {
+                Ok(resp) => tracing::debug!("Proxy config sent to port {}: {}", port, resp.status()),
+                Err(e) => tracing::error!("Failed to send proxy config to port {}: {}", port, e),
+            }
         }
     });
 }
@@ -991,6 +1064,7 @@ fn open_file_diff(
     ticket_id: usize,
     status: &legion_core::orchestrate::engine::TicketStatus,
     assigned_worker: Option<u16>,
+    base_commit: Option<String>,
 ) {
     app.diff_ticket_id = ticket_id;
     app.diff_file_selected = 0;
@@ -1009,38 +1083,56 @@ fn open_file_diff(
             if let Some(db_arc) = engine.db() {
                 if let Ok(db) = db_arc.lock() {
                     if let Ok(Some(cached)) = db.get_ticket_diff(ticket_id as i64) {
-                        // Rebuild DiffData from cached
-                        let files = cached.file_summary.iter().map(|fs| {
-                            crate::diff::DiffFile {
-                                path: fs.path.clone(),
-                                status: fs.status.clone(),
-                                additions: fs.additions,
-                                deletions: fs.deletions,
-                                diff_lines: Vec::new(), // will extract from raw
-                            }
-                        }).collect::<Vec<_>>();
-                        // Re-parse to get per-file diff lines
-                        let data = crate::diff::parse_raw_diff_with_summary(&cached.diff_content, files);
-                        app.diff_data = Some(data);
-                        app.diff_loading = false;
-                        return;
+                        if !cached.diff_content.trim().is_empty() {
+                            // Rebuild DiffData from cached
+                            let files: Vec<_> = if cached.file_summary.is_empty() {
+                                // file_summary was empty but raw diff has content — parse directly
+                                crate::diff::parse_diff(&cached.diff_content)
+                            } else {
+                                let summary_files = cached.file_summary.iter().map(|fs| {
+                                    crate::diff::DiffFile {
+                                        path: fs.path.clone(),
+                                        status: fs.status.clone(),
+                                        additions: fs.additions,
+                                        deletions: fs.deletions,
+                                        diff_lines: Vec::new(),
+                                    }
+                                }).collect::<Vec<_>>();
+                                let data = crate::diff::parse_raw_diff_with_summary(&cached.diff_content, summary_files);
+                                data.files
+                            };
+                            app.diff_data = Some(crate::diff::DiffData {
+                                files,
+                                raw_diff: cached.diff_content,
+                            });
+                            app.diff_loading = false;
+                            return;
+                        }
+                        // Cached diff was empty — fall through to git diff
                     }
                 }
             }
         }
     }
 
-    // Real-time fetch from git
-    let include_uncommitted = matches!(status, legion_core::orchestrate::engine::TicketStatus::Working);
+    // Real-time fetch from git — always include uncommitted changes
+    // Workers may forget to commit, so we need to capture untracked/unstaged files too
+    let include_uncommitted = true;
     if let (Some(project_path), Some(session)) = (&app.project_path, &app.current_session) {
         if let Some(worker_id) = assigned_worker {
             let wt_path = crate::worktree::pane_worktree_path(
                 project_path, &session.name, &format!("Worker {}", worker_id),
             );
-            let leader_ref = crate::diff::get_leader_ref(
-                project_path, &session.name, session.is_default,
-            );
-            match crate::diff::get_worktree_diff(&wt_path, &leader_ref, include_uncommitted) {
+            // Use base_commit for accurate diff if available
+            let diff_result = if let Some(ref base) = base_commit {
+                crate::diff::get_worktree_diff_from_commit(&wt_path, base)
+            } else {
+                let leader_ref = crate::diff::get_leader_ref(
+                    project_path, &session.name, session.is_default,
+                );
+                crate::diff::get_worktree_diff(&wt_path, &leader_ref, include_uncommitted)
+            };
+            match diff_result {
                 Ok(data) => {
                     app.diff_data = Some(data);
                     app.diff_loading = false;
@@ -1125,6 +1217,11 @@ fn resume_session(app: &mut App, session: &legion_db::SquadSession) {
     match app.start_session(&session.name, workers, true, is_default) {
         Ok(()) => {
             tracing::info!("Resumed session: {}", session.name);
+            // Sync detected_branch/commit from the session being resumed
+            if let Some(ref current) = app.current_session {
+                app.detected_branch = current.base_branch.clone();
+                app.detected_commit = current.base_commit.clone();
+            }
             update_proxy_config(app);
             app.mode = AppMode::Normal;
         }
