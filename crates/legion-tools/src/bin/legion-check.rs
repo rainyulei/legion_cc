@@ -102,18 +102,19 @@ fn main() {
 
         for t in &group_tickets {
             let ticket_id = t
-                .get("ticket_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
+                .get("id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_string());
             let title = t
                 .get("title")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let ticket_text = t
-                .get("ticket")
+                .get("prompt")
                 .and_then(|v| v.as_str())
                 .unwrap_or("-");
-            let worker = t.get("worker_id").and_then(|v| v.as_u64());
+            let worker = t.get("assigned_worker").and_then(|v| v.as_u64());
             let elapsed = t.get("elapsed_secs").and_then(|v| v.as_u64()).unwrap_or(0);
 
             let display_ticket = if !title.is_empty() {

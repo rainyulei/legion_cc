@@ -45,34 +45,43 @@ fn main() {
         }
     };
 
-    let workers = match parsed.get("workers").and_then(|w| w.as_array()) {
-        Some(w) => w,
+    let tickets = match parsed.get("tickets").and_then(|t| t.as_array()) {
+        Some(t) => t,
         None => {
             eprintln!("Error: unexpected response format");
             process::exit(1);
         }
     };
 
+    if tickets.is_empty() {
+        println!("No tickets.");
+        return;
+    }
+
     let mut parts: Vec<String> = Vec::new();
 
-    for w in workers {
-        let id = w.get("worker_id").and_then(|v| v.as_u64()).unwrap_or(0);
-        let status_str = w
+    for t in tickets {
+        let id = t.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let status_str = t
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
+        let worker = t.get("assigned_worker").and_then(|v| v.as_u64());
 
         let badge = match status_str {
             "done" => "OK",
             "working" => "..",
-            "pending" => "??",
+            "queued" => "??",
             "error" => "!!",
-            "stopped" => "XX",
-            "idle" => "--",
             _ => "??",
         };
 
-        parts.push(format!("W{}[{}]", id, badge));
+        let worker_str = match worker {
+            Some(w) => format!("W{}", w),
+            None => format!("#{}", id),
+        };
+
+        parts.push(format!("{}[{}]", worker_str, badge));
     }
 
     println!("{}", parts.join(" "));

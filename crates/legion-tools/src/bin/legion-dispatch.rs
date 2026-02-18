@@ -1,6 +1,6 @@
 //! legion-dispatch — Submit a ticket to the orchestrate queue
 //!
-//! Usage: legion-dispatch <worker_id> [-t "title"] [-c "context"] [-k "criteria"] "ticket text"
+//! Usage: legion-dispatch <worker_id> [-t "title"] [-c "context"] [-k "criteria"] [--after 1,3] "ticket text"
 //! POSTs to /legion/orchestrate/submit with structured fields.
 //! (worker_id is kept for CLI compat but ignored by queue)
 
@@ -18,7 +18,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] [-c \"context\"] [-k \"criteria\"] \"ticket text\"");
+        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] [-c \"context\"] [-k \"criteria\"] [--after 1,3] \"ticket text\"");
         process::exit(1);
     }
 
@@ -34,6 +34,7 @@ fn main() {
     let mut title: Option<String> = None;
     let mut context: Option<String> = None;
     let mut criteria: Option<String> = None;
+    let mut after: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 2;
@@ -51,25 +52,29 @@ fn main() {
                 i += 1;
                 if i < args.len() { criteria = Some(args[i].clone()); }
             }
+            "-a" | "--after" => {
+                i += 1;
+                if i < args.len() { after = Some(args[i].clone()); }
+            }
             _ => positional.push(args[i].clone()),
         }
         i += 1;
     }
 
     if positional.is_empty() {
-        eprintln!("Usage: legion-dispatch <worker_id> -t \"title\" -c \"context\" -k \"criteria\" \"ticket text\"");
+        eprintln!("Usage: legion-dispatch <worker_id> -t \"title\" -c \"context\" -k \"criteria\" [--after 1,3] \"ticket text\"");
         process::exit(1);
     }
 
     if context.is_none() {
         eprintln!("Error: -c/--context is required. Provide working directory, language, related files, etc.");
-        eprintln!("Example: legion-dispatch 1 -t \"Add login\" -c \"Rust project in ./backend, uses axum\" -k \"tests pass\" \"implement login\"");
+        eprintln!("Example: legion-dispatch 1 -t \"Add login\" -c \"Rust project in ./backend, uses axum\" -k \"tests pass\" [--after 1,3] \"implement login\"");
         process::exit(1);
     }
 
     if criteria.is_none() {
         eprintln!("Error: -k/--criteria is required. Provide specific, testable success conditions.");
-        eprintln!("Example: legion-dispatch 1 -t \"Add login\" -c \"Rust project in ./backend\" -k \"POST /login returns JWT, cargo test passes\" \"implement login\"");
+        eprintln!("Example: legion-dispatch 1 -t \"Add login\" -c \"Rust project in ./backend\" -k \"POST /login returns JWT, cargo test passes\" --after 1,2 \"implement login\"");
         process::exit(1);
     }
 
@@ -99,6 +104,14 @@ fn main() {
     }
     if let Some(crit) = &criteria {
         body["criteria"] = serde_json::Value::String(crit.clone());
+    }
+    if let Some(after_str) = &after {
+        let blocked_by: Vec<u64> = after_str.split(',')
+            .filter_map(|s| s.trim().parse::<u64>().ok())
+            .collect();
+        if !blocked_by.is_empty() {
+            body["blocked_by"] = serde_json::json!(blocked_by);
+        }
     }
 
     match ureq::post(&url)

@@ -144,6 +144,8 @@ async fn handle_submit(
         team_mode: Option<super::engine::TeamMode>,
         #[serde(default)]
         max_iterations: Option<u16>,
+        #[serde(default)]
+        blocked_by: Vec<usize>,
     }
 
     match serde_json::from_slice::<SubmitRequest>(&body_bytes) {
@@ -154,7 +156,7 @@ async fn handle_submit(
                 _ => engine.default_max_iterations().await,
             };
             let id = match engine
-                .submit_ticket(req.title, req.ticket, req.context, req.criteria, mode, max_iter, Vec::new())
+                .submit_ticket(req.title, req.ticket, req.context, req.criteria, mode, max_iter, req.blocked_by)
                 .await {
                     Ok(id) => id,
                     Err(e) => return Ok(json_response(StatusCode::BAD_REQUEST, &format!(r#"{{"error": "{}"}}"#, e))),
