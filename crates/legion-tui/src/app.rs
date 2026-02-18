@@ -1565,10 +1565,6 @@ impl App {
         };
         let structured_prompt = format!("{}{}", wd_prefix, build_structured_prompt(title, prompt, context, criteria));
 
-        // DEBUG: dump system prompt to file for verification
-        let _ = std::fs::write("/tmp/legion-debug-sysprompt.txt", &sys_prompt);
-        let _ = std::fs::write("/tmp/legion-debug-wd.txt", format!("working_dir={:?}\nwd_str={:?}\npane_label={}\npane_index={}", working_dir, wd_str, pane_label, pane_index));
-
         let wd = working_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
 
         // Per-ticket log buffer: reuse for retry iterations (and retries), create new for fresh ticket
