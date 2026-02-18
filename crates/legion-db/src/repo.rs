@@ -76,6 +76,26 @@ pub struct FileDiffSummary {
     pub deletions: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Role {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub prompt_template: String,
+    pub is_builtin: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Team {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub role_ids: Vec<String>,
+    pub is_builtin: bool,
+    pub created_at: i64,
+}
+
 pub struct TicketDiffRow {
     pub ticket_id: i64,
     pub session_name: String,
@@ -664,6 +684,149 @@ impl Repository {
         )?;
         Ok(())
     }
+
+    // Role methods
+
+    pub fn list_roles(&self) -> Result<Vec<Role>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, prompt_template, is_builtin, created_at FROM roles ORDER BY name"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Role {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                prompt_template: row.get(3)?,
+                is_builtin: row.get::<_, i32>(4)? != 0,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_role(&self, id: &str) -> Result<Option<Role>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, prompt_template, is_builtin, created_at FROM roles WHERE id = ?"
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Role {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                prompt_template: row.get(3)?,
+                is_builtin: row.get::<_, i32>(4)? != 0,
+                created_at: row.get(5)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn upsert_role(&self, role: &Role) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO roles (id, name, description, prompt_template, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                role.id,
+                role.name,
+                role.description,
+                role.prompt_template,
+                role.is_builtin as i32,
+                role.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_role(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM roles WHERE id = ? AND is_builtin = 0",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    // Team methods
+
+    pub fn list_teams(&self) -> Result<Vec<Team>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, role_ids, is_builtin, created_at FROM teams ORDER BY name"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let role_ids_json: String = row.get(3)?;
+            let role_ids: Vec<String> = serde_json::from_str(&role_ids_json).unwrap_or_default();
+            Ok(Team {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                role_ids,
+                is_builtin: row.get::<_, i32>(4)? != 0,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_team(&self, id: &str) -> Result<Option<Team>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, role_ids, is_builtin, created_at FROM teams WHERE id = ?"
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            let role_ids_json: String = row.get(3)?;
+            let role_ids: Vec<String> = serde_json::from_str(&role_ids_json).unwrap_or_default();
+            Ok(Some(Team {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                role_ids,
+                is_builtin: row.get::<_, i32>(4)? != 0,
+                created_at: row.get(5)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn upsert_team(&self, team: &Team) -> Result<()> {
+        let role_ids_json = serde_json::to_string(&team.role_ids)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO teams (id, name, description, role_ids, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                team.id,
+                team.name,
+                team.description,
+                role_ids_json,
+                team.is_builtin as i32,
+                team.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_team(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM teams WHERE id = ? AND is_builtin = 0",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_team_roles(&self, team_id: &str) -> Result<Vec<Role>> {
+        let team = self.get_team(team_id)?;
+        match team {
+            Some(t) => {
+                let mut roles = Vec::new();
+                for role_id in &t.role_ids {
+                    if let Some(role) = self.get_role(role_id)? {
+                        roles.push(role);
+                    }
+                }
+                Ok(roles)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -989,5 +1152,198 @@ mod tests {
 
         // Verify pending count
         assert_eq!(repo.count_pending_tickets("new-sess").unwrap(), 3);
+    }
+
+    #[test]
+    fn seed_roles_exist() {
+        let repo = test_repo();
+
+        let roles = repo.list_roles().unwrap();
+        assert_eq!(roles.len(), 6);
+
+        // Check that all expected roles exist
+        let role_ids: Vec<String> = roles.iter().map(|r| r.id.clone()).collect();
+        assert!(role_ids.contains(&"tech_lead".to_string()));
+        assert!(role_ids.contains(&"engineer".to_string()));
+        assert!(role_ids.contains(&"qa".to_string()));
+        assert!(role_ids.contains(&"pm".to_string()));
+        assert!(role_ids.contains(&"architect".to_string()));
+        assert!(role_ids.contains(&"devops".to_string()));
+
+        // Verify all are builtin
+        for role in &roles {
+            assert!(role.is_builtin);
+        }
+    }
+
+    #[test]
+    fn seed_teams_exist() {
+        let repo = test_repo();
+
+        let teams = repo.list_teams().unwrap();
+        assert_eq!(teams.len(), 5);
+
+        // Check that all expected teams exist
+        let team_ids: Vec<String> = teams.iter().map(|t| t.id.clone()).collect();
+        assert!(team_ids.contains(&"tech_lead_team".to_string()));
+        assert!(team_ids.contains(&"fullstack_team".to_string()));
+        assert!(team_ids.contains(&"backend_team".to_string()));
+        assert!(team_ids.contains(&"qa_team".to_string()));
+        assert!(team_ids.contains(&"solo".to_string()));
+
+        // Verify all are builtin
+        for team in &teams {
+            assert!(team.is_builtin);
+        }
+
+        // Verify solo team has empty role_ids
+        let solo = repo.get_team("solo").unwrap().unwrap();
+        assert_eq!(solo.role_ids.len(), 0);
+    }
+
+    #[test]
+    fn get_role_by_id() {
+        let repo = test_repo();
+
+        let tech_lead = repo.get_role("tech_lead").unwrap().unwrap();
+        assert_eq!(tech_lead.id, "tech_lead");
+        assert_eq!(tech_lead.name, "Tech Lead");
+        assert!(tech_lead.is_builtin);
+        assert!(tech_lead.prompt_template.contains("Tech Lead"));
+
+        // Non-existent role
+        assert!(repo.get_role("non_existent").unwrap().is_none());
+    }
+
+    #[test]
+    fn crud_custom_role() {
+        let repo = test_repo();
+
+        // Initial count
+        let initial_roles = repo.list_roles().unwrap();
+        assert_eq!(initial_roles.len(), 6);
+
+        // Insert custom role
+        let custom_role = Role {
+            id: "custom_role".into(),
+            name: "Custom Role".into(),
+            description: "A custom role".into(),
+            prompt_template: "You are a custom role.".into(),
+            is_builtin: false,
+            created_at: 12345,
+        };
+        repo.upsert_role(&custom_role).unwrap();
+
+        // Verify it exists
+        let roles = repo.list_roles().unwrap();
+        assert_eq!(roles.len(), 7);
+
+        let loaded = repo.get_role("custom_role").unwrap().unwrap();
+        assert_eq!(loaded.id, "custom_role");
+        assert_eq!(loaded.name, "Custom Role");
+        assert!(!loaded.is_builtin);
+
+        // Update it
+        let updated_role = Role {
+            id: "custom_role".into(),
+            name: "Updated Role".into(),
+            description: "Updated description".into(),
+            prompt_template: "Updated prompt.".into(),
+            is_builtin: false,
+            created_at: 12345,
+        };
+        repo.upsert_role(&updated_role).unwrap();
+
+        let loaded = repo.get_role("custom_role").unwrap().unwrap();
+        assert_eq!(loaded.name, "Updated Role");
+
+        // Delete it (only works for non-builtin)
+        repo.delete_role("custom_role").unwrap();
+        assert!(repo.get_role("custom_role").unwrap().is_none());
+
+        // Try to delete builtin (should not work)
+        repo.delete_role("tech_lead").unwrap();
+        assert!(repo.get_role("tech_lead").unwrap().is_some());
+    }
+
+    #[test]
+    fn crud_custom_team() {
+        let repo = test_repo();
+
+        // Initial count
+        let initial_teams = repo.list_teams().unwrap();
+        assert_eq!(initial_teams.len(), 5);
+
+        // Insert custom team
+        let custom_team = Team {
+            id: "custom_team".into(),
+            name: "Custom Team".into(),
+            description: "A custom team".into(),
+            role_ids: vec!["engineer".into(), "qa".into()],
+            is_builtin: false,
+            created_at: 12345,
+        };
+        repo.upsert_team(&custom_team).unwrap();
+
+        // Verify it exists
+        let teams = repo.list_teams().unwrap();
+        assert_eq!(teams.len(), 6);
+
+        let loaded = repo.get_team("custom_team").unwrap().unwrap();
+        assert_eq!(loaded.id, "custom_team");
+        assert_eq!(loaded.name, "Custom Team");
+        assert!(!loaded.is_builtin);
+        assert_eq!(loaded.role_ids, vec!["engineer", "qa"]);
+
+        // Update it
+        let updated_team = Team {
+            id: "custom_team".into(),
+            name: "Updated Team".into(),
+            description: "Updated description".into(),
+            role_ids: vec!["tech_lead".into()],
+            is_builtin: false,
+            created_at: 12345,
+        };
+        repo.upsert_team(&updated_team).unwrap();
+
+        let loaded = repo.get_team("custom_team").unwrap().unwrap();
+        assert_eq!(loaded.name, "Updated Team");
+        assert_eq!(loaded.role_ids, vec!["tech_lead"]);
+
+        // Delete it (only works for non-builtin)
+        repo.delete_team("custom_team").unwrap();
+        assert!(repo.get_team("custom_team").unwrap().is_none());
+
+        // Try to delete builtin (should not work)
+        repo.delete_team("tech_lead_team").unwrap();
+        assert!(repo.get_team("tech_lead_team").unwrap().is_some());
+    }
+
+    #[test]
+    fn get_team_roles_resolves() {
+        let repo = test_repo();
+
+        // Get tech_lead_team roles
+        let roles = repo.get_team_roles("tech_lead_team").unwrap();
+        assert_eq!(roles.len(), 3);
+
+        let role_ids: Vec<String> = roles.iter().map(|r| r.id.clone()).collect();
+        assert!(role_ids.contains(&"tech_lead".to_string()));
+        assert!(role_ids.contains(&"engineer".to_string()));
+        assert!(role_ids.contains(&"qa".to_string()));
+
+        // Verify actual Role objects
+        for role in &roles {
+            assert!(!role.name.is_empty());
+            assert!(!role.prompt_template.is_empty());
+        }
+
+        // Solo team should return empty
+        let solo_roles = repo.get_team_roles("solo").unwrap();
+        assert_eq!(solo_roles.len(), 0);
+
+        // Non-existent team
+        let non_existent_roles = repo.get_team_roles("non_existent").unwrap();
+        assert_eq!(non_existent_roles.len(), 0);
     }
 }

@@ -99,6 +99,24 @@ CREATE TABLE IF NOT EXISTS ticket_diffs (
     file_summary TEXT NOT NULL,
     cached_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS roles (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    prompt_template TEXT NOT NULL,
+    is_builtin INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS teams (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    role_ids TEXT NOT NULL,
+    is_builtin INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
 "#;
 
 pub fn init_db(conn: &Connection) -> Result<()> {
@@ -110,5 +128,52 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN last_active_at INTEGER", []);
     let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN max_iterations INTEGER", []);
     let _ = conn.execute("ALTER TABLE tickets ADD COLUMN origin_session TEXT", []);
+
+    // Seed roles
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let _ = conn.execute("INSERT OR IGNORE INTO roles (id, name, description, prompt_template, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["tech_lead", "Tech Lead", "Technical lead responsible for architecture and planning",
+         "You are the Tech Lead. Your approach: 1) Carefully analyze the requirements. 2) Design the architecture and identify components. 3) Break the work into concrete subtasks. 4) Review all code for correctness and edge cases. Focus on planning before implementation.", &now.to_string()]);
+
+    let _ = conn.execute("INSERT OR IGNORE INTO roles (id, name, description, prompt_template, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["engineer", "Engineer", "Software engineer responsible for implementation",
+         "You are the Engineer. Your approach: 1) Follow strict TDD - write a failing test first. 2) Implement the minimal code to pass the test. 3) Refactor for clarity. 4) Repeat until all requirements are met. Never skip writing tests.", &now.to_string()]);
+
+    let _ = conn.execute("INSERT OR IGNORE INTO roles (id, name, description, prompt_template, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["qa", "QA Engineer", "Quality assurance engineer responsible for testing",
+         "You are the QA Engineer. Your approach: 1) Read every acceptance criterion carefully. 2) Write tests for each criterion including edge cases and error paths. 3) Run the full test suite. 4) Report any failures with clear reproduction steps. Be thorough and skeptical.", &now.to_string()]);
+
+    let _ = conn.execute("INSERT OR IGNORE INTO roles (id, name, description, prompt_template, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["pm", "Product Manager", "Product manager responsible for requirements",
+         "You are the Product Manager. Your approach: 1) Evaluate requirements for completeness and clarity. 2) Identify missing edge cases from the user perspective. 3) Define clear acceptance criteria. 4) Validate the final result matches user intent.", &now.to_string()]);
+
+    let _ = conn.execute("INSERT OR IGNORE INTO roles (id, name, description, prompt_template, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["architect", "Architect", "System architect responsible for system design",
+         "You are the Architect. Your approach: 1) Evaluate the system design and technology choices. 2) Consider scalability, performance, and security implications. 3) Identify potential bottlenecks or vulnerabilities. 4) Document architectural decisions and trade-offs.", &now.to_string()]);
+
+    let _ = conn.execute("INSERT OR IGNORE INTO roles (id, name, description, prompt_template, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["devops", "DevOps Engineer", "DevOps engineer responsible for deployment",
+         "You are the DevOps Engineer. Your approach: 1) Set up reproducible build and deployment processes. 2) Write Dockerfiles or deployment scripts as needed. 3) Configure CI/CD pipelines. 4) Ensure monitoring and logging are in place.", &now.to_string()]);
+
+    // Seed teams
+    let _ = conn.execute("INSERT OR IGNORE INTO teams (id, name, description, role_ids, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["tech_lead_team", "Tech Lead Team", "Team with tech lead, engineer, and QA", r#"["tech_lead","engineer","qa"]"#, &now.to_string()]);
+
+    let _ = conn.execute("INSERT OR IGNORE INTO teams (id, name, description, role_ids, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["fullstack_team", "Fullstack Team", "Team with architect, engineer, and QA", r#"["architect","engineer","qa"]"#, &now.to_string()]);
+
+    let _ = conn.execute("INSERT OR IGNORE INTO teams (id, name, description, role_ids, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["backend_team", "Backend Team", "Team with tech lead and engineer", r#"["tech_lead","engineer"]"#, &now.to_string()]);
+
+    let _ = conn.execute("INSERT OR IGNORE INTO teams (id, name, description, role_ids, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["qa_team", "QA Team", "Team with QA and engineer", r#"["qa","engineer"]"#, &now.to_string()]);
+
+    let _ = conn.execute("INSERT OR IGNORE INTO teams (id, name, description, role_ids, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        ["solo", "Solo", "Solo mode with no team", "[]", &now.to_string()]);
+
     Ok(())
 }
