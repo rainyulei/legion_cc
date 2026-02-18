@@ -383,6 +383,17 @@ impl OrchestrateEngine {
         }
     }
 
+    /// Update the merge status for a ticket
+    pub async fn set_merge_status(&self, ticket_id: usize, status: MergeStatus) {
+        let mut guard = self.inner.write().await;
+        if let Some(ticket) = guard.tickets.iter_mut().find(|t| t.id == ticket_id) {
+            ticket.merge_status = status;
+            let snap = ticket.clone();
+            drop(guard);
+            self.persist_ticket_update(&snap);
+        }
+    }
+
     pub async fn report_iteration(
         &self, ticket_id: usize, success: bool, feedback: Option<String>,
     ) -> bool {

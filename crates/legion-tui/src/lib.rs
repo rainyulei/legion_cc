@@ -495,6 +495,25 @@ async fn run_event_loop(
                         }
                     }
 
+                    // Auto-merge: merge worker branch into leader (only for Done tickets)
+                    if promise_found {
+                        if let (Some(project_path), Some(session)) = (&app.project_path, &app.current_session) {
+                            let worker_label = format!("Worker {}", wi);
+                            match crate::worktree::merge_worker_into_leader(
+                                project_path, &session.name, &worker_label, session.is_default,
+                            ) {
+                                Ok(()) => {
+                                    tracing::info!("Auto-merged {} into leader", worker_label);
+                                    engine.set_merge_status(ticket_id, legion_core::MergeStatus::Merged).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Auto-merge failed for {}: {}", worker_label, e);
+                                    engine.set_merge_status(ticket_id, legion_core::MergeStatus::Conflict).await;
+                                }
+                            }
+                        }
+                    }
+
                     // Clean up finished SDK (log buffer stays in app.ticket_logs keyed by ticket_id)
                     app.panes[wi].sdk_task = None;
                     app.panes[wi].current_ticket_id = None;
@@ -506,11 +525,21 @@ async fn run_event_loop(
                 if app.panes[wi].sdk_task.is_none() {
                     if let Some(ts) = engine.take_next(wi as u16).await {
                         tracing::info!("Worker {} taking ticket {}", wi, ts.id);
-                        // Capture base commit before SDK starts making changes
+
                         if let (Some(project_path), Some(session)) = (&app.project_path, &app.current_session) {
+                            let worker_label = format!("Worker {}", wi);
                             let wt_path = crate::worktree::pane_worktree_path(
-                                project_path, &session.name, &format!("Worker {}", wi),
+                                project_path, &session.name, &worker_label,
                             );
+
+                            // Rebase worker worktree to leader's latest before starting
+                            if let Err(e) = crate::worktree::rebase_worker_from_leader(
+                                project_path, &session.name, &worker_label, session.is_default,
+                            ) {
+                                tracing::warn!("Worker {} rebase failed: {}", wi, e);
+                            }
+
+                            // Capture base commit after rebase (reflects leader's latest)
                             if let Ok(output) = std::process::Command::new("git")
                                 .args(["rev-parse", "HEAD"])
                                 .current_dir(&wt_path)
@@ -522,6 +551,7 @@ async fn run_event_loop(
                                 }
                             }
                         }
+
                         app.start_sdk_task(wi, ts.id, &ts.prompt, &ts.team_mode, 1, None,
                             ts.title.as_str(), ts.context.as_deref(), ts.criteria.as_deref());
                     }
