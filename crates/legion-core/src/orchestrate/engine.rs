@@ -297,9 +297,15 @@ impl OrchestrateEngine {
 
     pub async fn submit_ticket(
         &self, title: String, prompt: String, context: Option<String>, criteria: Option<String>,
-        team_mode: TeamMode, max_iterations: u16,
-    ) -> usize {
+        team_mode: TeamMode, max_iterations: u16, blocked_by: Vec<usize>,
+    ) -> Result<usize, String> {
         let mut guard = self.inner.write().await;
+        // Validate all blocked_by IDs exist in current tickets
+        for dep_id in &blocked_by {
+            if !guard.tickets.iter().any(|t| t.id == *dep_id) {
+                return Err(format!("blocked_by references unknown ticket id {}", dep_id));
+            }
+        }
         let id = guard.next_ticket_id;
         guard.next_ticket_id += 1;
         let ticket = TaskTicket {
@@ -318,13 +324,23 @@ impl OrchestrateEngine {
             started_at: None,
             completed_elapsed_secs: None,
             base_commit: None,
-            blocked_by: Vec::new(),
+            blocked_by,
             merge_status: MergeStatus::Pending,
         };
         guard.tickets.push(ticket.clone());
         drop(guard);
         self.persist_ticket(&ticket);
-        id
+        Ok(id)
+    }
+
+    /// Check if a ticket's dependencies are all Done
+    fn is_ready(ticket: &TaskTicket, all_tickets: &[TaskTicket]) -> bool {
+        ticket.blocked_by.iter().all(|dep_id| {
+            all_tickets.iter()
+                .find(|t| t.id == *dep_id)
+                .map(|t| t.status == TicketStatus::Done)
+                .unwrap_or(true)
+        })
     }
 
     pub async fn take_next(&self, worker_id: u16) -> Option<TicketSnapshot> {
@@ -334,7 +350,17 @@ impl OrchestrateEngine {
         });
         if already_working { return None; }
 
-        let ticket = guard.tickets.iter_mut().find(|t| t.status == TicketStatus::Queued)?;
+        // Find first Queued ticket whose dependencies are all Done
+        let ready_id = {
+            let tickets = &guard.tickets;
+            tickets.iter()
+                .find(|t| t.status == TicketStatus::Queued && Self::is_ready(t, tickets))
+                .map(|t| t.id)
+        };
+        let ticket = match ready_id {
+            Some(id) => guard.tickets.iter_mut().find(|t| t.id == id).unwrap(),
+            None => return None,
+        };
         ticket.status = TicketStatus::Working;
         ticket.assigned_worker = Some(worker_id);
         ticket.iteration = 1;

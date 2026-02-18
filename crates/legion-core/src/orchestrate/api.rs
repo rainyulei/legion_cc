@@ -153,9 +153,12 @@ async fn handle_submit(
                 Some(n) if n > 0 => n,
                 _ => engine.default_max_iterations().await,
             };
-            let id = engine
-                .submit_ticket(req.title, req.ticket, req.context, req.criteria, mode, max_iter)
-                .await;
+            let id = match engine
+                .submit_ticket(req.title, req.ticket, req.context, req.criteria, mode, max_iter, Vec::new())
+                .await {
+                    Ok(id) => id,
+                    Err(e) => return Ok(json_response(StatusCode::BAD_REQUEST, &format!(r#"{{"error": "{}"}}"#, e))),
+                };
             Ok(json_response(
                 StatusCode::OK,
                 &format!(r#"{{"ticket_id": {}}}"#, id),
@@ -203,9 +206,12 @@ async fn handle_dispatch_compat(
             } else {
                 req.ticket.clone()
             };
-            let id = engine
-                .submit_ticket(title, req.ticket, None, None, super::engine::TeamMode::default(), 5)
-                .await;
+            let id = match engine
+                .submit_ticket(title, req.ticket, None, None, super::engine::TeamMode::default(), 5, Vec::new())
+                .await {
+                    Ok(id) => id,
+                    Err(e) => return Ok(json_response(StatusCode::BAD_REQUEST, &format!(r#"{{"error": "{}"}}"#, e))),
+                };
             Ok(json_response(
                 StatusCode::OK,
                 &format!(
