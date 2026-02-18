@@ -1,6 +1,6 @@
 //! legion-dispatch — Submit a ticket to the orchestrate queue
 //!
-//! Usage: legion-dispatch <worker_id> [-t "title"] [-c "context"] [-k "criteria"] [--after 1,3] "ticket text"
+//! Usage: legion-dispatch <worker_id> [-t "title"] [-c "context"] [-k "criteria"] [--after 1,3] [--team <team_name>] "ticket text"
 //! POSTs to /legion/orchestrate/submit with structured fields.
 //! (worker_id is kept for CLI compat but ignored by queue)
 
@@ -18,7 +18,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] [-c \"context\"] [-k \"criteria\"] [--after 1,3] \"ticket text\"");
+        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] [-c \"context\"] [-k \"criteria\"] [--after 1,3] [--team <team_name>] \"ticket text\"");
         process::exit(1);
     }
 
@@ -35,6 +35,7 @@ fn main() {
     let mut context: Option<String> = None;
     let mut criteria: Option<String> = None;
     let mut after: Option<String> = None;
+    let mut team: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 2;
@@ -56,19 +57,23 @@ fn main() {
                 i += 1;
                 if i < args.len() { after = Some(args[i].clone()); }
             }
+            "--team" => {
+                i += 1;
+                if i < args.len() { team = Some(args[i].clone()); }
+            }
             _ => positional.push(args[i].clone()),
         }
         i += 1;
     }
 
     if positional.is_empty() {
-        eprintln!("Usage: legion-dispatch <worker_id> -t \"title\" -c \"context\" -k \"criteria\" [--after 1,3] \"ticket text\"");
+        eprintln!("Usage: legion-dispatch <worker_id> -t \"title\" -c \"context\" -k \"criteria\" [--after 1,3] [--team <team_name>] \"ticket text\"");
         process::exit(1);
     }
 
     if context.is_none() {
         eprintln!("Error: -c/--context is required. Provide working directory, language, related files, etc.");
-        eprintln!("Example: legion-dispatch 1 -t \"Add login\" -c \"Rust project in ./backend, uses axum\" -k \"tests pass\" [--after 1,3] \"implement login\"");
+        eprintln!("Example: legion-dispatch 1 -t \"Add login\" -c \"Rust project in ./backend, uses axum\" -k \"tests pass\" --after 1,3 \"implement login\"");
         process::exit(1);
     }
 
@@ -96,7 +101,7 @@ fn main() {
     let mut body = serde_json::json!({
         "title": title,
         "ticket": ticket,
-        "team_mode": "tech_lead_team",
+        "team_mode": team.as_deref().unwrap_or("tech_lead_team"),
     });
 
     if let Some(ctx) = &context {
@@ -127,6 +132,9 @@ fn main() {
 
             if status.is_success() {
                 println!("Dispatched to worker {}: {}", worker_id, ticket);
+                if let Some(ref t) = team {
+                    println!("Team: {}", t);
+                }
                 if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&body_str) {
                     if let Some(id) = resp.get("ticket_id") {
                         println!("Ticket ID: {}", id);

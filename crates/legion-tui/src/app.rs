@@ -1144,7 +1144,7 @@ impl App {
                 crate::claudemd::leader_instructions(worker_count)
             } else {
                 let wd_str = working_dir.as_ref().map(|p| p.to_string_lossy().to_string());
-                crate::claudemd::worker_instructions(i as u16, wd_str.as_deref())
+                crate::claudemd::worker_instructions(i as u16, wd_str.as_deref(), None)
             };
 
             match crate::pty::PtyHandle::spawn(
@@ -1511,6 +1511,22 @@ impl App {
         }
     }
 
+    /// Resolve team roles from the database for the given team_id
+    fn resolve_team_roles(&self, team_id: &str) -> Vec<(String, String, String)> {
+        if let Some(ref engine) = self.orchestrate {
+            if let Some(db) = engine.db() {
+                if let Ok(db_lock) = db.lock() {
+                    if let Ok(roles) = db_lock.get_team_roles(team_id) {
+                        return roles.into_iter()
+                            .map(|r| (r.id, r.name, r.prompt_template))
+                            .collect();
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
     /// Start an SDK task on a worker pane
     pub fn start_sdk_task(
         &mut self,
@@ -1546,15 +1562,21 @@ impl App {
         // Generate system prompt based on team mode
         let wd_str = working_dir.as_ref().map(|p| p.to_string_lossy().to_string());
         let sys_prompt = match team_mode {
-            legion_core::TeamMode::TechLeadTeam => {
-                let worker_id = pane_index as u16;
-                crate::claudemd::worker_instructions(worker_id, wd_str.as_deref())
-            }
             legion_core::TeamMode::Solo => {
-                "You are a solo developer. Follow TDD: write failing tests first, then implement. Run tests to verify. Output <promise>DONE</promise> when complete.".to_string()
+                crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), Some(&[]))
             }
-            legion_core::TeamMode::Custom(desc) => {
-                format!("{}\n\nOutput <promise>DONE</promise> when complete.", desc)
+            legion_core::TeamMode::TechLeadTeam | legion_core::TeamMode::Custom(_) => {
+                let team_name = match team_mode {
+                    legion_core::TeamMode::TechLeadTeam => "tech_lead_team",
+                    legion_core::TeamMode::Custom(s) => s.as_str(),
+                    _ => unreachable!(),
+                };
+                let team_roles = self.resolve_team_roles(team_name);
+                if team_roles.is_empty() {
+                    crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), None)
+                } else {
+                    crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), Some(&team_roles))
+                }
             }
         };
 
