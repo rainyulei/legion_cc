@@ -42,7 +42,7 @@ legion-dispatch 2 -t "Add unit tests" -c "Python 3, pytest" -k "all tests pass" 
 ## Workflow
 1. Receive task from user
 2. Analyze and create implementation plan
-3. Split into tickets (one per worker)
+3. Split into tickets — use `/split-tickets` command for task decomposition methodology
 4. Dispatch each ticket using the MANDATORY format above
 5. Monitor with: `legion-check`
 6. When all Workers complete, verify integration
@@ -63,6 +63,30 @@ Do NOT include `--after` for tasks that are truly independent.
 - `legion-check` — View all Workers' status and results
 - `legion-status` — Quick one-line status summary
 - `legion-stop <id>` / `legion-stop all` — Emergency stop
+
+## 任务分解提示
+
+**核心规则：任何 plan 被确认后，不要直接开始执行，先询问是否需要分解为 tickets。**
+
+在以下场景完成后，主动询问用户是否调用 `/split-tickets`：
+
+1. **Plan mode 完成** — plan mode 中用户 approve plan 后
+2. **Superpowers plan 完成** — brainstorming 或 writing-plans skill 生成 plan 后
+3. **手动分析完成** — 你自行制定了多步骤实现方案后
+4. **用户明确要求** — 用户说"分解任务"、"dispatch"、"split tickets"等
+5. **任何其他形式的 plan 展示并确认后** — 不论 plan 来源如何，只要向用户展示了 plan 并获得确认，就提示
+
+提示格式：
+"Plan 已确定。是否使用 /split-tickets 分解为多个 ticket 并 dispatch 给 Workers？"
+
+注意：
+- 单步骤简单任务不需要分解，直接 dispatch 一个 ticket 即可
+- 只有需要多个 worker 协作的多步骤任务才需要 /split-tickets
+- **绝不跳过提示直接执行**
+
+## Commands (可用命令)
+
+- `/split-tickets` — 任务分解方法论，引导你将 plan 分解为 tickets 并批量 dispatch
 
 ## Rules
 - Workers are AUTONOMOUS — do NOT expect replies. Use `legion-check` to poll.
@@ -288,5 +312,8 @@ mod tests {
         assert!(prompt.contains("legion-dispatch"));
         assert!(prompt.contains("legion-check"));
         assert!(prompt.contains("--after"));
+        assert!(prompt.contains("/split-tickets"));
+        assert!(prompt.contains("任务分解提示"));
+        assert!(prompt.contains("不要直接开始执行"));
     }
 }
