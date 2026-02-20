@@ -146,6 +146,17 @@ impl ProxyServer {
 }
 
 /// Build an error response with a fully buffered body
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn error_response(status: StatusCode, body: String) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
@@ -452,7 +463,7 @@ async fn handle_request(
     // Log non-success responses for debugging
     if !status.is_success() {
         if let Ok(resp_str) = std::str::from_utf8(&response_body) {
-            let truncated = if resp_str.len() > 500 { &resp_str[..500] } else { resp_str };
+            let truncated = truncate_utf8(resp_str, 500);
             warn!("Upstream error ({}): {}", status, truncated);
         }
     }
@@ -508,14 +519,14 @@ async fn handle_request(
     if is_openai_compat && status.is_success() {
         // Log upstream response for debugging
         if let Ok(resp_str) = std::str::from_utf8(&response_body) {
-            let truncated = if resp_str.len() > 500 { &resp_str[..500] } else { resp_str };
+            let truncated = truncate_utf8(resp_str, 500);
             debug!("OpenAI upstream response ({}): {}", response_body.len(), truncated);
         }
         match openai_to_anthropic(&response_body) {
             Ok(anthropic_json) => {
                 // Log transformed response
                 if let Ok(resp_str) = std::str::from_utf8(&anthropic_json) {
-                    let truncated = if resp_str.len() > 500 { &resp_str[..500] } else { resp_str };
+                    let truncated = truncate_utf8(resp_str, 500);
                     debug!("Anthropic transformed ({}): {}", anthropic_json.len(), truncated);
                 }
                 match wrap_anthropic_json_as_sse(&anthropic_json) {

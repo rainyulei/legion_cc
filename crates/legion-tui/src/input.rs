@@ -80,6 +80,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
                                 String::new(), // feedback
                             ];
                             app.retry_form_focus = 3; // default focus on feedback
+                            app.retry_error_summary = t.summary.clone().unwrap_or_default();
+                            app.retry_form_scroll = 0;
                             app.mode = AppMode::Popup(PopupMenu::RetryForm);
                         }
                     }
@@ -140,31 +142,6 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
                     return InputResult::Continue;
                 }
             }
-        }
-    }
-
-    // Squad-only shortcuts (not forwarded to PTY)
-    if app.is_squad() {
-        match key.code {
-            // Alt+Right / Alt+Left toggle focus between Leader and Task Board
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
-                app.right_panel_focused = !app.right_panel_focused;
-                return InputResult::Continue;
-            }
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
-                app.right_panel_focused = !app.right_panel_focused;
-                return InputResult::Continue;
-            }
-            // Ctrl+Left/Right adjust leader/worker split ratio
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.adjust_leader_ratio(-5);
-                return InputResult::Continue;
-            }
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.adjust_leader_ratio(5);
-                return InputResult::Continue;
-            }
-            _ => {}
         }
     }
 
@@ -242,6 +219,13 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
             if near_divider {
                 app.dragging_divider = true;
                 app.hover_on_divider = true;
+            } else if matches!(app.mode, AppMode::Normal) {
+                // Click-to-focus: click on left panel = Leader, right panel = Task Board
+                if event.column < divider_x {
+                    app.right_panel_focused = false;
+                } else {
+                    app.right_panel_focused = true;
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) if app.dragging_divider => {
@@ -323,6 +307,12 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::BranchChanged) => handle_branch_changed_keys(app, key),
         AppMode::Popup(PopupMenu::CopilotAuth) => handle_copilot_auth_keys(app, key),
         AppMode::Popup(PopupMenu::SetWorkerCount) => handle_set_worker_count_keys(app, key),
+        AppMode::Popup(PopupMenu::ManageTeams) => handle_manage_teams_keys(app, key),
+        AppMode::Popup(PopupMenu::TeamDetail) => handle_team_detail_keys(app, key),
+        AppMode::Popup(PopupMenu::TeamForm) => handle_team_form_keys(app, key),
+        AppMode::Popup(PopupMenu::RoleList) => handle_role_list_keys(app, key),
+        AppMode::Popup(PopupMenu::RoleForm) => handle_role_form_keys(app, key),
+        AppMode::Popup(PopupMenu::AddRoleToTeam) => handle_add_role_to_team_keys(app, key),
         _ => {}
     }
 
@@ -394,7 +384,7 @@ fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
                 if session.status == "active" && !session.is_default {
                     let name = session.name.clone();
                     // Get session stats from DB
-                    if let Ok(repo) = legion_db::open_db() {
+                    if let Some(repo) = app.open_project_db() {
                         app.session_delete_pending_count = repo.count_pending_tickets(&name).unwrap_or(0);
                         app.session_delete_ticket_count = repo.count_tickets(&name).unwrap_or(0);
                         app.session_delete_log_count = repo.count_ticket_logs(&name).unwrap_or(0);
@@ -421,7 +411,7 @@ fn handle_session_list_keys(app: &mut App, key: KeyEvent) {
                 let session = &app.session_list[app.session_list_index];
                 if session.status == "completed" {
                     let name = session.name.clone();
-                    if let Ok(repo) = legion_db::open_db() {
+                    if let Some(repo) = app.open_project_db() {
                         if let Err(e) = repo.delete_squad_session(&name) {
                             tracing::error!("Failed to remove session '{}': {}", name, e);
                         } else {
@@ -662,7 +652,12 @@ fn handle_connect_provider_keys(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let tmpl = &crate::app::PROVIDER_TEMPLATES[app.connect_provider_index];
-            if tmpl.auth_method == "device_flow" {
+            if tmpl.auth_method == "none" {
+                // Native provider — no auth needed, just select it
+                app.current_provider = Some(0); // __default__ is always index 0
+                app.provider_connected = true;
+                app.mode = AppMode::Popup(PopupMenu::Main);
+            } else if tmpl.auth_method == "device_flow" {
                 // Start Copilot device auth flow
                 app.copilot_auth_status = crate::app::CopilotAuthStatus::RequestingCode;
                 app.copilot_user_code = None;
@@ -782,9 +777,10 @@ fn handle_max_retries_keys(app: &mut App, key: KeyEvent) {
             app.default_max_iterations = (app.submenu_index as u16) + 1;
             app.pending_sync_max_iterations = true;
             // Persist to DB
+            let repo = app.open_project_db();
             if let Some(ref mut session) = app.current_session {
                 session.max_iterations = Some(app.default_max_iterations as i64);
-                if let Ok(repo) = legion_db::open_db() {
+                if let Some(repo) = repo {
                     let _ = repo.upsert_squad_session(session);
                 }
             }
@@ -950,6 +946,12 @@ fn handle_retry_form_keys(app: &mut App, key: KeyEvent) {
                 });
             }
             app.mode = AppMode::Normal;
+        }
+        KeyCode::Up => {
+            app.retry_form_scroll = app.retry_form_scroll.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            app.retry_form_scroll = app.retry_form_scroll.saturating_add(1);
         }
         KeyCode::Backspace => {
             let idx = app.retry_form_focus as usize;
@@ -1202,7 +1204,7 @@ fn handle_file_diff_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn update_session_branch(app: &App, session_name: &str) {
-    if let Ok(repo) = legion_db::open_db() {
+    if let Some(repo) = app.open_project_db() {
         if let Ok(Some(mut session)) = repo.get_squad_session(session_name) {
             session.base_branch = app.detected_branch.clone();
             session.base_commit = app.detected_commit.clone();
@@ -1459,12 +1461,612 @@ fn handle_set_worker_count_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+fn handle_manage_teams_keys(app: &mut App, key: KeyEvent) {
+    // Handle confirmation state first
+    if app.confirm_delete.is_some() {
+        match key.code {
+            KeyCode::Char('y') => {
+                if let Some((_, target)) = app.confirm_delete.take() {
+                    if let crate::app::DeleteTarget::Team(id) = target {
+                        if let Ok(repo) = legion_db::open_db() {
+                            let _ = repo.delete_team(&id);
+                            app.team_list = repo.list_teams().unwrap_or_default();
+                        }
+                        if app.team_list_index >= app.team_list.len() && app.team_list_index > 0 {
+                            app.team_list_index -= 1;
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.confirm_delete = None;
+            }
+            _ => {} // ignore other keys during confirmation
+        }
+        return;
+    }
 
     match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Popup(PopupMenu::Main);
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Enter => {
+            if app.team_list_index < app.team_list.len() {
+                let team = app.team_list[app.team_list_index].clone();
+                if let Ok(repo) = legion_db::open_db() {
+                    app.team_detail_roles = repo.get_team_roles(&team.id).unwrap_or_default();
+                }
+                app.team_detail_team = Some(team);
+                app.team_detail_index = 0;
+                app.mode = AppMode::Popup(PopupMenu::TeamDetail);
+            }
+        }
+        KeyCode::Char('n') => {
+            // New team
+            app.team_form_fields = [String::new(), String::new(), String::new()];
+            app.team_form_focus = 0;
+            app.team_form_cursor = 0;
+            app.team_form_editing = None;
+            app.team_form_clone_roles = Vec::new();
+            if let Ok(repo) = legion_db::open_db() {
+                app.team_form_role_list = repo.list_roles().unwrap_or_default();
+                app.team_form_role_selections = vec![false; app.team_form_role_list.len()];
+            }
+            app.team_form_role_scroll = 0;
+            app.mode = AppMode::Popup(PopupMenu::TeamForm);
+        }
+        KeyCode::Char('e') => {
+            // Edit selected team
+            if app.team_list_index < app.team_list.len() {
+                let team = &app.team_list[app.team_list_index];
+                app.team_form_fields = [team.name.clone(), team.description.clone(), team.team_prompt.clone()];
+                app.team_form_focus = 0;
+                app.team_form_cursor = app.team_form_fields[0].chars().count();
+                if team.is_builtin {
+                    // Clone builtin team as new custom team
+                    app.team_form_editing = None;
+                    app.team_form_clone_roles = team.role_ids.clone();
+                } else {
+                    app.team_form_editing = Some(team.id.clone());
+                    app.team_form_clone_roles = Vec::new();
+                }
+                if let Ok(repo) = legion_db::open_db() {
+                    app.team_form_role_list = repo.list_roles().unwrap_or_default();
+                    let existing_ids: std::collections::HashSet<&str> = if team.is_builtin {
+                        app.team_form_clone_roles.iter().map(|s| s.as_str()).collect()
+                    } else {
+                        team.role_ids.iter().map(|s| s.as_str()).collect()
+                    };
+                    app.team_form_role_selections = app.team_form_role_list.iter()
+                        .map(|r| existing_ids.contains(r.id.as_str()))
+                        .collect();
+                }
+                app.team_form_role_scroll = 0;
+                app.mode = AppMode::Popup(PopupMenu::TeamForm);
+            }
+        }
+        KeyCode::Char('d') => {
+            // Delete selected team (with confirmation)
+            if app.team_list_index < app.team_list.len() {
+                let team = &app.team_list[app.team_list_index];
+                if !team.is_builtin {
+                    app.confirm_delete = Some((
+                        team.name.clone(),
+                        crate::app::DeleteTarget::Team(team.id.clone()),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_team_detail_keys(app: &mut App, key: KeyEvent) {
+    // Handle confirmation state first
+    if app.confirm_delete.is_some() {
+        match key.code {
+            KeyCode::Char('y') => {
+                if let Some((_, target)) = app.confirm_delete.take() {
+                    if let crate::app::DeleteTarget::TeamRole(_team_id, role_id) = target {
+                        if let Some(ref mut team) = app.team_detail_team {
+                            team.role_ids.retain(|id| id != &role_id);
+                            if let Ok(repo) = legion_db::open_db() {
+                                let _ = repo.upsert_team(team);
+                                app.team_detail_roles = repo.get_team_roles(&team.id).unwrap_or_default();
+                            }
+                            if app.team_detail_index >= app.team_detail_roles.len() && app.team_detail_index > 0 {
+                                app.team_detail_index -= 1;
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.confirm_delete = None;
+            }
+            _ => {} // ignore other keys during confirmation
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.confirm_delete = None;
+            app.team_detail_team = None;
+            app.team_detail_roles.clear();
+            app.mode = AppMode::Popup(PopupMenu::ManageTeams);
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Char('a') => {
+            // Add role to team
+            if let Some(ref team) = app.team_detail_team {
+                if let Ok(repo) = legion_db::open_db() {
+                    let all_roles = repo.list_roles().unwrap_or_default();
+                    let existing: std::collections::HashSet<&str> =
+                        team.role_ids.iter().map(|s| s.as_str()).collect();
+                    app.add_role_available = all_roles.into_iter()
+                        .filter(|r| !existing.contains(r.id.as_str()))
+                        .collect();
+                }
+                app.add_role_index = 0;
+                app.add_role_selections = vec![false; app.add_role_available.len()];
+                app.mode = AppMode::Popup(PopupMenu::AddRoleToTeam);
+            }
+        }
+        KeyCode::Char('d') => {
+            // Remove selected role from team (with confirmation)
+            if let Some(ref team) = app.team_detail_team {
+                if app.team_detail_index < app.team_detail_roles.len() {
+                    let role = &app.team_detail_roles[app.team_detail_index];
+                    app.confirm_delete = Some((
+                        role.name.clone(),
+                        crate::app::DeleteTarget::TeamRole(team.id.clone(), role.id.clone()),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_team_form_keys(app: &mut App, key: KeyEvent) {
+    // When in role selection zone (focus == 3), handle navigation and space
+    if app.team_form_focus == 3 {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.team_form_role_scroll = app.team_form_role_scroll.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if app.team_form_role_scroll < app.team_form_role_list.len().saturating_sub(1) {
+                    app.team_form_role_scroll += 1;
+                }
+                return;
+            }
+            KeyCode::Char(' ') => {
+                let idx = app.team_form_role_scroll;
+                if idx < app.team_form_role_selections.len() {
+                    app.team_form_role_selections[idx] = !app.team_form_role_selections[idx];
+                }
+                return;
+            }
+            KeyCode::Tab => {
+                app.team_form_focus = 0;
+                let idx = app.team_form_focus as usize;
+                app.team_form_cursor = app.team_form_fields[idx].chars().count();
+                return;
+            }
+            KeyCode::BackTab => {
+                app.team_form_focus = 2;
+                let idx = app.team_form_focus as usize;
+                app.team_form_cursor = app.team_form_fields[idx].chars().count();
+                return;
+            }
+            // Esc and Enter fall through to main handler
+            _ => {}
+        }
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Popup(PopupMenu::ManageTeams);
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            let next = (app.team_form_focus + 1) % 4;
+            app.team_form_focus = next;
+            if next < 3 {
+                let idx = next as usize;
+                app.team_form_cursor = app.team_form_fields[idx].chars().count();
+            }
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            let next = if app.team_form_focus == 0 { 3 } else { app.team_form_focus - 1 };
+            app.team_form_focus = next;
+            if next < 3 {
+                let idx = next as usize;
+                app.team_form_cursor = app.team_form_fields[idx].chars().count();
+            }
+        }
+        KeyCode::Left => {
+            if app.team_form_focus < 3 {
+                app.team_form_cursor = app.team_form_cursor.saturating_sub(1);
+            }
+        }
+        KeyCode::Right => {
+            if app.team_form_focus < 3 {
+                let idx = app.team_form_focus as usize;
+                let len = app.team_form_fields[idx].chars().count();
+                if app.team_form_cursor < len {
+                    app.team_form_cursor += 1;
+                }
+            }
+        }
+        KeyCode::Home => {
+            if app.team_form_focus < 3 {
+                app.team_form_cursor = 0;
+            }
+        }
+        KeyCode::End => {
+            if app.team_form_focus < 3 {
+                let idx = app.team_form_focus as usize;
+                app.team_form_cursor = app.team_form_fields[idx].chars().count();
+            }
+        }
+        KeyCode::Enter => {
+            let name = app.team_form_fields[0].trim().to_string();
+            if name.is_empty() { return; }
+            let description = app.team_form_fields[1].trim().to_string();
+            let team_prompt = app.team_form_fields[2].trim().to_string();
+
+            if let Ok(repo) = legion_db::open_db() {
+                let saved_id;
+                if let Some(ref editing_id) = app.team_form_editing {
+                    // Edit existing custom team
+                    saved_id = editing_id.clone();
+                    if let Ok(Some(mut team)) = repo.get_team(editing_id) {
+                        team.name = name;
+                        team.description = description;
+                        team.team_prompt = team_prompt;
+                        // Update role_ids from inline selections
+                        team.role_ids = app.team_form_role_list.iter()
+                            .zip(app.team_form_role_selections.iter())
+                            .filter(|(_, &sel)| sel)
+                            .map(|(r, _)| r.id.clone())
+                            .collect();
+                        let _ = repo.upsert_team(&team);
+                    }
+                } else {
+                    // New team or clone from builtin
+                    let id = name.to_lowercase().replace(' ', "_");
+                    saved_id = id.clone();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let mut role_ids = std::mem::take(&mut app.team_form_clone_roles);
+                    // Add inline-selected roles
+                    for (i, sel) in app.team_form_role_selections.iter().enumerate() {
+                        if *sel {
+                            if let Some(r) = app.team_form_role_list.get(i) {
+                                if !role_ids.contains(&r.id) {
+                                    role_ids.push(r.id.clone());
+                                }
+                            }
+                        }
+                    }
+                    let team = legion_db::Team {
+                        id,
+                        name,
+                        description,
+                        role_ids,
+                        is_builtin: false,
+                        created_at: now,
+                        team_prompt,
+                    };
+                    let _ = repo.upsert_team(&team);
+                }
+                app.team_list = repo.list_teams().unwrap_or_default();
+                // Navigate to team detail so user can add/remove roles
+                if let Ok(Some(team)) = repo.get_team(&saved_id) {
+                    app.team_detail_roles = repo.get_team_roles(&team.id).unwrap_or_default();
+                    app.team_detail_team = Some(team);
+                    app.team_detail_index = 0;
+                    app.mode = AppMode::Popup(PopupMenu::TeamDetail);
+                } else {
+                    app.mode = AppMode::Popup(PopupMenu::ManageTeams);
+                }
+            } else {
+                app.mode = AppMode::Popup(PopupMenu::ManageTeams);
+            }
+        }
+        KeyCode::Backspace => {
+            if app.team_form_focus < 3 {
+                let idx = app.team_form_focus as usize;
+                if app.team_form_cursor > 0 {
+                    let byte_pos = app.team_form_fields[idx]
+                        .char_indices()
+                        .nth(app.team_form_cursor - 1)
+                        .map(|(i, c)| (i, c.len_utf8()));
+                    if let Some((start, len)) = byte_pos {
+                        app.team_form_fields[idx].replace_range(start..start + len, "");
+                        app.team_form_cursor -= 1;
+                    }
+                }
+            }
+        }
+        KeyCode::Delete => {
+            if app.team_form_focus < 3 {
+                let idx = app.team_form_focus as usize;
+                let len = app.team_form_fields[idx].chars().count();
+                if app.team_form_cursor < len {
+                    let byte_pos = app.team_form_fields[idx]
+                        .char_indices()
+                        .nth(app.team_form_cursor)
+                        .map(|(i, c)| (i, c.len_utf8()));
+                    if let Some((start, clen)) = byte_pos {
+                        app.team_form_fields[idx].replace_range(start..start + clen, "");
+                    }
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            if app.team_form_focus < 3 {
+                let idx = app.team_form_focus as usize;
+                let byte_pos = app.team_form_fields[idx]
+                    .char_indices()
+                    .nth(app.team_form_cursor)
+                    .map(|(i, _)| i)
+                    .unwrap_or(app.team_form_fields[idx].len());
+                app.team_form_fields[idx].insert(byte_pos, c);
+                app.team_form_cursor += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_role_list_keys(app: &mut App, key: KeyEvent) {
+    // Handle confirmation state first
+    if app.confirm_delete.is_some() {
+        match key.code {
+            KeyCode::Char('y') => {
+                if let Some((_, target)) = app.confirm_delete.take() {
+                    if let crate::app::DeleteTarget::Role(id) = target {
+                        if let Ok(repo) = legion_db::open_db() {
+                            let _ = repo.delete_role(&id);
+                            app.role_list = repo.list_roles().unwrap_or_default();
+                        }
+                        if app.role_list_index >= app.role_list.len() && app.role_list_index > 0 {
+                            app.role_list_index -= 1;
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.confirm_delete = None;
+            }
+            _ => {} // ignore other keys during confirmation
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.confirm_delete = None;
+            app.mode = AppMode::Popup(PopupMenu::Main);
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Char('n') => {
+            // New role
+            app.role_form_fields = [String::new(), String::new(), String::new()];
+            app.role_form_focus = 0;
+            app.role_form_cursor = 0;
+            app.role_form_editing = None;
+            app.role_form_clone_source = None;
+            app.mode = AppMode::Popup(PopupMenu::RoleForm);
+        }
+        KeyCode::Char('e') => {
+            // Edit selected role
+            if app.role_list_index < app.role_list.len() {
+                let role = &app.role_list[app.role_list_index];
+                app.role_form_fields = [
+                    role.name.clone(),
+                    role.description.clone(),
+                    role.prompt_template.clone(),
+                ];
+                app.role_form_focus = 0;
+                app.role_form_cursor = role.name.chars().count();
+                if role.is_builtin {
+                    app.role_form_editing = None;
+                    app.role_form_clone_source = Some(role.id.clone());
+                } else {
+                    app.role_form_editing = Some(role.id.clone());
+                    app.role_form_clone_source = None;
+                }
+                app.mode = AppMode::Popup(PopupMenu::RoleForm);
+            }
+        }
+        KeyCode::Char('d') => {
+            // Delete selected role (non-builtin only, with confirmation)
+            if app.role_list_index < app.role_list.len() {
+                let role = &app.role_list[app.role_list_index];
+                if !role.is_builtin {
+                    app.confirm_delete = Some((
+                        role.name.clone(),
+                        crate::app::DeleteTarget::Role(role.id.clone()),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_role_form_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Go back to role list
+            if let Ok(repo) = legion_db::open_db() {
+                app.role_list = repo.list_roles().unwrap_or_default();
+            }
+            app.mode = AppMode::Popup(PopupMenu::RoleList);
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            app.role_form_focus = (app.role_form_focus + 1) % 3;
+            // Set cursor to end of new field
+            let idx = app.role_form_focus as usize;
+            app.role_form_cursor = app.role_form_fields[idx].chars().count();
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            app.role_form_focus = if app.role_form_focus == 0 { 2 } else { app.role_form_focus - 1 };
+            let idx = app.role_form_focus as usize;
+            app.role_form_cursor = app.role_form_fields[idx].chars().count();
+        }
+        KeyCode::Left => {
+            app.role_form_cursor = app.role_form_cursor.saturating_sub(1);
+        }
+        KeyCode::Right => {
+            let idx = app.role_form_focus as usize;
+            let len = app.role_form_fields[idx].chars().count();
+            if app.role_form_cursor < len {
+                app.role_form_cursor += 1;
+            }
+        }
+        KeyCode::Home => {
+            app.role_form_cursor = 0;
+        }
+        KeyCode::End => {
+            let idx = app.role_form_focus as usize;
+            app.role_form_cursor = app.role_form_fields[idx].chars().count();
+        }
+        KeyCode::Enter => {
+            let name = app.role_form_fields[0].trim().to_string();
+            if name.is_empty() { return; }
+            let description = app.role_form_fields[1].trim().to_string();
+            let prompt_template = app.role_form_fields[2].trim().to_string();
+
+            if let Ok(repo) = legion_db::open_db() {
+                let id = if let Some(ref editing_id) = app.role_form_editing {
+                    editing_id.clone()
+                } else if let Some(ref source_id) = app.role_form_clone_source {
+                    format!("{}_custom", source_id)
+                } else {
+                    name.to_lowercase().replace(' ', "_")
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let role = legion_db::Role {
+                    id,
+                    name,
+                    description,
+                    prompt_template,
+                    is_builtin: false,
+                    created_at: now,
+                };
+                let _ = repo.upsert_role(&role);
+                app.role_list = repo.list_roles().unwrap_or_default();
+            }
+            app.role_form_clone_source = None;
+            app.mode = AppMode::Popup(PopupMenu::RoleList);
+        }
+        KeyCode::Backspace => {
+            let idx = app.role_form_focus as usize;
+            if app.role_form_cursor > 0 {
+                let byte_pos = app.role_form_fields[idx]
+                    .char_indices()
+                    .nth(app.role_form_cursor - 1)
+                    .map(|(i, c)| (i, c.len_utf8()));
+                if let Some((start, len)) = byte_pos {
+                    app.role_form_fields[idx].replace_range(start..start + len, "");
+                    app.role_form_cursor -= 1;
+                }
+            }
+        }
+        KeyCode::Delete => {
+            let idx = app.role_form_focus as usize;
+            let len = app.role_form_fields[idx].chars().count();
+            if app.role_form_cursor < len {
+                let byte_pos = app.role_form_fields[idx]
+                    .char_indices()
+                    .nth(app.role_form_cursor)
+                    .map(|(i, c)| (i, c.len_utf8()));
+                if let Some((start, clen)) = byte_pos {
+                    app.role_form_fields[idx].replace_range(start..start + clen, "");
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            let idx = app.role_form_focus as usize;
+            let byte_pos = app.role_form_fields[idx]
+                .char_indices()
+                .nth(app.role_form_cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(app.role_form_fields[idx].len());
+            app.role_form_fields[idx].insert(byte_pos, c);
+            app.role_form_cursor += 1;
+        }
+        _ => {}
+    }
+}
+
+fn handle_add_role_to_team_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Popup(PopupMenu::TeamDetail);
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
+        KeyCode::Char(' ') => {
+            let idx = app.add_role_index;
+            if idx < app.add_role_selections.len() {
+                app.add_role_selections[idx] = !app.add_role_selections[idx];
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(ref mut team) = app.team_detail_team {
+                let mut added = false;
+                for (i, role) in app.add_role_available.iter().enumerate() {
+                    if app.add_role_selections.get(i).copied().unwrap_or(false) {
+                        if !team.role_ids.contains(&role.id) {
+                            team.role_ids.push(role.id.clone());
+                            added = true;
+                        }
+                    }
+                }
+                if added {
+                    if let Ok(repo) = legion_db::open_db() {
+                        let _ = repo.upsert_team(team);
+                        app.team_detail_roles = repo.get_team_roles(&team.id).unwrap_or_default();
+                    }
+                }
+            }
+            app.mode = AppMode::Popup(PopupMenu::TeamDetail);
+        }
+        _ => {}
+    }
+}
+
+fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    // Modifier parameter for CSI sequences: 1=none, 2=Shift, 3=Alt, 5=Ctrl, etc.
+    let mod_param = 1
+        + if shift { 1 } else { 0 }
+        + if alt { 2 } else { 0 }
+        + if ctrl { 4 } else { 0 };
+
+    let base = match key.code {
         KeyCode::Char(c) => {
             if ctrl {
+                // Ctrl+letter → control character (0x01-0x1a)
                 vec![(c as u8).wrapping_sub(b'a').wrapping_add(1)]
             } else {
                 c.to_string().into_bytes()
@@ -1473,16 +2075,60 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![127],
         KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),  // Shift+Tab (Claude Code: Plan/Act toggle)
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::Up => {
+            if mod_param > 1 { format!("\x1b[1;{}A", mod_param).into_bytes() }
+            else { b"\x1b[A".to_vec() }
+        }
+        KeyCode::Down => {
+            if mod_param > 1 { format!("\x1b[1;{}B", mod_param).into_bytes() }
+            else { b"\x1b[B".to_vec() }
+        }
+        KeyCode::Right => {
+            if mod_param > 1 { format!("\x1b[1;{}C", mod_param).into_bytes() }
+            else { b"\x1b[C".to_vec() }
+        }
+        KeyCode::Left => {
+            if mod_param > 1 { format!("\x1b[1;{}D", mod_param).into_bytes() }
+            else { b"\x1b[D".to_vec() }
+        }
+        KeyCode::Home => {
+            if mod_param > 1 { format!("\x1b[1;{}H", mod_param).into_bytes() }
+            else { b"\x1b[H".to_vec() }
+        }
+        KeyCode::End => {
+            if mod_param > 1 { format!("\x1b[1;{}F", mod_param).into_bytes() }
+            else { b"\x1b[F".to_vec() }
+        }
+        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::F(n) => match n {
+            1 => b"\x1bOP".to_vec(),
+            2 => b"\x1bOQ".to_vec(),
+            3 => b"\x1bOR".to_vec(),
+            4 => b"\x1bOS".to_vec(),
+            5 => b"\x1b[15~".to_vec(),
+            6 => b"\x1b[17~".to_vec(),
+            7 => b"\x1b[18~".to_vec(),
+            8 => b"\x1b[19~".to_vec(),
+            9 => b"\x1b[20~".to_vec(),
+            10 => b"\x1b[21~".to_vec(),
+            11 => b"\x1b[23~".to_vec(),
+            12 => b"\x1b[24~".to_vec(),
+            _ => vec![],
+        },
         _ => vec![],
+    };
+
+    // Alt modifier for non-escape-sequence keys: prepend ESC (Alt+x → \x1b + x)
+    if alt && !base.is_empty() && base[0] != 0x1b {
+        let mut out = vec![0x1b];
+        out.extend_from_slice(&base);
+        out
+    } else {
+        base
     }
 }

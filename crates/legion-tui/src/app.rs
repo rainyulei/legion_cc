@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use legion_core::orchestrate::OrchestrateEngine;
-use legion_db::{Provider, SquadSession};
+use legion_db::{Provider, Role, SquadSession, Team};
 
 use crate::pty::{PtyHandle, SharedParser};
 
@@ -44,6 +44,12 @@ pub enum PopupMenu {
     BranchChanged,
     CopilotAuth,
     SetWorkerCount,
+    ManageTeams,
+    TeamDetail,
+    TeamForm,
+    RoleList,
+    RoleForm,
+    AddRoleToTeam,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +83,14 @@ pub enum ModelTarget {
     AllPanes,
 }
 
+/// Target for delete confirmation in teams/roles screens
+#[derive(Debug, Clone)]
+pub enum DeleteTarget {
+    Team(String),             // team id
+    Role(String),             // role id
+    TeamRole(String, String), // (team_id, role_id)
+}
+
 /// Main menu items
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainMenuItem {
@@ -85,6 +99,8 @@ pub enum MainMenuItem {
     MaxRetries,
     SetWorkers,
     RemoveWorker,
+    ManageTeams,
+    ManageRoles,
     SwitchSession,
     SwitchBranch,
     CompleteSession,
@@ -99,6 +115,8 @@ impl MainMenuItem {
             Self::MaxRetries => "Max Retries",
             Self::SetWorkers => "Set Workers",
             Self::RemoveWorker => "Remove Worker",
+            Self::ManageTeams => "Manage Teams",
+            Self::ManageRoles => "Manage Roles",
             Self::SwitchSession => "Switch Session",
             Self::SwitchBranch => "Switch Branch",
             Self::CompleteSession => "Complete Session",
@@ -113,6 +131,8 @@ impl MainMenuItem {
             Self::MaxRetries => "Set max retry attempts for failed tickets",
             Self::SetWorkers => "Scale worker count from 1 to 8",
             Self::RemoveWorker => "Remove a specific worker from the squad",
+            Self::ManageTeams => "View team presets and role compositions",
+            Self::ManageRoles => "Create, edit, and delete custom roles",
             Self::SwitchSession => "Switch to a different squad session",
             Self::SwitchBranch => "Change the git branch for this session",
             Self::CompleteSession => "Mark current session as complete",
@@ -135,22 +155,13 @@ pub struct ProviderTemplate {
 
 pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
     ProviderTemplate {
-        id: "anthropic",
-        name: "Anthropic",
-        base_url: "https://api.anthropic.com",
+        id: "__default__",
+        name: "Native",
+        base_url: "",
         api_format: "anthropic",
         models: &["claude-opus-4-6", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"],
-        env_var: "ANTHROPIC_API_KEY",
-        auth_method: "api_key",
-    },
-    ProviderTemplate {
-        id: "openai",
-        name: "OpenAI",
-        base_url: "https://api.openai.com/v1",
-        api_format: "openai_chat",
-        models: &["gpt-4o", "gpt-4o-mini", "o3", "o3-mini"],
-        env_var: "OPENAI_API_KEY",
-        auth_method: "api_key",
+        env_var: "",
+        auth_method: "none",
     },
     ProviderTemplate {
         id: "github_copilot",
@@ -168,24 +179,6 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
         api_format: "openai_chat",
         models: &["anthropic/claude-opus-4-6", "openai/gpt-4o", "google/gemini-2.5-pro"],
         env_var: "OPENROUTER_API_KEY",
-        auth_method: "api_key",
-    },
-    ProviderTemplate {
-        id: "google_gemini",
-        name: "Google Gemini",
-        base_url: "https://generativelanguage.googleapis.com/v1beta",
-        api_format: "openai_chat",
-        models: &["gemini-2.5-pro", "gemini-2.5-flash"],
-        env_var: "GOOGLE_API_KEY",
-        auth_method: "api_key",
-    },
-    ProviderTemplate {
-        id: "deepseek",
-        name: "DeepSeek",
-        base_url: "https://api.deepseek.com/v1",
-        api_format: "openai_chat",
-        models: &["deepseek-chat", "deepseek-reasoner"],
-        env_var: "DEEPSEEK_API_KEY",
         auth_method: "api_key",
     },
 ];
@@ -332,6 +325,8 @@ pub struct App {
     pub retry_target_id: usize,
     pub retry_form_fields: [String; 4],      // [prompt, context, criteria, feedback]
     pub retry_form_focus: u8,                // 0-3 for which field is focused
+    pub retry_error_summary: String,         // ticket error summary for display
+    pub retry_form_scroll: u16,              // scroll offset for long content
 
     // Delete confirm state
     pub delete_confirm_id: usize,
@@ -339,6 +334,7 @@ pub struct App {
     // Leader context status (from statusLine hook)
     pub leader_context_pct: Option<u8>,
     pub leader_git_branch: Option<String>,
+    pub leader_output_style: Option<String>,
 
     // Branch recovery dialog state
     pub recovery_session: Option<SquadSession>,  // session being recovered
@@ -370,6 +366,45 @@ pub struct App {
     pub copilot_verification_uri: Option<String>,
     pub copilot_auth_error: Option<String>,
     pub copilot_models_result: Option<Vec<String>>,
+
+    // Manage Teams state
+    pub team_list: Vec<Team>,
+    pub team_list_index: usize,
+    pub team_detail_team: Option<Team>,
+    pub team_detail_roles: Vec<Role>,
+    pub team_detail_index: usize,
+
+    // Team form (new/edit)
+    pub team_form_fields: [String; 3],    // [name, description, team_prompt]
+    pub team_form_focus: u8,              // 0=name, 1=description, 2=team_prompt, 3=role selection
+    pub team_form_cursor: usize,          // cursor position within current field (char index)
+    pub team_form_editing: Option<String>, // Some(id)=editing existing, None=new
+    pub team_form_clone_roles: Vec<String>, // role_ids to copy when cloning a builtin team
+    pub team_form_role_list: Vec<Role>,       // all available roles for selection
+    pub team_form_role_selections: Vec<bool>, // parallel to team_form_role_list
+    pub team_form_role_scroll: usize,         // currently highlighted index in role list
+
+    // Role list
+    pub role_list: Vec<Role>,
+    pub role_list_index: usize,
+
+    // Role form (new/edit)
+    pub role_form_fields: [String; 3],    // [name, description, prompt_template]
+    pub role_form_focus: u8,              // 0-2
+    pub role_form_cursor: usize,          // cursor position within current field (char index)
+    pub role_form_editing: Option<String>, // Some(id)=editing, None=new
+    pub role_form_clone_source: Option<String>, // Some(builtin_id) when cloning a builtin role
+
+    // Add role to team
+    pub add_role_available: Vec<Role>,    // roles not yet in current team
+    pub add_role_index: usize,
+    pub add_role_selections: Vec<bool>,  // parallel to add_role_available
+
+    // Delete confirmation (inline footer)
+    pub confirm_delete: Option<(String, DeleteTarget)>, // (display_name, target)
+
+    // Project-local DB path (set when project_path is known)
+    pub project_db_path: Option<PathBuf>,
 }
 
 impl App {
@@ -436,9 +471,12 @@ impl App {
             retry_target_id: 0,
             retry_form_fields: [String::new(), String::new(), String::new(), String::new()],
             retry_form_focus: 0,
+            retry_error_summary: String::new(),
+            retry_form_scroll: 0,
             delete_confirm_id: 0,
             leader_context_pct: None,
             leader_git_branch: None,
+            leader_output_style: None,
             recovery_session: None,
             recovery_choice: 0,
             branch_list: Vec::new(),
@@ -460,7 +498,38 @@ impl App {
             copilot_verification_uri: None,
             copilot_auth_error: None,
             copilot_models_result: None,
+            team_list: Vec::new(),
+            team_list_index: 0,
+            team_detail_team: None,
+            team_detail_roles: Vec::new(),
+            team_detail_index: 0,
+            team_form_fields: [String::new(), String::new(), String::new()],
+            team_form_focus: 0,
+            team_form_cursor: 0,
+            team_form_editing: None,
+            team_form_clone_roles: Vec::new(),
+            team_form_role_list: Vec::new(),
+            team_form_role_selections: Vec::new(),
+            team_form_role_scroll: 0,
+            role_list: Vec::new(),
+            role_list_index: 0,
+            role_form_fields: [String::new(), String::new(), String::new()],
+            role_form_focus: 0,
+            role_form_cursor: 0,
+            role_form_editing: None,
+            role_form_clone_source: None,
+            add_role_available: Vec::new(),
+            add_role_index: 0,
+            add_role_selections: Vec::new(),
+            confirm_delete: None,
+            project_db_path: None,
         }
+    }
+
+    /// Open the project-local database (squad_sessions, tickets, etc.)
+    pub fn open_project_db(&self) -> Option<legion_db::Repository> {
+        self.project_db_path.as_ref()
+            .and_then(|p| legion_db::open_project_db(p).ok())
     }
 
     /// Add a pane, spawning a Claude Code PTY inside it
@@ -775,12 +844,31 @@ impl App {
             max_iterations: Some(self.default_max_iterations as i64),
         };
 
-        if let Ok(repo) = legion_db::open_db() {
+        if let Some(repo) = self.open_project_db() {
             repo.upsert_squad_session(&session)?;
         }
 
         self.current_session = Some(session);
         Ok(paths)
+    }
+
+    /// Load teams from the orchestrate DB for the leader prompt
+    fn load_teams_for_leader(&self) -> Vec<(String, String, Vec<String>)> {
+        if let Some(ref engine) = self.orchestrate {
+            if let Some(db) = engine.db() {
+                if let Ok(db_lock) = db.lock() {
+                    if let Ok(teams) = db_lock.list_teams() {
+                        return teams.into_iter().map(|t| {
+                            let role_names: Vec<String> = t.role_ids.iter().filter_map(|rid| {
+                                db_lock.get_role(rid).ok().flatten().map(|r| r.name)
+                            }).collect();
+                            (t.id, t.name, role_names)
+                        }).collect();
+                    }
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// Get worktree path for a pane in the current session
@@ -862,7 +950,7 @@ impl App {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        if let Ok(repo) = legion_db::open_db() {
+        if let Some(repo) = self.open_project_db() {
             if migrate {
                 let default_session_name = self.default_session_name_for_default();
                 repo.migrate_tickets_to_session(&session.name, &default_session_name)?;
@@ -883,7 +971,8 @@ impl App {
     /// Delete a session entirely: remove worktrees, delete all tickets/logs, delete DB record.
     /// Cannot delete a default session.
     pub fn delete_session(&mut self, session_name: &str) -> anyhow::Result<()> {
-        let repo = legion_db::open_db()?;
+        let repo = self.open_project_db()
+            .ok_or_else(|| anyhow::anyhow!("No project database available"))?;
         let session = repo.get_squad_session(session_name)?
             .ok_or_else(|| anyhow::anyhow!("Session '{}' not found", session_name))?;
 
@@ -918,7 +1007,7 @@ impl App {
     }
 
     pub fn load_session_list(&mut self) {
-        if let Ok(repo) = legion_db::open_db() {
+        if let Some(repo) = self.open_project_db() {
             self.session_list = repo.list_squad_sessions().unwrap_or_default();
         }
         // Check branch status for all sessions
@@ -962,7 +1051,7 @@ impl App {
         // Create or verify worktrees
         let worktree_paths = if is_resume {
             // Load session from DB and update last_active_at
-            if let Ok(repo) = legion_db::open_db() {
+            if let Some(repo) = self.open_project_db() {
                 self.current_session = repo.get_squad_session(name).ok().flatten();
                 let _ = repo.touch_squad_session(name);
             }
@@ -1006,7 +1095,8 @@ impl App {
         // (Worker PTY sizes no longer needed — workers use SDK mode)
 
         // Generate system prompts (leader only — workers get prompts via SDK dispatch)
-        let leader_prompt = crate::claudemd::leader_instructions(worker_count);
+        let teams_for_leader = self.load_teams_for_leader();
+        let leader_prompt = crate::claudemd::leader_instructions(worker_count, &teams_for_leader);
 
         // Write /split-tickets command to leader worktree
         if let Err(e) = crate::claudemd::write_leader_commands(&worktree_paths[0], worker_count) {
@@ -1073,7 +1163,7 @@ impl App {
         let session_name = self.current_session.as_ref()
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "default".to_string());
-        let engine = if let Ok(repo) = legion_db::open_db() {
+        let engine = if let Some(repo) = self.open_project_db() {
             let repo = std::sync::Arc::new(std::sync::Mutex::new(repo));
             legion_core::OrchestrateEngine::with_db(worker_count, repo, session_name)
         } else {
@@ -1141,10 +1231,11 @@ impl App {
             let use_proxy = self.pane_uses_proxy(&label);
             let working_dir = self.pane_worktree(&label);
             let prompt = if i == 0 {
-                crate::claudemd::leader_instructions(worker_count)
+                let teams_for_leader = self.load_teams_for_leader();
+                crate::claudemd::leader_instructions(worker_count, &teams_for_leader)
             } else {
                 let wd_str = working_dir.as_ref().map(|p| p.to_string_lossy().to_string());
-                crate::claudemd::worker_instructions(i as u16, wd_str.as_deref(), None)
+                crate::claudemd::worker_instructions(i as u16, wd_str.as_deref(), None, None)
             };
 
             match crate::pty::PtyHandle::spawn(
@@ -1178,6 +1269,8 @@ impl App {
                 items.push(MainMenuItem::SwitchBranch);
             }
         }
+        items.push(MainMenuItem::ManageTeams);
+        items.push(MainMenuItem::ManageRoles);
         items.push(MainMenuItem::SwitchSession);
         items.push(MainMenuItem::CompleteSession);
         items
@@ -1191,9 +1284,10 @@ impl App {
     /// Persist the current worker count to the DB session record.
     pub fn persist_worker_count(&mut self) {
         let wc = self.worker_count() as i64;
+        let repo = self.open_project_db();
         if let Some(ref mut session) = self.current_session {
             session.worker_count = wc;
-            if let Ok(repo) = legion_db::open_db() {
+            if let Some(repo) = repo {
                 let _ = repo.upsert_squad_session(session);
             }
         }
@@ -1248,6 +1342,20 @@ impl App {
                         self.branch_list_index = 0;
                         self.recovery_session = None;
                         self.mode = AppMode::Popup(PopupMenu::BranchList);
+                    }
+                    MainMenuItem::ManageTeams => {
+                        if let Ok(repo) = legion_db::open_db() {
+                            self.team_list = repo.list_teams().unwrap_or_default();
+                        }
+                        self.team_list_index = 0;
+                        self.mode = AppMode::Popup(PopupMenu::ManageTeams);
+                    }
+                    MainMenuItem::ManageRoles => {
+                        if let Ok(repo) = legion_db::open_db() {
+                            self.role_list = repo.list_roles().unwrap_or_default();
+                        }
+                        self.role_list_index = 0;
+                        self.mode = AppMode::Popup(PopupMenu::RoleList);
                     }
                     MainMenuItem::SwitchSession => {
                         self.load_session_list();
@@ -1359,6 +1467,10 @@ impl App {
             AppMode::Popup(PopupMenu::CompleteSession) => 3,
             AppMode::Popup(PopupMenu::RemoveWorkerList) => self.worker_count(),
             AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => 0,
+            AppMode::Popup(PopupMenu::ManageTeams) => self.team_list.len(),
+            AppMode::Popup(PopupMenu::TeamDetail) => self.team_detail_roles.len(),
+            AppMode::Popup(PopupMenu::RoleList) => self.role_list.len(),
+            AppMode::Popup(PopupMenu::AddRoleToTeam) => self.add_role_available.len(),
             _ => return,
         };
         let idx = match self.mode {
@@ -1368,6 +1480,10 @@ impl App {
             AppMode::Popup(PopupMenu::CompleteSession) => &mut self.complete_merge_index,
             AppMode::Popup(PopupMenu::RemoveWorkerList) => &mut self.remove_worker_target,
             AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => &mut self.remove_worker_strategy_index,
+            AppMode::Popup(PopupMenu::ManageTeams) => &mut self.team_list_index,
+            AppMode::Popup(PopupMenu::TeamDetail) => &mut self.team_detail_index,
+            AppMode::Popup(PopupMenu::RoleList) => &mut self.role_list_index,
+            AppMode::Popup(PopupMenu::AddRoleToTeam) => &mut self.add_role_index,
             _ => &mut self.submenu_index,
         };
         *idx = if *idx > 0 { *idx - 1 } else { len.saturating_sub(1) };
@@ -1385,6 +1501,10 @@ impl App {
             AppMode::Popup(PopupMenu::CompleteSession) => 3,
             AppMode::Popup(PopupMenu::RemoveWorkerList) => self.worker_count(),
             AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => 0,
+            AppMode::Popup(PopupMenu::ManageTeams) => self.team_list.len(),
+            AppMode::Popup(PopupMenu::TeamDetail) => self.team_detail_roles.len(),
+            AppMode::Popup(PopupMenu::RoleList) => self.role_list.len(),
+            AppMode::Popup(PopupMenu::AddRoleToTeam) => self.add_role_available.len(),
             _ => return,
         };
         let idx = match self.mode {
@@ -1394,6 +1514,10 @@ impl App {
             AppMode::Popup(PopupMenu::CompleteSession) => &mut self.complete_merge_index,
             AppMode::Popup(PopupMenu::RemoveWorkerList) => &mut self.remove_worker_target,
             AppMode::Popup(PopupMenu::RemoveWorkerConfirm) => &mut self.remove_worker_strategy_index,
+            AppMode::Popup(PopupMenu::ManageTeams) => &mut self.team_list_index,
+            AppMode::Popup(PopupMenu::TeamDetail) => &mut self.team_detail_index,
+            AppMode::Popup(PopupMenu::RoleList) => &mut self.role_list_index,
+            AppMode::Popup(PopupMenu::AddRoleToTeam) => &mut self.add_role_index,
             _ => &mut self.submenu_index,
         };
         *idx = if *idx < len.saturating_sub(1) { *idx + 1 } else { 0 };
@@ -1527,6 +1651,22 @@ impl App {
         Vec::new()
     }
 
+    /// Resolve team_prompt from the database for the given team_id
+    fn resolve_team_prompt(&self, team_id: &str) -> Option<String> {
+        if let Some(ref engine) = self.orchestrate {
+            if let Some(db) = engine.db() {
+                if let Ok(db_lock) = db.lock() {
+                    if let Ok(Some(team)) = db_lock.get_team(team_id) {
+                        if !team.team_prompt.is_empty() {
+                            return Some(team.team_prompt);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Start an SDK task on a worker pane
     pub fn start_sdk_task(
         &mut self,
@@ -1539,6 +1679,7 @@ impl App {
         title: &str,
         context: Option<&str>,
         criteria: Option<&str>,
+        structure_plan: Option<&str>,
     ) {
         // Compute values before mutable borrow
         let pane_label = self.panes[pane_index].label.clone();
@@ -1563,7 +1704,7 @@ impl App {
         let wd_str = working_dir.as_ref().map(|p| p.to_string_lossy().to_string());
         let sys_prompt = match team_mode {
             legion_core::TeamMode::Solo => {
-                crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), Some(&[]))
+                crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), Some(&[]), None)
             }
             legion_core::TeamMode::TechLeadTeam | legion_core::TeamMode::Custom(_) => {
                 let team_name = match team_mode {
@@ -1573,12 +1714,30 @@ impl App {
                 };
                 let team_roles = self.resolve_team_roles(team_name);
                 if team_roles.is_empty() {
-                    crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), None)
+                    crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), None, None)
                 } else {
-                    crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), Some(&team_roles))
+                    let team_prompt_str = self.resolve_team_prompt(team_name);
+                    crate::claudemd::worker_instructions(
+                        pane_index as u16,
+                        wd_str.as_deref(),
+                        Some(&team_roles),
+                        team_prompt_str.as_deref(),
+                    )
                 }
             }
         };
+
+        // Gather project file tree from worker worktree via git ls-files
+        let file_tree = working_dir.as_ref().and_then(|wd| {
+            std::process::Command::new("git")
+                .args(["ls-files"])
+                .current_dir(wd)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
 
         // Build structured effective prompt with title, context, and criteria
         // Prepend working directory instruction directly in the user prompt (higher priority than system prompt)
@@ -1590,7 +1749,9 @@ impl App {
         } else {
             String::new()
         };
-        let structured_prompt = format!("{}{}", wd_prefix, build_structured_prompt(title, prompt, context, criteria));
+        let structured_prompt = format!("{}{}", wd_prefix, build_structured_prompt(
+            title, prompt, context, criteria, structure_plan, file_tree.as_deref(),
+        ));
 
         let wd = working_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
 
@@ -1687,9 +1848,22 @@ impl App {
 }
 
 /// Build a structured prompt from ticket fields for SDK execution
-fn build_structured_prompt(title: &str, prompt: &str, context: Option<&str>, criteria: Option<&str>) -> String {
+fn build_structured_prompt(
+    title: &str, prompt: &str, context: Option<&str>, criteria: Option<&str>,
+    structure_plan: Option<&str>, file_tree: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
     parts.push(format!("# Task: {}", title));
+
+    if let Some(plan) = structure_plan {
+        if !plan.is_empty() {
+            parts.push(String::new());
+            parts.push("## Architecture & Structure Plan".to_string());
+            parts.push(plan.to_string());
+            parts.push(String::new());
+            parts.push("**IMPORTANT**: Follow the file paths and conventions above exactly.".to_string());
+        }
+    }
 
     if let Some(ctx) = context {
         if !ctx.is_empty() {
@@ -1704,6 +1878,14 @@ fn build_structured_prompt(title: &str, prompt: &str, context: Option<&str>, cri
             parts.push(String::new());
             parts.push("## Success Criteria".to_string());
             parts.push(crit.to_string());
+        }
+    }
+
+    if let Some(tree) = file_tree {
+        if !tree.is_empty() {
+            parts.push(String::new());
+            parts.push("## Current Project Structure".to_string());
+            parts.push(format!("```\n{}\n```", tree));
         }
     }
 

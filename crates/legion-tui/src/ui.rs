@@ -43,9 +43,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let focused_pane = app.panes.get(app.focused_pane);
-    let provider = focused_pane
+    // Get provider from focused pane, or fallback to app-level default (e.g. during session selection)
+    let provider_idx = focused_pane
         .and_then(|p| p.current_provider)
-        .and_then(|i| app.providers.get(i));
+        .or(app.current_provider);
+    let provider = provider_idx.and_then(|i| app.providers.get(i));
     let is_default = provider.map(|p| p.id == "__default__").unwrap_or(false);
     let provider_name = if is_default {
         "Native (No Proxy)"
@@ -57,6 +59,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         focused_pane
             .and_then(|p| p.current_model.as_deref())
+            .or(app.current_model.as_deref())
             .unwrap_or("No Model")
     };
 
@@ -117,6 +120,20 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("]", Style::default().fg(Color::Gray)),
         indicator,
     ]);
+
+    // Claude Code output style / mode
+    if let Some(ref style) = app.leader_output_style {
+        let (label, color) = match style.as_str() {
+            "plan" => ("PLAN", Color::Yellow),
+            "streamjson" => ("JSON", Color::Magenta),
+            _ => (style.as_str(), Color::Cyan),
+        };
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // Git branch
     if let Some(ref branch) = app.leader_git_branch {
@@ -317,8 +334,20 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::styled(top_display, Style::default().fg(border_col))));
 
         // Content line — detail text brighter than border
-        let detail = format!("iter {}/{} \u{00b7} {} \u{00b7} {}",
-            t.iteration, t.max_iterations, format_elapsed(t.elapsed_secs), team_short);
+        let dep_suffix = if !t.blocked_by.is_empty() {
+            let dep_ids: Vec<String> = t.blocked_by.iter().map(|id| format!("#{}", id)).collect();
+            format!(" \u{2190}{}", dep_ids.join(","))
+        } else { String::new() };
+        let blocks_list: Vec<usize> = tickets.iter()
+            .filter(|other| other.blocked_by.contains(&t.id))
+            .map(|other| other.id).collect();
+        let blocks_suffix = if !blocks_list.is_empty() {
+            let ids: Vec<String> = blocks_list.iter().map(|id| format!("#{}", id)).collect();
+            format!(" \u{2192}{}", ids.join(","))
+        } else { String::new() };
+        let detail = format!("iter {}/{} \u{00b7} {} \u{00b7} {}{}{}",
+            t.iteration, t.max_iterations, format_elapsed(t.elapsed_secs), team_short,
+            dep_suffix, blocks_suffix);
         let content_line = format!("  \u{2502} {} ", detail);
         let content_pad = card_width.saturating_sub(detail.len() + 2);
         let content_full = format!("{}{}\u{2502}",
@@ -336,12 +365,24 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(Span::raw("")));
 
     // --- QUEUED section: compact ---
+    let blocked_count = queued.iter().filter(|t| {
+        !t.blocked_by.is_empty() && t.blocked_by.iter().any(|dep_id| {
+            tickets.iter().find(|tt| tt.id == *dep_id)
+                .map(|tt| tt.status != TicketStatus::Done)
+                .unwrap_or(false)
+        })
+    }).count();
+    let queued_header = if blocked_count > 0 {
+        format!(" \u{23f3} QUEUED ({}, {} blocked)", queued.len(), blocked_count)
+    } else {
+        format!(" \u{23f3} QUEUED ({})", queued.len())
+    };
     lines.push(Line::from(Span::styled(
-        format!(" \u{23f3} QUEUED ({})", queued.len()),
+        queued_header,
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )));
     for t in &queued {
-        lines.push(ticket_compact_line(t, app, false));
+        lines.push(ticket_compact_line(t, app, false, tickets));
     }
 
     lines.push(Line::from(Span::raw("")));
@@ -352,7 +393,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
     )));
     for t in &done {
-        lines.push(ticket_compact_line(t, app, true));
+        lines.push(ticket_compact_line(t, app, true, tickets));
     }
 
     lines.push(Line::from(Span::raw("")));
@@ -370,7 +411,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default().fg(Color::Red)
         };
-        lines.push(Line::from(vec![
+        let mut err_spans = vec![
             Span::styled(prefix.to_string(), Style::default().fg(Color::Yellow)),
             Span::styled(format!("#{} ", t.id), Style::default().fg(Color::Gray)),
             Span::styled(t.title.clone(), row_style),
@@ -378,7 +419,24 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
                 format!(" \u{00b7} ERR {}/{}", t.iteration, t.max_iterations),
                 Style::default().fg(Color::Red),
             ),
-        ]));
+        ];
+        if !t.blocked_by.is_empty() {
+            let dep_ids: Vec<String> = t.blocked_by.iter().map(|id| format!("#{}", id)).collect();
+            err_spans.push(Span::styled(
+                format!(" \u{2190}{}", dep_ids.join(",")),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        let err_blocks: Vec<String> = tickets.iter()
+            .filter(|other| other.blocked_by.contains(&t.id))
+            .map(|other| format!("#{}", other.id)).collect();
+        if !err_blocks.is_empty() {
+            err_spans.push(Span::styled(
+                format!(" \u{2192}{}", err_blocks.join(",")),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        lines.push(Line::from(err_spans));
     }
 
     // --- Action bar at bottom (only when focused) ---
@@ -433,11 +491,22 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Compact single-line ticket for Queued/Done sections
-fn ticket_compact_line<'a>(ticket: &TicketSnapshot, app: &App, show_elapsed: bool) -> Line<'a> {
+fn ticket_compact_line<'a>(ticket: &TicketSnapshot, app: &App, show_elapsed: bool, all_tickets: &[TicketSnapshot]) -> Line<'a> {
     let sel = app.right_panel_focused && app.board_selected == ticket.id;
     let prefix = if sel { "\u{25b6} " } else { "  " };
+
+    // Check if this queued ticket is blocked by unfinished dependencies
+    let is_blocked = ticket.status == TicketStatus::Queued && !ticket.blocked_by.is_empty()
+        && ticket.blocked_by.iter().any(|dep_id| {
+            all_tickets.iter()
+                .find(|t| t.id == *dep_id)
+                .map(|t| t.status != TicketStatus::Done)
+                .unwrap_or(false)
+        });
+
     let base_color = match ticket.status {
         TicketStatus::Done => Color::Green,
+        TicketStatus::Queued if is_blocked => Color::DarkGray,
         TicketStatus::Queued => Color::Cyan,
         _ => Color::Yellow,
     };
@@ -452,6 +521,40 @@ fn ticket_compact_line<'a>(ticket: &TicketSnapshot, app: &App, show_elapsed: boo
         Span::styled(format!("#{} ", ticket.id), Style::default().fg(Color::Gray)),
         Span::styled(ticket.title.clone(), row_style),
     ];
+    // Show dependency info
+    if is_blocked {
+        let pending_deps: Vec<String> = ticket.blocked_by.iter()
+            .filter(|dep_id| {
+                all_tickets.iter()
+                    .find(|t| t.id == **dep_id)
+                    .map(|t| t.status != TicketStatus::Done)
+                    .unwrap_or(false)
+            })
+            .map(|id| format!("#{}", id))
+            .collect();
+        spans.push(Span::styled(
+            format!(" \u{2190}{}", pending_deps.join(",")),
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else if !ticket.blocked_by.is_empty() {
+        // Has deps but all resolved
+        let dep_ids: Vec<String> = ticket.blocked_by.iter().map(|id| format!("#{}", id)).collect();
+        spans.push(Span::styled(
+            format!(" \u{2190}{}", dep_ids.join(",")),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    // Show downstream (what this ticket blocks)
+    let blocks: Vec<String> = all_tickets.iter()
+        .filter(|other| other.blocked_by.contains(&ticket.id))
+        .map(|other| format!("#{}", other.id))
+        .collect();
+    if !blocks.is_empty() {
+        spans.push(Span::styled(
+            format!(" \u{2192}{}", blocks.join(",")),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
     if show_elapsed && ticket.elapsed_secs > 0 {
         spans.push(Span::styled(
             format!(" \u{00b7} {}", format_elapsed(ticket.elapsed_secs)),
@@ -572,6 +675,48 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
         ]));
     }
 
+    // Dependencies
+    let all_tickets = app.ticket_snapshot.as_deref().unwrap_or(&[]);
+    let has_deps = !t.blocked_by.is_empty();
+    let blocks: Vec<usize> = all_tickets.iter()
+        .filter(|other| other.blocked_by.contains(&t.id))
+        .map(|other| other.id)
+        .collect();
+    if has_deps || !blocks.is_empty() {
+        let mut dep_spans: Vec<Span> = vec![
+            Span::styled(" Deps: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ];
+        if has_deps {
+            // Show upstream deps with status indicator
+            let dep_strs: Vec<String> = t.blocked_by.iter().map(|dep_id| {
+                let status_icon = all_tickets.iter().find(|tt| tt.id == *dep_id)
+                    .map(|tt| match tt.status {
+                        TicketStatus::Done => "\u{2713}",   // checkmark
+                        TicketStatus::Working => "\u{25b6}", // playing
+                        TicketStatus::Error => "\u{2717}",   // cross
+                        TicketStatus::Queued => "\u{23f3}",  // hourglass
+                    })
+                    .unwrap_or("?");
+                format!("{}#{}", status_icon, dep_id)
+            }).collect();
+            dep_spans.push(Span::styled(
+                format!("\u{2190} {}", dep_strs.join(" ")),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if has_deps && !blocks.is_empty() {
+            dep_spans.push(Span::styled("  ", Style::default()));
+        }
+        if !blocks.is_empty() {
+            let block_strs: Vec<String> = blocks.iter().map(|id| format!("#{}", id)).collect();
+            dep_spans.push(Span::styled(
+                format!("\u{2192} {}", block_strs.join(" ")),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        lines.push(Line::from(dep_spans));
+    }
+
     // --- Prompt (word-wrapped) ---
     if !t.prompt.is_empty() {
         let sep_w = inner.width.saturating_sub(2) as usize;
@@ -582,6 +727,26 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
         )));
         for wl in wrap_to_lines(&t.prompt, wrap_w) {
             lines.push(Line::from(Span::styled(format!(" {}", wl), Style::default().fg(Color::White))));
+        }
+    }
+
+    // --- Error reason (Error only — show what went wrong) ---
+    if t.status == TicketStatus::Error {
+        // Show feedback if it differs from summary (avoid duplication)
+        let error_text = t.feedback.as_deref()
+            .filter(|fb| !fb.is_empty() && t.summary.as_deref() != Some(*fb))
+            .or(t.summary.as_deref());
+        if let Some(err) = error_text {
+            let sep_w = inner.width.saturating_sub(2) as usize;
+            lines.push(Line::from(Span::raw("")));
+            lines.push(Line::from(Span::styled(
+                format!(" \u{2500}\u{2500}\u{2500} Error {}", "\u{2500}".repeat(sep_w.saturating_sub(11))),
+                Style::default().fg(Color::Red),
+            )));
+            let cleaned = clean_xml_tags(err);
+            for wl in wrap_to_lines(&cleaned, wrap_w) {
+                lines.push(Line::from(Span::styled(format!(" {}", wl), Style::default().fg(Color::Red))));
+            }
         }
     }
 
@@ -751,6 +916,56 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("Esc/N", Style::default().fg(Color::Yellow)),
                     Span::styled(": Cancel", Style::default().fg(Color::Gray)),
                 ],
+                PopupMenu::ManageTeams => vec![
+                    Span::styled(" j/k", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Nav ", Style::default().fg(Color::Gray)),
+                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                    Span::styled(": View ", Style::default().fg(Color::Gray)),
+                    Span::styled("n", Style::default().fg(Color::Yellow)),
+                    Span::styled(": New ", Style::default().fg(Color::Gray)),
+                    Span::styled("e", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Edit ", Style::default().fg(Color::Gray)),
+                    Span::styled("d", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Del", Style::default().fg(Color::Gray)),
+                ],
+                PopupMenu::TeamDetail => vec![
+                    Span::styled(" j/k", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Nav ", Style::default().fg(Color::Gray)),
+                    Span::styled("a", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Add Role ", Style::default().fg(Color::Gray)),
+                    Span::styled("d", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Remove ", Style::default().fg(Color::Gray)),
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Back", Style::default().fg(Color::Gray)),
+                ],
+                PopupMenu::TeamForm | PopupMenu::RoleForm => vec![
+                    Span::styled(" Tab", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Switch ", Style::default().fg(Color::Gray)),
+                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Save ", Style::default().fg(Color::Gray)),
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Cancel", Style::default().fg(Color::Gray)),
+                ],
+                PopupMenu::RoleList => vec![
+                    Span::styled(" j/k", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Nav ", Style::default().fg(Color::Gray)),
+                    Span::styled("n", Style::default().fg(Color::Yellow)),
+                    Span::styled(": New ", Style::default().fg(Color::Gray)),
+                    Span::styled("e", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Edit ", Style::default().fg(Color::Gray)),
+                    Span::styled("d", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Del ", Style::default().fg(Color::Gray)),
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Back", Style::default().fg(Color::Gray)),
+                ],
+                PopupMenu::AddRoleToTeam => vec![
+                    Span::styled(" j/k", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Nav ", Style::default().fg(Color::Gray)),
+                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Add ", Style::default().fg(Color::Gray)),
+                    Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                    Span::styled(": Back", Style::default().fg(Color::Gray)),
+                ],
                 PopupMenu::BranchRecovery | PopupMenu::BranchList | PopupMenu::BranchChanged => vec![
                     Span::styled(" j/k", Style::default().fg(Color::Yellow)),
                     Span::styled(": Navigate ", Style::default().fg(Color::Gray)),
@@ -791,6 +1006,12 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::BranchRecovery | PopupMenu::BranchChanged => (60, 30),
         PopupMenu::BranchList => (50, 60),
         PopupMenu::SetWorkerCount => (40, 60),
+        PopupMenu::ManageTeams => (60, 60),
+        PopupMenu::TeamDetail => (70, 70),
+        PopupMenu::TeamForm => (60, 30),
+        PopupMenu::RoleList => (60, 60),
+        PopupMenu::RoleForm => (70, 60),
+        PopupMenu::AddRoleToTeam => (60, 60),
         PopupMenu::DeleteConfirm | PopupMenu::ClearConfirm => (50, 30),
         PopupMenu::SessionDeleteConfirm => (55, 40),
         PopupMenu::CompleteRecordChoice => (55, 25),
@@ -824,6 +1045,12 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::BranchChanged => draw_branch_changed(frame, app, area),
         PopupMenu::CopilotAuth => draw_copilot_auth(frame, app, area),
         PopupMenu::SetWorkerCount => draw_set_worker_count(frame, app, area),
+        PopupMenu::ManageTeams => draw_manage_teams(frame, app, area),
+        PopupMenu::TeamDetail => draw_team_detail(frame, app, area),
+        PopupMenu::TeamForm => draw_team_form(frame, app, area),
+        PopupMenu::RoleList => draw_role_list(frame, app, area),
+        PopupMenu::RoleForm => draw_role_form(frame, app, area),
+        PopupMenu::AddRoleToTeam => draw_add_role_to_team(frame, app, area),
     }
 }
 
@@ -887,6 +1114,8 @@ fn draw_main_menu(frame: &mut Frame, app: &App, area: Rect) {
                         String::new()
                     }
                 }
+                MainMenuItem::ManageTeams => String::new(),
+                MainMenuItem::ManageRoles => String::new(),
                 MainMenuItem::CompleteSession => String::new(),
                 MainMenuItem::Quit => String::new(),
             };
@@ -1538,10 +1767,15 @@ fn draw_connect_provider(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::White)
             };
 
+            let desc = if tmpl.auth_method == "none" {
+                "  Claude Code native auth".to_string()
+            } else {
+                format!("  {}", tmpl.api_format)
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{}{}", prefix, tmpl.name), style),
                 Span::styled(badge, Style::default().fg(Color::Green)),
-                Span::styled(format!("  {}", tmpl.api_format), Style::default().fg(Color::Gray)),
+                Span::styled(desc, Style::default().fg(Color::Gray)),
             ]))
         })
         .collect();
@@ -1667,7 +1901,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 fn draw_retry_form(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
-        .title(format!(" Retry Ticket #{} [ESC] ", app.retry_target_id))
+        .title(format!(" Retry Ticket #{} ", app.retry_target_id))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::DarkGray));
@@ -1675,8 +1909,29 @@ fn draw_retry_form(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let wrap_width = inner.width.saturating_sub(6) as usize;
     let field_labels = ["Prompt", "Context", "Criteria", "Feedback"];
     let mut lines: Vec<Line> = Vec::new();
+
+    // Error summary at top (if present)
+    if !app.retry_error_summary.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  Error:",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        for wrapped in wrap_text(&app.retry_error_summary, wrap_width) {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", wrapped),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        // separator
+        let sep: String = "─".repeat(inner.width.saturating_sub(4) as usize);
+        lines.push(Line::from(Span::styled(
+            format!("  {}", sep),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     for (i, label) in field_labels.iter().enumerate() {
         let is_focused = app.retry_form_focus as usize == i;
@@ -1690,29 +1945,41 @@ fn draw_retry_form(frame: &mut Frame, app: &App, area: Rect) {
             label_style,
         )));
 
-        // Show field value (truncated to fit) with cursor if focused
         let val = &app.retry_form_fields[i];
-        let max_width = inner.width.saturating_sub(6) as usize;
-        let char_count = val.chars().count();
-        let display = if char_count > max_width {
-            let skip = char_count.saturating_sub(max_width.saturating_sub(3));
-            let tail: String = val.chars().skip(skip).collect();
-            format!("...{}", tail)
-        } else {
-            val.clone()
-        };
-        let field_text = if is_focused {
-            format!("  {}\u{2588}", display)
-        } else {
-            format!("  {}", display)
-        };
         let border_style = if is_focused {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::Gray)
         };
-        lines.push(Line::from(Span::styled(field_text, border_style)));
-        lines.push(Line::from(Span::raw("")));
+
+        if val.is_empty() {
+            let placeholder = if is_focused { "  \u{2588}" } else { "  (empty)" };
+            lines.push(Line::from(Span::styled(
+                placeholder.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            let wrapped = wrap_text(val, wrap_width);
+            for (li, line_text) in wrapped.iter().enumerate() {
+                let display = if is_focused && li == wrapped.len() - 1 {
+                    format!("  {}\u{2588}", line_text)
+                } else {
+                    format!("  {}", line_text)
+                };
+                lines.push(Line::from(Span::styled(display, border_style)));
+            }
+        }
+
+        // field separator
+        if i < 3 {
+            let sep: String = "─".repeat(inner.width.saturating_sub(4) as usize);
+            lines.push(Line::from(Span::styled(
+                format!("  {}", sep),
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            lines.push(Line::from(Span::raw("")));
+        }
     }
 
     lines.push(Line::from(vec![
@@ -1721,10 +1988,13 @@ fn draw_retry_form(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
         Span::styled(" Confirm  ", Style::default().fg(Color::Gray)),
         Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
-        Span::styled(" Cancel", Style::default().fg(Color::Gray)),
+        Span::styled(" Cancel  ", Style::default().fg(Color::Gray)),
+        Span::styled("[↑↓]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Scroll", Style::default().fg(Color::Gray)),
     ]));
 
-    let paragraph = Paragraph::new(lines);
+    let paragraph = Paragraph::new(lines)
+        .scroll((app.retry_form_scroll, 0));
     frame.render_widget(paragraph, inner);
 }
 
@@ -1865,6 +2135,38 @@ fn truncate_str(s: &str, max: usize) -> String {
         let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
         format!("{}...", truncated)
     }
+}
+
+/// Word-wrap text: split on existing newlines first, then wrap long lines at word boundaries.
+fn wrap_text(s: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(10);
+    let mut result = Vec::new();
+    for line in s.lines() {
+        if line.len() <= max_width {
+            result.push(line.to_string());
+        } else {
+            // Wrap at word boundaries
+            let mut current = String::new();
+            for word in line.split_whitespace() {
+                if current.is_empty() {
+                    current = word.to_string();
+                } else if current.len() + 1 + word.len() <= max_width {
+                    current.push(' ');
+                    current.push_str(word);
+                } else {
+                    result.push(current);
+                    current = word.to_string();
+                }
+            }
+            if !current.is_empty() {
+                result.push(current);
+            }
+        }
+    }
+    if result.is_empty() && !s.is_empty() {
+        result.push(s.to_string());
+    }
+    result
 }
 
 fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
@@ -2320,6 +2622,14 @@ fn draw_copilot_auth(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_set_worker_count(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
     let block = Block::default()
         .title(" Set Workers [1-8] ")
         .borders(Borders::ALL)
@@ -2338,7 +2648,7 @@ fn draw_set_worker_count(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     for n in 1..=crate::app::MAX_WORKERS {
-        let marker = if n == selected { " ▶ " } else { "   " };
+        let marker = if n == selected { " \u{25b8} " } else { "   " };
         let label = if n == current {
             format!("{}{}  (current)", marker, n)
         } else {
@@ -2354,13 +2664,677 @@ fn draw_set_worker_count(frame: &mut Frame, app: &App, area: Rect) {
         items.push(ListItem::new(Line::from(Span::styled(label, style))));
     }
 
-    items.push(ListItem::new(""));
-    items.push(ListItem::new(Line::from(vec![
-        Span::styled("  [Enter] ", Style::default().fg(Color::Green)),
-        Span::styled("Apply  ", Style::default().fg(Color::Gray)),
-        Span::styled("[Esc] ", Style::default().fg(Color::Yellow)),
-        Span::styled("Cancel", Style::default().fg(Color::Gray)),
-    ])));
+    frame.render_widget(List::new(items).block(block), chunks[0]);
 
-    frame.render_widget(List::new(items).block(block), area);
+    // Footer
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(" Enter", Style::default().fg(Color::Green)),
+            Span::styled(": Apply  ", Style::default().fg(Color::Gray)),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled(": Cancel", Style::default().fg(Color::Gray)),
+        ]),
+    ])
+    .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(footer, chunks[1]);
+}
+
+fn draw_manage_teams(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    let block = Block::default()
+        .title(" Manage Teams ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let mut items: Vec<ListItem> = Vec::new();
+
+    if app.team_list.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  No teams yet \u{2014} press [n] to create",
+            Style::default().fg(Color::Gray),
+        ))));
+    } else {
+        for (i, team) in app.team_list.iter().enumerate() {
+            let selected = i == app.team_list_index;
+            let prefix = if selected { " \u{25b8} " } else { "   " };
+            let builtin_tag = if team.is_builtin { " [builtin]" } else { "" };
+            let role_count = team.role_ids.len();
+            let label = format!(
+                "{}{}  ({} role{}){}",
+                prefix,
+                team.name,
+                role_count,
+                if role_count == 1 { "" } else { "s" },
+                builtin_tag,
+            );
+            let style = if selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            items.push(ListItem::new(Line::from(Span::styled(label, style))));
+
+            // Show description for selected item
+            if selected && !team.description.is_empty() {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("     {}", team.description),
+                    Style::default().fg(Color::Gray),
+                ))));
+            }
+        }
+    }
+
+    frame.render_widget(List::new(items).block(block), chunks[0]);
+
+    // Footer
+    let footer_line = if let Some((ref name, _)) = app.confirm_delete {
+        Line::from(vec![
+            Span::styled(
+                format!(" Delete \"{}\"? ", name),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("[y] ", Style::default().fg(Color::Red)),
+            Span::styled("Yes  ", Style::default().fg(Color::Gray)),
+            Span::styled("[n/Esc] ", Style::default().fg(Color::Yellow)),
+            Span::styled("Cancel", Style::default().fg(Color::Gray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" Enter", Style::default().fg(Color::Green)),
+            Span::styled(": View  ", Style::default().fg(Color::Gray)),
+            Span::styled("n", Style::default().fg(Color::Yellow)),
+            Span::styled(": New  ", Style::default().fg(Color::Gray)),
+            Span::styled("e", Style::default().fg(Color::Yellow)),
+            Span::styled(": Edit  ", Style::default().fg(Color::Gray)),
+            Span::styled("d", Style::default().fg(Color::Red)),
+            Span::styled(": Delete  ", Style::default().fg(Color::Gray)),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled(": Back", Style::default().fg(Color::Gray)),
+        ])
+    };
+    let footer = Paragraph::new(vec![footer_line])
+        .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(footer, chunks[1]);
+}
+
+fn draw_team_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let team_name = app.team_detail_team.as_ref()
+        .map(|t| t.name.as_str())
+        .unwrap_or("Team");
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    let block = Block::default()
+        .title(format!(" {} - Roles ", team_name))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let mut items: Vec<ListItem> = Vec::new();
+
+    if let Some(ref team) = app.team_detail_team {
+        if !team.description.is_empty() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("  {}", team.description),
+                Style::default().fg(Color::Gray),
+            ))));
+            items.push(ListItem::new(""));
+        }
+    }
+
+    if app.team_detail_roles.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  No roles assigned \u{2014} press [a] to add",
+            Style::default().fg(Color::Gray),
+        ))));
+    } else {
+        for (i, role) in app.team_detail_roles.iter().enumerate() {
+            let selected = i == app.team_detail_index;
+            let prefix = if selected { " \u{25b8} " } else { "   " };
+            let builtin_tag = if role.is_builtin { " [builtin]" } else { "" };
+            let label = format!("{}{}{}", prefix, role.name, builtin_tag);
+            let style = if selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            items.push(ListItem::new(Line::from(Span::styled(label, style))));
+
+            // Show description + prompt_template for selected role
+            if selected {
+                if !role.description.is_empty() {
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        format!("     {}", role.description),
+                        Style::default().fg(Color::Gray),
+                    ))));
+                }
+                if !role.prompt_template.is_empty() {
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        "     Prompt:",
+                        Style::default().fg(Color::Cyan),
+                    ))));
+                    let max_w = chunks[0].width.saturating_sub(12) as usize;
+                    let wrapped = wrap_text(&role.prompt_template, max_w);
+                    for line in wrapped.iter().take(6) {
+                        items.push(ListItem::new(Line::from(Span::styled(
+                            format!("       {}", line),
+                            Style::default().fg(Color::Gray),
+                        ))));
+                    }
+                }
+            }
+        }
+    }
+
+    frame.render_widget(List::new(items).block(block), chunks[0]);
+
+    // Footer
+    let footer_line = if let Some((ref name, _)) = app.confirm_delete {
+        Line::from(vec![
+            Span::styled(
+                format!(" Remove \"{}\" from team? ", name),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("[y] ", Style::default().fg(Color::Red)),
+            Span::styled("Yes  ", Style::default().fg(Color::Gray)),
+            Span::styled("[n/Esc] ", Style::default().fg(Color::Yellow)),
+            Span::styled("Cancel", Style::default().fg(Color::Gray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" a", Style::default().fg(Color::Green)),
+            Span::styled(": Add Role  ", Style::default().fg(Color::Gray)),
+            Span::styled("d", Style::default().fg(Color::Red)),
+            Span::styled(": Remove  ", Style::default().fg(Color::Gray)),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled(": Back", Style::default().fg(Color::Gray)),
+        ])
+    };
+    let footer = Paragraph::new(vec![footer_line])
+        .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(footer, chunks[1]);
+}
+
+fn draw_team_form(frame: &mut Frame, app: &App, area: Rect) {
+    let title = if app.team_form_editing.is_some() || !app.team_form_clone_roles.is_empty() {
+        " Edit Team "
+    } else {
+        " New Team "
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let field_labels = ["Name", "Description"];
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Render Name and Description as single-line fields
+    for (i, label) in field_labels.iter().enumerate() {
+        let is_focused = app.team_form_focus as usize == i;
+        let label_style = if is_focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(format!("  {}:", label), label_style)));
+
+        let val = &app.team_form_fields[i];
+        if is_focused {
+            let cursor = app.team_form_cursor;
+            let before: String = val.chars().take(cursor).collect();
+            let after: String = val.chars().skip(cursor).collect();
+            lines.push(Line::from(Span::styled(
+                format!("  {}\u{2588}{}", before, after),
+                Style::default().fg(Color::Yellow),
+            )));
+        } else {
+            let max_width = inner.width.saturating_sub(6) as usize;
+            let display = truncate_str(val, max_width);
+            lines.push(Line::from(Span::styled(
+                format!("  {}", display),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        lines.push(Line::from(Span::raw("")));
+    }
+
+    // Team Prompt field (focus == 2): word-wrapped multi-line
+    {
+        let is_focused = app.team_form_focus == 2;
+        let label_style = if is_focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled("  Team Prompt:", label_style)));
+
+        let val = &app.team_form_fields[2];
+        let max_width = inner.width.saturating_sub(6) as usize;
+        let wrapped = wrap_text(val, max_width);
+        let max_display = if is_focused { 6 } else { 3 };
+
+        if is_focused {
+            let cursor = app.team_form_cursor;
+            let mut char_offset = 0;
+            for (li, line) in wrapped.iter().take(max_display).enumerate() {
+                let line_chars = line.chars().count();
+                let cursor_on_this_line = cursor >= char_offset && cursor <= char_offset + line_chars
+                    && (li == wrapped.len().min(max_display) - 1 || cursor < char_offset + line_chars);
+                if cursor_on_this_line {
+                    let pos = cursor - char_offset;
+                    let before: String = line.chars().take(pos).collect();
+                    let after: String = line.chars().skip(pos).collect();
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}\u{2588}{}", before, after),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", line),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+                char_offset += line_chars;
+            }
+            if wrapped.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  \u{2588}",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+        } else {
+            for line in wrapped.iter().take(3) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", line),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+            if val.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  (optional team collaboration guidance)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        if wrapped.len() > max_display {
+            lines.push(Line::from(Span::styled(
+                format!("  ... ({} more lines)", wrapped.len() - max_display),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        lines.push(Line::from(Span::raw("")));
+    }
+
+    // Role selection section
+    let roles_focused = app.team_form_focus == 3;
+    let roles_label_style = if roles_focused {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    lines.push(Line::from(Span::styled("  Roles:", roles_label_style)));
+
+    if app.team_form_role_list.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    No roles available",
+            Style::default().fg(Color::Gray),
+        )));
+    } else {
+        let visible = 5usize;
+        let total = app.team_form_role_list.len();
+        let scroll = app.team_form_role_scroll;
+        let start = if total <= visible { 0 } else { scroll.saturating_sub(visible / 2).min(total.saturating_sub(visible)) };
+        let end = (start + visible).min(total);
+
+        for i in start..end {
+            let role = &app.team_form_role_list[i];
+            let is_highlighted = scroll == i && roles_focused;
+            let checked = if app.team_form_role_selections.get(i).copied().unwrap_or(false) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let prefix = if is_highlighted { " \u{25b8}" } else { "  " };
+            let label = format!("{} {} {}", prefix, checked, role.name);
+            let style = if is_highlighted {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else if app.team_form_role_selections.get(i).copied().unwrap_or(false) {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(Span::styled(label, style)));
+        }
+
+        if total > visible {
+            lines.push(Line::from(Span::styled(
+                format!("    ({} total roles)", total),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+
+    lines.push(Line::from(Span::raw("")));
+
+    if app.team_form_editing.is_none() && !app.team_form_clone_roles.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (cloning from builtin team)",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("  [\u{2190}\u{2192}]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Cursor  ", Style::default().fg(Color::Gray)),
+        Span::styled("[\u{2191}\u{2193}/Tab]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Field  ", Style::default().fg(Color::Gray)),
+        Span::styled("[Space]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Toggle  ", Style::default().fg(Color::Gray)),
+        Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Save  ", Style::default().fg(Color::Gray)),
+        Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Cancel", Style::default().fg(Color::Gray)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_role_list(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    let block = Block::default()
+        .title(" All Roles ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let mut items: Vec<ListItem> = Vec::new();
+
+    if app.role_list.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  No roles yet \u{2014} press [n] to create",
+            Style::default().fg(Color::Gray),
+        ))));
+    } else {
+        for (i, role) in app.role_list.iter().enumerate() {
+            let selected = i == app.role_list_index;
+            let prefix = if selected { " \u{25b8} " } else { "   " };
+            let builtin_tag = if role.is_builtin { " [builtin]" } else { "" };
+            let desc_preview = if role.description.len() > 40 {
+                format!(" - {}...", &role.description[..37])
+            } else if !role.description.is_empty() {
+                format!(" - {}", role.description)
+            } else {
+                String::new()
+            };
+            let label = format!("{}{}{}{}", prefix, role.name, builtin_tag, desc_preview);
+            let style = if selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            items.push(ListItem::new(Line::from(Span::styled(label, style))));
+
+            // Show prompt_template preview for selected (word-wrapped)
+            if selected && !role.prompt_template.is_empty() {
+                let max_w = chunks[0].width.saturating_sub(12) as usize;
+                let wrapped = wrap_text(&role.prompt_template, max_w);
+                for line in wrapped.iter().take(4) {
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        format!("       {}", line),
+                        Style::default().fg(Color::Gray),
+                    ))));
+                }
+            }
+        }
+    }
+
+    frame.render_widget(List::new(items).block(block), chunks[0]);
+
+    // Footer
+    let footer_line = if let Some((ref name, _)) = app.confirm_delete {
+        Line::from(vec![
+            Span::styled(
+                format!(" Delete \"{}\"? ", name),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("[y] ", Style::default().fg(Color::Red)),
+            Span::styled("Yes  ", Style::default().fg(Color::Gray)),
+            Span::styled("[n/Esc] ", Style::default().fg(Color::Yellow)),
+            Span::styled("Cancel", Style::default().fg(Color::Gray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" n", Style::default().fg(Color::Green)),
+            Span::styled(": New  ", Style::default().fg(Color::Gray)),
+            Span::styled("e", Style::default().fg(Color::Yellow)),
+            Span::styled(": Edit  ", Style::default().fg(Color::Gray)),
+            Span::styled("d", Style::default().fg(Color::Red)),
+            Span::styled(": Delete  ", Style::default().fg(Color::Gray)),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled(": Back", Style::default().fg(Color::Gray)),
+        ])
+    };
+    let footer = Paragraph::new(vec![footer_line])
+        .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(footer, chunks[1]);
+}
+
+fn draw_role_form(frame: &mut Frame, app: &App, area: Rect) {
+    let title = if app.role_form_editing.is_some() || app.role_form_clone_source.is_some() {
+        " Edit Role "
+    } else {
+        " New Role "
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let field_labels = ["Name", "Description", "Prompt Template"];
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (i, label) in field_labels.iter().enumerate() {
+        let is_focused = app.role_form_focus as usize == i;
+        let label_style = if is_focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(format!("  {}:", label), label_style)));
+
+        let val = &app.role_form_fields[i];
+        let max_width = inner.width.saturating_sub(6) as usize;
+
+        if i == 2 {
+            // Prompt template: word-wrap long lines then show multiple
+            let wrapped = wrap_text(val, max_width);
+            let max_display = if is_focused { 8 } else { 3 };
+            if is_focused {
+                // Find which wrapped line the cursor is on
+                let cursor = app.role_form_cursor;
+                let mut char_offset = 0;
+                for (li, line) in wrapped.iter().take(max_display).enumerate() {
+                    let line_chars = line.chars().count();
+                    let cursor_on_this_line = cursor >= char_offset && cursor <= char_offset + line_chars
+                        && (li == wrapped.len().min(max_display) - 1 || cursor < char_offset + line_chars);
+                    if cursor_on_this_line {
+                        let pos = cursor - char_offset;
+                        let before: String = line.chars().take(pos).collect();
+                        let after: String = line.chars().skip(pos).collect();
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}\u{2588}{}", before, after),
+                            Style::default().fg(Color::Yellow),
+                        )));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", line),
+                            Style::default().fg(Color::Yellow),
+                        )));
+                    }
+                    char_offset += line_chars;
+                }
+                if wrapped.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  \u{2588}",
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+            } else {
+                for line in wrapped.iter().take(3) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", line),
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+            }
+            if wrapped.len() > max_display {
+                lines.push(Line::from(Span::styled(
+                    format!("  ... ({} more lines)", wrapped.len() - max_display),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+        } else {
+            // Single-line fields with cursor
+            if is_focused {
+                let cursor = app.role_form_cursor;
+                let before: String = val.chars().take(cursor).collect();
+                let after: String = val.chars().skip(cursor).collect();
+                lines.push(Line::from(Span::styled(
+                    format!("  {}\u{2588}{}", before, after),
+                    Style::default().fg(Color::Yellow),
+                )));
+            } else {
+                let display = truncate_str(val, max_width);
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", display),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+        }
+        lines.push(Line::from(Span::raw("")));
+    }
+
+    if let Some(ref source) = app.role_form_clone_source {
+        lines.push(Line::from(Span::styled(
+            format!("  (cloning from \"{}\")", source),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("  [\u{2190}\u{2192}]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Cursor  ", Style::default().fg(Color::Gray)),
+        Span::styled("[\u{2191}\u{2193}/Tab]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Field  ", Style::default().fg(Color::Gray)),
+        Span::styled("[Enter]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Save  ", Style::default().fg(Color::Gray)),
+        Span::styled("[Esc]", Style::default().fg(Color::Yellow)),
+        Span::styled(" Cancel", Style::default().fg(Color::Gray)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_add_role_to_team(frame: &mut Frame, app: &App, area: Rect) {
+    let team_name = app.team_detail_team.as_ref()
+        .map(|t| t.name.as_str())
+        .unwrap_or("Team");
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    let block = Block::default()
+        .title(format!(" Add Role to {} ", team_name))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::DarkGray));
+
+    let mut items: Vec<ListItem> = Vec::new();
+
+    if app.add_role_available.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  No available roles to add",
+            Style::default().fg(Color::Gray),
+        ))));
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  (all roles already in team)",
+            Style::default().fg(Color::Gray),
+        ))));
+    } else {
+        for (i, role) in app.add_role_available.iter().enumerate() {
+            let selected = i == app.add_role_index;
+            let prefix = if selected { " \u{25b8} " } else { "   " };
+            let builtin_tag = if role.is_builtin { " [builtin]" } else { "" };
+            let desc = if role.description.len() > 40 {
+                format!(" - {}...", &role.description[..37])
+            } else if !role.description.is_empty() {
+                format!(" - {}", role.description)
+            } else {
+                String::new()
+            };
+            let checked = if app.add_role_selections.get(i).copied().unwrap_or(false) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let label = format!("{} {} {}{}{}", prefix, checked, role.name, builtin_tag, desc);
+            let style = if selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            items.push(ListItem::new(Line::from(Span::styled(label, style))));
+        }
+    }
+
+    frame.render_widget(List::new(items).block(block), chunks[0]);
+
+    // Footer
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(" Space", Style::default().fg(Color::Yellow)),
+            Span::styled(": Toggle  ", Style::default().fg(Color::Gray)),
+            Span::styled("Enter", Style::default().fg(Color::Green)),
+            Span::styled(": Add Selected  ", Style::default().fg(Color::Gray)),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled(": Back", Style::default().fg(Color::Gray)),
+        ]),
+    ])
+    .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(footer, chunks[1]);
 }
