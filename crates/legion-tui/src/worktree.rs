@@ -522,10 +522,28 @@ pub fn merge_worker_no_abort(
 
     if conflict_files.is_empty() && output.status.success() {
         // Clean merge — commit it
-        let _ = Command::new("git")
+        let commit_output = Command::new("git")
             .args(["commit", "--no-edit", "-m", &format!("Auto-merge: {} completed", worker_label)])
             .current_dir(&leader_dir)
             .output();
+
+        // Check if commit actually created (merge might be empty / already up-to-date)
+        match &commit_output {
+            Ok(o) if !o.status.success() => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stdout_str = String::from_utf8_lossy(&o.stdout);
+                tracing::warn!(
+                    "Merge commit may be empty for {}: stdout={}, stderr={}",
+                    worker_label,
+                    stdout_str.trim(),
+                    stderr.trim(),
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Merge commit command failed for {}: {}", worker_label, e);
+            }
+            _ => {}
+        }
 
         // Restore stash
         if did_stash {

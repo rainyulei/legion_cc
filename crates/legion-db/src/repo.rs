@@ -70,6 +70,7 @@ pub struct TicketRow {
     pub blocked_by: String,        // JSON array e.g. "[1, 3]"
     pub merge_status: String,      // "pending" / "merged" / "conflict" / "skipped"
     pub structure_plan: Option<String>,
+    pub is_checkpoint: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,7 +446,7 @@ impl Repository {
 
     pub fn insert_ticket(&self, ticket: &TicketRow) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO tickets (id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at, origin_session, base_commit, blocked_by, merge_status, structure_plan) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            "INSERT OR REPLACE INTO tickets (id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at, origin_session, base_commit, blocked_by, merge_status, structure_plan, is_checkpoint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 ticket.id,
                 ticket.session_name,
@@ -467,6 +468,7 @@ impl Repository {
                 ticket.blocked_by,
                 ticket.merge_status,
                 ticket.structure_plan,
+                ticket.is_checkpoint,
             ],
         )?;
         Ok(())
@@ -493,7 +495,7 @@ impl Repository {
 
     pub fn list_tickets_by_session(&self, session_name: &str) -> Result<Vec<TicketRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at, origin_session, base_commit, blocked_by, merge_status, structure_plan FROM tickets WHERE session_name = ? ORDER BY id"
+            "SELECT id, session_name, title, prompt, context, criteria, status, assigned_worker, team_mode, iteration, max_iterations, feedback, summary, created_at, updated_at, origin_session, base_commit, blocked_by, merge_status, structure_plan, is_checkpoint FROM tickets WHERE session_name = ? ORDER BY id"
         )?;
         let rows = stmt.query_map(params![session_name], |row| {
             Ok(TicketRow {
@@ -517,6 +519,7 @@ impl Repository {
                 blocked_by: row.get::<_, Option<String>>(17)?.unwrap_or_else(|| "[]".to_string()),
                 merge_status: row.get::<_, Option<String>>(18)?.unwrap_or_else(|| "pending".to_string()),
                 structure_plan: row.get(19)?,
+                is_checkpoint: row.get::<_, Option<bool>>(20)?.unwrap_or(false),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1097,6 +1100,7 @@ mod tests {
             blocked_by: "[]".to_string(),
             merge_status: "pending".to_string(),
             structure_plan: None,
+            is_checkpoint: false,
         };
         repo.insert_ticket(&ticket).unwrap();
         repo.append_ticket_log(1, "sess1", "log entry", 1000).unwrap();
@@ -1155,6 +1159,7 @@ mod tests {
                 blocked_by: "[]".to_string(),
                 merge_status: "pending".to_string(),
                 structure_plan: None,
+                is_checkpoint: false,
             }).unwrap();
             repo.append_ticket_log(i, "old-sess", &format!("log {}", i), 1000).unwrap();
         }

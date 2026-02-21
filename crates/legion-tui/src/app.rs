@@ -1252,7 +1252,7 @@ impl App {
                 crate::claudemd::leader_instructions(worker_count, &teams_for_leader)
             } else {
                 let wd_str = working_dir.as_ref().map(|p| p.to_string_lossy().to_string());
-                crate::claudemd::worker_instructions(i as u16, wd_str.as_deref(), None, None)
+                crate::claudemd::worker_instructions(i as u16, wd_str.as_deref(), None, None, false)
             };
 
             match crate::pty::PtyHandle::spawn(
@@ -1697,6 +1697,7 @@ impl App {
         context: Option<&str>,
         criteria: Option<&str>,
         structure_plan: Option<&str>,
+        is_checkpoint: bool,
     ) {
         // Compute values before mutable borrow
         let pane_label = self.panes[pane_index].label.clone();
@@ -1721,7 +1722,7 @@ impl App {
         let wd_str = working_dir.as_ref().map(|p| p.to_string_lossy().to_string());
         let sys_prompt = match team_mode {
             legion_core::TeamMode::Solo => {
-                crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), Some(&[]), None)
+                crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), Some(&[]), None, is_checkpoint)
             }
             legion_core::TeamMode::TechLeadTeam | legion_core::TeamMode::Custom(_) => {
                 let team_name = match team_mode {
@@ -1731,7 +1732,7 @@ impl App {
                 };
                 let team_roles = self.resolve_team_roles(team_name);
                 if team_roles.is_empty() {
-                    crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), None, None)
+                    crate::claudemd::worker_instructions(pane_index as u16, wd_str.as_deref(), None, None, is_checkpoint)
                 } else {
                     let team_prompt_str = self.resolve_team_prompt(team_name);
                     crate::claudemd::worker_instructions(
@@ -1739,6 +1740,7 @@ impl App {
                         wd_str.as_deref(),
                         Some(&team_roles),
                         team_prompt_str.as_deref(),
+                        is_checkpoint,
                     )
                 }
             }

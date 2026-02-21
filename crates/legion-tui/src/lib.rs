@@ -494,6 +494,12 @@ async fn run_event_loop(
                         tracing::info!("Worker {} ticket {} completed (promise found)", wi, ticket_id);
                         should_cache_diff = true;
                     } else {
+                        // Failed — log result text for debugging promise detection
+                        let preview: String = result_text.chars().take(200).collect();
+                        tracing::warn!(
+                            "Worker {} ticket {} NO promise found. result_text preview: {:?}",
+                            wi, ticket_id, preview
+                        );
                         // Failed — check if retry needed
                         let feedback = crate::sdk::extract_feedback(&result_text);
                         let should_retry = engine.report_iteration(ticket_id, false, Some(feedback.clone())).await;
@@ -515,8 +521,9 @@ async fn run_event_loop(
                                 // Clean up old SDK
                                 app.panes[wi].sdk_task = None;
                                 // Start new iteration
+                                let is_checkpoint = ts.is_checkpoint;
                                 app.start_sdk_task(wi, ticket_id, &prompt, &team_mode, iteration, Some(&feedback),
-                                    &title, context.as_deref(), criteria.as_deref(), structure_plan.as_deref());
+                                    &title, context.as_deref(), criteria.as_deref(), structure_plan.as_deref(), is_checkpoint);
                                 continue;
                             }
                         } else {
@@ -788,7 +795,7 @@ async fn run_event_loop(
                         }
 
                         app.start_sdk_task(wi, ts.id, &ts.prompt, &ts.team_mode, 1, None,
-                            ts.title.as_str(), ts.context.as_deref(), ts.criteria.as_deref(), ts.structure_plan.as_deref());
+                            ts.title.as_str(), ts.context.as_deref(), ts.criteria.as_deref(), ts.structure_plan.as_deref(), ts.is_checkpoint);
                     }
                 }
             }

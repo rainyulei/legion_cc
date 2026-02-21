@@ -107,6 +107,7 @@ async fn handle_request(
         (Method::POST, "/legion/orchestrate/dispatch") => handle_dispatch_compat(req, engine).await,
         (Method::POST, "/legion/orchestrate/report") => handle_report(req, engine).await,
         (Method::POST, "/legion/orchestrate/stop-all") => handle_stop_all(engine).await,
+        (Method::GET, p) if p.starts_with("/legion/orchestrate/deps") => handle_deps(req, engine).await,
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
             r#"{"error": "not found"}"#,
@@ -148,6 +149,8 @@ async fn handle_submit(
         blocked_by: Vec<usize>,
         #[serde(default)]
         structure_plan: Option<String>,
+        #[serde(default)]
+        is_checkpoint: bool,
     }
 
     match serde_json::from_slice::<SubmitRequest>(&body_bytes) {
@@ -158,7 +161,7 @@ async fn handle_submit(
                 _ => engine.default_max_iterations().await,
             };
             let id = match engine
-                .submit_ticket(req.title, req.ticket, req.context, req.criteria, mode, max_iter, req.blocked_by, req.structure_plan)
+                .submit_ticket(req.title, req.ticket, req.context, req.criteria, mode, max_iter, req.blocked_by, req.structure_plan, req.is_checkpoint)
                 .await {
                     Ok(id) => id,
                     Err(e) => return Ok(json_response(StatusCode::BAD_REQUEST, &format!(r#"{{"error": "{}"}}"#, e))),
@@ -211,7 +214,7 @@ async fn handle_dispatch_compat(
                 req.ticket.clone()
             };
             let id = match engine
-                .submit_ticket(title, req.ticket, None, None, super::engine::TeamMode::default(), 5, Vec::new(), None)
+                .submit_ticket(title, req.ticket, None, None, super::engine::TeamMode::default(), 5, Vec::new(), None, false)
                 .await {
                     Ok(id) => id,
                     Err(e) => return Ok(json_response(StatusCode::BAD_REQUEST, &format!(r#"{{"error": "{}"}}"#, e))),
@@ -322,6 +325,109 @@ async fn handle_stop_all(engine: OrchestrateEngine) -> Result<Response<Full<Byte
         StatusCode::OK,
         r#"{"status": "all_stopped"}"#,
     ))
+}
+
+/// GET /legion/orchestrate/deps?ticket_id=N — return dependency info for a ticket.
+/// Returns upstream tickets' summary, merge_status, diff_summary, and log_tail.
+async fn handle_deps(
+    req: Request<Incoming>,
+    engine: OrchestrateEngine,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    // Parse ticket_id from query string
+    let query = req.uri().query().unwrap_or("");
+    let ticket_id: Option<usize> = query.split('&')
+        .find_map(|pair| {
+            let mut kv = pair.splitn(2, '=');
+            match (kv.next(), kv.next()) {
+                (Some("ticket_id"), Some(v)) => v.parse().ok(),
+                _ => None,
+            }
+        });
+
+    let ticket_id = match ticket_id {
+        Some(id) => id,
+        None => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                r#"{"error": "ticket_id query parameter required"}"#,
+            ));
+        }
+    };
+
+    let all = engine.all_tickets().await;
+    let target = match all.iter().find(|t| t.id == ticket_id) {
+        Some(t) => t,
+        None => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &format!(r#"{{"error": "ticket {} not found"}}"#, ticket_id),
+            ));
+        }
+    };
+
+    let mut deps = Vec::new();
+    for dep_id in &target.blocked_by {
+        if let Some(dep) = all.iter().find(|t| t.id == *dep_id) {
+            let status_str = match dep.status {
+                super::engine::TicketStatus::Queued => "queued",
+                super::engine::TicketStatus::Working => "working",
+                super::engine::TicketStatus::Done => "done",
+                super::engine::TicketStatus::Error => "error",
+            };
+            let merge_str = match dep.merge_status {
+                super::engine::MergeStatus::Pending => "pending",
+                super::engine::MergeStatus::Merged => "merged",
+                super::engine::MergeStatus::Conflict => "conflict",
+                super::engine::MergeStatus::Skipped => "skipped",
+            };
+
+            // Try to get diff_summary and log_tail from DB
+            let mut diff_summary = serde_json::Value::Array(vec![]);
+            let mut log_tail = String::new();
+
+            if let (Some(db_arc), Some(session)) = (engine.db(), engine.session_name()) {
+                if let Ok(db) = db_arc.lock() {
+                    // Get diff summary
+                    if let Ok(Some(diff_row)) = db.get_ticket_diff(*dep_id as i64) {
+                        let files: Vec<serde_json::Value> = diff_row.file_summary.iter().map(|f| {
+                            serde_json::json!({
+                                "path": f.path,
+                                "status": f.status,
+                                "additions": f.additions,
+                                "deletions": f.deletions,
+                            })
+                        }).collect();
+                        diff_summary = serde_json::Value::Array(files);
+                    }
+                    // Get log tail (last 50 lines)
+                    if let Ok(logs) = db.get_ticket_logs(*dep_id as i64, session) {
+                        let all_log: String = logs.join("\n");
+                        let lines: Vec<&str> = all_log.lines().collect();
+                        let start = lines.len().saturating_sub(50);
+                        log_tail = lines[start..].join("\n");
+                    }
+                }
+            }
+
+            deps.push(serde_json::json!({
+                "id": dep.id,
+                "title": dep.title,
+                "status": status_str,
+                "merge_status": merge_str,
+                "summary": dep.summary,
+                "diff_summary": diff_summary,
+                "log_tail": log_tail,
+                "is_checkpoint": dep.is_checkpoint,
+            }));
+        }
+    }
+
+    let response = serde_json::json!({
+        "ticket_id": ticket_id,
+        "dependencies": deps,
+    });
+
+    Ok(json_response(StatusCode::OK, &response.to_string()))
 }
 
 /// Helper to create a JSON response with the correct content-type header.

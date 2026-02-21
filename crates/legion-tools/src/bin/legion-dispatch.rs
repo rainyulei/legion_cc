@@ -1,6 +1,6 @@
 //! legion-dispatch — Submit a ticket to the orchestrate queue
 //!
-//! Usage: legion-dispatch <worker_id> [-t "title"] [-c "context"] [-k "criteria"] [--after 1,3] [--team <team_name>] [--plan "structure plan"] "ticket text"
+//! Usage: legion-dispatch <worker_id> [-t "title"] [-c "context"] [-k "criteria"] [--after 1,3] [--team <team_name>] [--plan "structure plan"] [--checkpoint] "ticket text"
 //! POSTs to /legion/orchestrate/submit with structured fields.
 //! (worker_id is kept for CLI compat but ignored by queue)
 
@@ -37,6 +37,7 @@ fn main() {
     let mut after: Option<String> = None;
     let mut team: Option<String> = None;
     let mut plan: Option<String> = None;
+    let mut is_checkpoint = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 2;
@@ -65,6 +66,9 @@ fn main() {
             "-p" | "--plan" => {
                 i += 1;
                 if i < args.len() { plan = Some(args[i].clone()); }
+            }
+            "--checkpoint" => {
+                is_checkpoint = true;
             }
             _ => positional.push(args[i].clone()),
         }
@@ -125,6 +129,9 @@ fn main() {
     }
     if let Some(plan_str) = &plan {
         body["structure_plan"] = serde_json::Value::String(plan_str.clone());
+    }
+    if is_checkpoint {
+        body["is_checkpoint"] = serde_json::Value::Bool(true);
     }
 
     match ureq::post(&url)

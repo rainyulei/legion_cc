@@ -12,7 +12,7 @@ PKG_NAME := legion-$(VERSION)-$(ARCH).pkg
 PKG_ID := com.legion.cli
 INSTALL_DIR := /usr/local/bin
 
-BINARIES := legion legion-dispatch legion-check legion-report legion-status legion-stop
+BINARIES := legion legion-dispatch legion-check legion-report legion-status legion-stop legion-deps
 RELEASE_DIR := target/release
 PKG_ROOT := target/pkg-root
 

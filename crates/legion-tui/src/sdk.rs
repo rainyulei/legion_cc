@@ -136,6 +136,10 @@ impl SdkHandle {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             let start = Instant::now();
+            // Track promise from assistant messages as fallback.
+            // Result.result may not contain the promise tag when the worker's
+            // final turn is a tool call (e.g. git commit) rather than text output.
+            let mut last_promise_text: Option<String> = None;
 
             while let Ok(Some(line)) = lines.next_line().await {
                 let trimmed = line.trim();
@@ -145,6 +149,16 @@ impl SdkHandle {
 
                 match serde_json::from_str::<ClaudeJson>(trimmed) {
                     Ok(msg) => {
+                        // Scan assistant messages for promise tags
+                        if let ClaudeJson::Assistant { ref message, .. } = msg {
+                            let content = extract_assistant_content(message);
+                            if content.contains("<promise>DONE</promise>")
+                                || content.contains("<promise>COMPLETE</promise>")
+                            {
+                                last_promise_text = Some(content);
+                            }
+                        }
+
                         let (formatted, entry) = process_message(&msg, start.elapsed().as_secs());
                         if let Some(ref text) = formatted {
                             if let Ok(mut p) = parser_clone.lock() {
@@ -166,9 +180,20 @@ impl SdkHandle {
 
                         // Check for Result message (execution complete)
                         if let ClaudeJson::Result { is_error, result, .. } = &msg {
-                            // Store result text for promise detection
+                            // Use Result.result if it has promise, otherwise fall back
+                            // to the last assistant message that contained the promise tag
                             if let Ok(mut rt) = result_text_clone.lock() {
-                                *rt = result.clone();
+                                let result_has_promise = result.as_deref()
+                                    .map(|r| r.contains("<promise>DONE</promise>")
+                                        || r.contains("<promise>COMPLETE</promise>"))
+                                    .unwrap_or(false);
+                                if result_has_promise {
+                                    *rt = result.clone();
+                                } else if last_promise_text.is_some() {
+                                    *rt = last_promise_text.clone();
+                                } else {
+                                    *rt = result.clone();
+                                }
                             }
                             if let Ok(mut s) = success_clone.lock() {
                                 *s = Some(!is_error.unwrap_or(false));

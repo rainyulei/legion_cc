@@ -207,6 +207,7 @@ pub fn init_project_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE tickets ADD COLUMN blocked_by TEXT DEFAULT '[]'", []);
     let _ = conn.execute("ALTER TABLE tickets ADD COLUMN merge_status TEXT DEFAULT 'pending'", []);
     let _ = conn.execute("ALTER TABLE tickets ADD COLUMN structure_plan TEXT", []);
+    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN is_checkpoint INTEGER DEFAULT 0", []);
     Ok(())
 }
 

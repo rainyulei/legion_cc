@@ -30,7 +30,7 @@ You coordinate a team of {worker_count} autonomous Workers.
 Every `legion-dispatch` call MUST include ALL four parts. The command WILL FAIL without -t, -c, and -k:
 
 ```
-legion-dispatch <worker_id> [--team <team_name>] -t "title" -c "context" -k "criteria" [--after N,M] [--plan "structure plan"] "task description"
+legion-dispatch <worker_id> [--team <team_name>] -t "title" -c "context" -k "criteria" [--after N,M] [--plan "structure plan"] [--checkpoint] "task description"
 ```
 
 - `-t` — Short title (3-6 words): "Implement heart animation"
@@ -88,6 +88,7 @@ Do NOT include `--after` for tasks that are truly independent.
 - `legion-check` — View all Workers' status and results
 - `legion-status` — Quick one-line status summary
 - `legion-stop <id>` / `legion-stop all` — Emergency stop
+- `legion-deps [ticket_id]` — Query upstream dependency info (summary, diff, logs, merge status)
 
 ## 任务分解提示
 
@@ -129,7 +130,7 @@ Do NOT include `--after` for tasks that are truly independent.
 /// * `worker_id` - The worker's numeric ID
 /// * `working_dir` - Optional working directory path for the worker
 /// * `team_roles` - Optional slice of (role_id, role_name, prompt_template) tuples
-pub fn worker_instructions(worker_id: u16, working_dir: Option<&str>, team_roles: Option<&[(String, String, String)]>, team_prompt: Option<&str>) -> String {
+pub fn worker_instructions(worker_id: u16, working_dir: Option<&str>, team_roles: Option<&[(String, String, String)]>, team_prompt: Option<&str>, is_checkpoint: bool) -> String {
     let wd_note = working_dir.map(|d| format!(
         "\n\n## Working Directory\n\nYour working directory is: `{}`\nAll files you create MUST be in this directory. Use relative paths (e.g., `./heart.py`) or this absolute path. NEVER write files to any other location.\n", d
     )).unwrap_or_default();
@@ -217,6 +218,36 @@ When ALL success criteria are met, output `<promise>DONE</promise>` with a summa
    - Run the full test suite.
    - Verify any specific behaviors mentioned in criteria.
 5. **Complete**: When ALL criteria pass, output `<promise>DONE</promise>` with a brief summary.
+
+"#
+        );
+    }
+
+    // Dependency check section
+    if is_checkpoint {
+        prompt.push_str(
+            r#"## Checkpoint: Verify & Fix Integration
+
+You are a **checkpoint ticket**. Your primary job is to ensure all upstream work is properly integrated.
+
+1. Run `legion-deps` to check all upstream tickets' status and merge status
+2. For any unmerged tickets: investigate why (check git branches, conflict markers), attempt to merge/fix
+3. Review upstream diffs and summaries to understand what was done
+4. Run build + test + lint on the current codebase
+5. Fix any integration issues found (merge conflicts, API mismatches, broken imports)
+6. When everything passes, output `<promise>DONE</promise>`
+
+"#
+        );
+    } else {
+        prompt.push_str(
+            r#"## Dependency Check
+
+Before starting your main task, verify your upstream dependencies:
+- Run `legion-deps` to check the status and content of tickets you depend on
+- Review their diff_summary to understand what files were changed and how
+- If any dependency shows merge_status != "merged", report the issue via `legion-check` and wait
+- Use upstream summaries and diffs to inform your implementation approach
 
 "#
         );
@@ -487,7 +518,7 @@ pub fn write_squad_claude_md(worker_count: u16) -> Result<(PathBuf, Vec<PathBuf>
     let mut worker_paths = Vec::new();
     for i in 1..=worker_count {
         let path = dir.join(format!("worker-{}-CLAUDE.md", i));
-        fs::write(&path, worker_instructions(i, None, None, None))?;
+        fs::write(&path, worker_instructions(i, None, None, None, false))?;
         worker_paths.push(path);
     }
 
@@ -500,7 +531,7 @@ mod tests {
 
     #[test]
     fn worker_prompt_contains_key_elements() {
-        let prompt = worker_instructions(1, Some("/test/worktree"), None, None);
+        let prompt = worker_instructions(1, Some("/test/worktree"), None, None, false);
         assert!(prompt.contains("Worker 1"));
         assert!(prompt.contains("headless"));
         assert!(prompt.contains("TDD"));
@@ -589,7 +620,7 @@ mod tests {
         ];
 
         let team_prompt = "Sequential workflow: Lead designs, Engineer implements, QA validates.";
-        let prompt = worker_instructions(1, None, Some(&roles), Some(team_prompt));
+        let prompt = worker_instructions(1, None, Some(&roles), Some(team_prompt), false);
 
         // Agent Team section
         assert!(prompt.contains("## Agent Team"));
@@ -622,7 +653,7 @@ mod tests {
 
     #[test]
     fn worker_prompt_without_team_is_solo() {
-        let prompt = worker_instructions(1, None, None, None);
+        let prompt = worker_instructions(1, None, None, None, false);
 
         // Should contain solo TDD workflow
         assert!(prompt.contains("Implement with TDD"));
@@ -637,7 +668,7 @@ mod tests {
     #[test]
     fn worker_prompt_with_empty_team_is_solo() {
         let empty_roles: Vec<(String, String, String)> = vec![];
-        let prompt = worker_instructions(1, None, Some(&empty_roles), None);
+        let prompt = worker_instructions(1, None, Some(&empty_roles), None, false);
 
         // Should contain solo TDD workflow
         assert!(prompt.contains("Implement with TDD"));

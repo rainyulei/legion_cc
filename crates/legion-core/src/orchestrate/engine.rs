@@ -66,6 +66,7 @@ pub struct TaskTicket {
     pub blocked_by: Vec<usize>,
     pub merge_status: MergeStatus,
     pub structure_plan: Option<String>,
+    pub is_checkpoint: bool,
 }
 
 impl TaskTicket {
@@ -97,6 +98,7 @@ pub struct TicketSnapshot {
     pub blocked_by: Vec<usize>,
     pub merge_status: MergeStatus,
     pub structure_plan: Option<String>,
+    pub is_checkpoint: bool,
 }
 
 struct EngineInner {
@@ -181,6 +183,7 @@ impl OrchestrateEngine {
                             _ => MergeStatus::Pending,
                         },
                         structure_plan: row.structure_plan,
+                        is_checkpoint: row.is_checkpoint,
                     });
                     if row.id as usize >= next_id {
                         next_id = row.id as usize + 1;
@@ -246,6 +249,7 @@ impl OrchestrateEngine {
                     MergeStatus::Skipped => "skipped".to_string(),
                 },
                 structure_plan: ticket.structure_plan.clone(),
+                is_checkpoint: ticket.is_checkpoint,
             };
             if let Ok(db) = db.lock() {
                 let _ = db.insert_ticket(&row);
@@ -293,6 +297,7 @@ impl OrchestrateEngine {
                     MergeStatus::Skipped => "skipped".to_string(),
                 },
                 structure_plan: ticket.structure_plan.clone(),
+                is_checkpoint: ticket.is_checkpoint,
             };
             if let Ok(db) = db.lock() {
                 let _ = db.update_ticket(&row);
@@ -303,7 +308,7 @@ impl OrchestrateEngine {
     pub async fn submit_ticket(
         &self, title: String, prompt: String, context: Option<String>, criteria: Option<String>,
         team_mode: TeamMode, max_iterations: u16, blocked_by: Vec<usize>,
-        structure_plan: Option<String>,
+        structure_plan: Option<String>, is_checkpoint: bool,
     ) -> Result<usize, String> {
         let mut guard = self.inner.write().await;
         // Validate all blocked_by IDs exist in current tickets
@@ -333,6 +338,7 @@ impl OrchestrateEngine {
             blocked_by,
             merge_status: MergeStatus::Pending,
             structure_plan,
+            is_checkpoint,
         };
         guard.tickets.push(ticket.clone());
         drop(guard);
@@ -340,12 +346,21 @@ impl OrchestrateEngine {
         Ok(id)
     }
 
-    /// Check if a ticket's dependencies are all Done
+    /// Check if a ticket's dependencies are satisfied.
+    /// - Checkpoint tickets: deps only need Done (checkpoint will handle merge itself)
+    /// - Normal tickets: deps need Done + Merged (or Skipped)
     fn is_ready(ticket: &TaskTicket, all_tickets: &[TaskTicket]) -> bool {
         ticket.blocked_by.iter().all(|dep_id| {
             all_tickets.iter()
                 .find(|t| t.id == *dep_id)
-                .map(|t| t.status == TicketStatus::Done)
+                .map(|t| {
+                    if ticket.is_checkpoint {
+                        t.status == TicketStatus::Done
+                    } else {
+                        t.status == TicketStatus::Done
+                            && matches!(t.merge_status, MergeStatus::Merged | MergeStatus::Skipped)
+                    }
+                })
                 .unwrap_or(true)
         })
     }
@@ -615,5 +630,6 @@ fn ticket_to_snapshot(t: &TaskTicket) -> TicketSnapshot {
         blocked_by: t.blocked_by.clone(),
         merge_status: t.merge_status,
         structure_plan: t.structure_plan.clone(),
+        is_checkpoint: t.is_checkpoint,
     }
 }
