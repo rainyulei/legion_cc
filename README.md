@@ -51,7 +51,7 @@ What would take 30+ minutes sequentially finishes in under 10.
 
 ```bash
 # Clone and build
-git clone https://github.com/anthropics/legion.git
+git clone https://github.com/rainyulei/legion_cc.git
 cd legion
 make build
 
@@ -67,10 +67,10 @@ make pkg
 ```bash
 cd /path/to/your/project    # must be a git repo
 
-# Initialize Legion in your project
+# Initialize Legion (creates .legion/, CLAUDE.md, .claude/commands/)
 legion init
 
-# Launch squad mode (default: 2 workers)
+# Launch (opens TUI with Leader + 2 Workers)
 legion
 ```
 
@@ -228,18 +228,14 @@ Configure providers through `Ctrl+P → Connect Provider` in the TUI. Each pane 
 # Initialize Legion in a project
 legion init
 
-# Launch (defaults to squad mode with 2 workers)
+# Launch squad mode (default: 2 workers, port 18080)
 legion
 
-# Squad mode with custom worker count and port
-legion squad --workers 4 --base-port 18080
-
-# Single agent mode (one Claude Code + proxy, no workers)
-legion single
-
-# Switch provider on existing Claude Code session
-legion switch
+# Launch with custom base port
+legion --base-port 19080
 ```
+
+Worker count and provider/model are configured interactively through the TUI settings menu (`Ctrl+P`).
 
 ### Leader Tools (available inside Leader pane)
 

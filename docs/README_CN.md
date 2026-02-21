@@ -50,7 +50,7 @@ Leader: "全部完成。认证系统已集成，测试通过。"
 ### 安装
 
 ```bash
-git clone https://github.com/anthropics/legion.git
+git clone https://github.com/rainyulei/legion_cc.git
 cd legion
 make build
 
@@ -66,10 +66,10 @@ make pkg
 ```bash
 cd /path/to/your/project    # 必须是 git 仓库
 
-# 初始化 Legion
+# 初始化 Legion（创建 .legion/、CLAUDE.md、.claude/commands/）
 legion init
 
-# 启动 squad 模式（默认 2 个 worker）
+# 启动（打开 TUI，Leader + 2 Workers）
 legion
 ```
 
