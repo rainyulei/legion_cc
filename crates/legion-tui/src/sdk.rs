@@ -325,6 +325,32 @@ struct AssistantMessage {
     content: Option<serde_json::Value>,
 }
 
+/// A single role delegation activity within a Worker's agent team
+#[derive(Debug, Clone)]
+pub struct TeamActivity {
+    pub role: String,
+    pub description: String,
+    pub status: TeamActivityStatus,
+    pub elapsed_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TeamActivityStatus {
+    Running,
+    Done(String),
+    Error(String),
+}
+
+/// Parse a Task tool summary into (role, description).
+/// Summary format from extract_tool_summary: "[subagent_type] description\nprompt_preview"
+pub fn parse_team_activity(summary: &str) -> Option<(String, String)> {
+    let first_line = summary.lines().next().unwrap_or(summary);
+    let stripped = first_line.strip_prefix('[')?;
+    let (role, rest) = stripped.split_once(']')?;
+    let desc = rest.trim().to_string();
+    Some((role.to_string(), desc))
+}
+
 /// Normalized progress entry for task list display
 #[derive(Debug, Clone)]
 pub enum ProgressEntry {
@@ -424,13 +450,24 @@ fn process_message(msg: &ClaudeJson, elapsed_secs: u64) -> (Option<String>, Opti
         ClaudeJson::ToolUse { tool_name, tool_data } => {
             let summary = extract_tool_summary(tool_name, tool_data.as_ref());
             let icon = tool_icon(tool_name);
-            let formatted = format!(
-                "\x1b[90m[{}s]\x1b[0m \x1b[1;34m{} {}:\x1b[0m\r\n  \x1b[36m{}\x1b[0m\r\n",
-                elapsed_secs,
-                icon,
-                tool_name,
-                wrap_text(&summary, 120).trim_start(),
-            );
+            // Use purple for Task (team delegation), blue for normal tools
+            let formatted = if tool_name == "Task" {
+                format!(
+                    "\x1b[90m[{}s]\x1b[0m \x1b[1;35m{} {} (subagent):\x1b[0m\r\n  \x1b[35m{}\x1b[0m\r\n",
+                    elapsed_secs,
+                    icon,
+                    tool_name,
+                    wrap_text(&summary, 120).trim_start(),
+                )
+            } else {
+                format!(
+                    "\x1b[90m[{}s]\x1b[0m \x1b[1;34m{} {}:\x1b[0m\r\n  \x1b[36m{}\x1b[0m\r\n",
+                    elapsed_secs,
+                    icon,
+                    tool_name,
+                    wrap_text(&summary, 120).trim_start(),
+                )
+            };
             (
                 Some(formatted),
                 Some(ProgressEntry::ToolUse {
@@ -550,10 +587,29 @@ fn extract_tool_summary(tool_name: &str, data: Option<&serde_json::Value>) -> St
                 .to_string()
         }
         "Task" => {
-            data.get("description")
+            let desc = data.get("description")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
+                .unwrap_or("");
+            let agent_type = data.get("subagent_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let prompt_preview = data.get("prompt")
+                .and_then(|v| v.as_str())
+                .map(|p| truncate(p, 200))
+                .unwrap_or_default();
+            if agent_type.is_empty() {
+                if prompt_preview.is_empty() {
+                    desc.to_string()
+                } else {
+                    format!("{}\n{}", desc, prompt_preview)
+                }
+            } else {
+                if prompt_preview.is_empty() {
+                    format!("[{}] {}", agent_type, desc)
+                } else {
+                    format!("[{}] {}\n{}", agent_type, desc, prompt_preview)
+                }
+            }
         }
         _ => {
             // Generic: try to get a short summary
@@ -586,16 +642,18 @@ fn truncate(s: &str, max: usize) -> String {
 fn wrap_text(s: &str, width: usize) -> String {
     let mut result = String::new();
     for line in s.lines() {
-        if line.len() <= width {
+        if line.chars().count() <= width {
             result.push_str("  ");
             result.push_str(line);
             result.push_str("\r\n");
         } else {
+            let chars: Vec<char> = line.chars().collect();
             let mut pos = 0;
-            while pos < line.len() {
-                let end = (pos + width).min(line.len());
+            while pos < chars.len() {
+                let end = (pos + width).min(chars.len());
                 result.push_str("  ");
-                result.push_str(&line[pos..end]);
+                let chunk: String = chars[pos..end].iter().collect();
+                result.push_str(&chunk);
                 result.push_str("\r\n");
                 pos = end;
             }
@@ -622,6 +680,84 @@ pub fn extract_feedback(result_text: &str) -> String {
         "Task did not complete. No specific feedback provided.".to_string()
     } else {
         truncate(trimmed, 500)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_team_activity_basic() {
+        let summary = "[engineer] Implement REST endpoints\nSome prompt preview";
+        let (role, desc) = parse_team_activity(summary).unwrap();
+        assert_eq!(role, "engineer");
+        assert_eq!(desc, "Implement REST endpoints");
+    }
+
+    #[test]
+    fn test_parse_team_activity_no_prompt_preview() {
+        let summary = "[tech_lead] Design API structure";
+        let (role, desc) = parse_team_activity(summary).unwrap();
+        assert_eq!(role, "tech_lead");
+        assert_eq!(desc, "Design API structure");
+    }
+
+    #[test]
+    fn test_parse_team_activity_no_bracket() {
+        assert!(parse_team_activity("just a plain description").is_none());
+    }
+
+    #[test]
+    fn test_parse_team_activity_empty_role() {
+        let summary = "[] no role";
+        let (role, desc) = parse_team_activity(summary).unwrap();
+        assert_eq!(role, "");
+        assert_eq!(desc, "no role");
+    }
+
+    #[test]
+    fn test_parse_team_activity_with_subagent_types() {
+        // Real subagent types from Claude Code
+        for agent in &["Bash", "Explore", "Plan", "general-purpose", "senior-fullstack-alex"] {
+            let summary = format!("[{}] Do something", agent);
+            let (role, desc) = parse_team_activity(&summary).unwrap();
+            assert_eq!(role, *agent);
+            assert_eq!(desc, "Do something");
+        }
+    }
+
+    #[test]
+    fn test_team_activity_status_eq() {
+        assert_eq!(TeamActivityStatus::Running, TeamActivityStatus::Running);
+        assert_ne!(TeamActivityStatus::Running, TeamActivityStatus::Done("ok".into()));
+        assert_ne!(TeamActivityStatus::Done("a".into()), TeamActivityStatus::Error("a".into()));
+    }
+
+    #[test]
+    fn test_extract_tool_summary_task_format() {
+        // Verify extract_tool_summary produces parseable format for Task tools
+        let tool_data: serde_json::Value = serde_json::json!({
+            "subagent_type": "engineer",
+            "description": "Implement feature X",
+            "prompt": "Write code for feature X with tests"
+        });
+        let summary = extract_tool_summary("Task", Some(&tool_data));
+        // Should be "[engineer] Implement feature X\nWrite code for feature X with tests"
+        let (role, desc) = parse_team_activity(&summary).unwrap();
+        assert_eq!(role, "engineer");
+        assert_eq!(desc, "Implement feature X");
+    }
+
+    #[test]
+    fn test_extract_tool_summary_task_no_subagent() {
+        let tool_data: serde_json::Value = serde_json::json!({
+            "description": "Do something",
+            "prompt": "prompt text"
+        });
+        let summary = extract_tool_summary("Task", Some(&tool_data));
+        // No [role] prefix, so parse_team_activity should return None
+        assert!(parse_team_activity(&summary).is_none());
     }
 }
 

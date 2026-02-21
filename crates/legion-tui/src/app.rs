@@ -50,6 +50,7 @@ pub enum PopupMenu {
     RoleList,
     RoleForm,
     AddRoleToTeam,
+    BoardDetail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,12 +174,30 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
         auth_method: "device_flow",
     },
     ProviderTemplate {
+        id: "github_copilot_codex",
+        name: "GitHub Copilot (Codex)",
+        base_url: "https://api.githubcopilot.com",
+        api_format: "github_copilot_responses",
+        models: &["gpt-5.2-codex"],
+        env_var: "GITHUB_TOKEN",
+        auth_method: "device_flow",
+    },
+    ProviderTemplate {
         id: "openrouter",
         name: "OpenRouter",
         base_url: "https://openrouter.ai/api/v1",
         api_format: "openai_chat",
         models: &["anthropic/claude-opus-4-6", "openai/gpt-4o", "google/gemini-2.5-pro"],
         env_var: "OPENROUTER_API_KEY",
+        auth_method: "api_key",
+    },
+    ProviderTemplate {
+        id: "minimax",
+        name: "MiniMax",
+        base_url: "https://api.minimax.io/v1",
+        api_format: "openai_chat",
+        models: &["MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1", "MiniMax-M2"],
+        env_var: "MINIMAX_API_KEY",
         auth_method: "api_key",
     },
 ];
@@ -310,11 +329,13 @@ pub struct App {
 
     // Board state (squad task board)
     pub board_selected: usize,          // selected ticket id in board view
-    pub board_detail_open: bool,        // whether showing detail popup for selected ticket
     pub board_detail_scroll: usize,     // scroll offset in detail popup
 
     // Per-ticket log buffers (ticket_id → log lines)
     pub ticket_logs: HashMap<usize, std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+
+    // Per-ticket team activity timeline (ticket_id → activities)
+    pub ticket_team_activities: HashMap<usize, Vec<crate::sdk::TeamActivity>>,
 
     // Connect Provider state
     pub connect_provider_index: usize,       // selected template index
@@ -462,9 +483,10 @@ impl App {
             remove_worker_strategy_index: 0,
             saved_pane_configs: HashMap::new(),
             board_selected: 0,
-            board_detail_open: false,
+            // board_detail is now AppMode::Popup(PopupMenu::BoardDetail)
             board_detail_scroll: 0,
             ticket_logs: HashMap::new(),
+            ticket_team_activities: HashMap::new(),
             connect_provider_index: 0,
             api_key_input: String::new(),
             default_max_iterations: 5,
@@ -962,6 +984,7 @@ impl App {
 
         // Clear in-memory ticket data
         self.ticket_logs.clear();
+        self.ticket_team_activities.clear();
         self.ticket_snapshot = None;
         self.queue_stats = None;
 
@@ -1000,6 +1023,7 @@ impl App {
 
         // Clear in-memory ticket data
         self.ticket_logs.clear();
+        self.ticket_team_activities.clear();
         self.ticket_snapshot = None;
         self.queue_stats = None;
 

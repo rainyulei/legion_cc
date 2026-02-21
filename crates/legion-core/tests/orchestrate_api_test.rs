@@ -94,7 +94,7 @@ async fn test_report_endpoint() {
     let engine = start_api(2, 30082).await;
 
     // Setup: submit ticket and take it
-    engine.submit_ticket("task-abc".into(), "task-abc".into(), None, None, legion_core::TeamMode::default(), 5, Vec::new()).await.unwrap();
+    engine.submit_ticket("task-abc".into(), "task-abc".into(), None, None, legion_core::TeamMode::default(), 5, Vec::new(), None).await.unwrap();
     engine.take_next(1).await;
 
     let client = reqwest::Client::new();
@@ -125,7 +125,7 @@ async fn test_stop_all_endpoint() {
 
     // Setup: submit and take tickets
     for i in 1..=3u16 {
-        engine.submit_ticket(format!("task-{}", i), format!("task-{}", i), None, None, legion_core::TeamMode::default(), 5, Vec::new()).await.unwrap();
+        engine.submit_ticket(format!("task-{}", i), format!("task-{}", i), None, None, legion_core::TeamMode::default(), 5, Vec::new(), None).await.unwrap();
     }
     for i in 1..=3u16 {
         engine.take_next(i).await;

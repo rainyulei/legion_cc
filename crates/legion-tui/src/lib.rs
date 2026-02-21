@@ -13,7 +13,7 @@ use std::io;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -30,7 +30,7 @@ pub async fn run(proxy_port: u16, control_port: u16) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -53,7 +53,7 @@ pub async fn run(proxy_port: u16, control_port: u16) -> Result<()> {
     // Kill child processes and restore terminal
     app.kill_all();
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste);
     let _ = terminal.show_cursor();
 
     std::process::exit(if result.is_ok() { 0 } else { 1 });
@@ -68,7 +68,7 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     // Setup terminal with mouse support for divider dragging
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -76,6 +76,7 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     let mut app = App::new();
     app.load_from_db();
     app.project_path = Some(project_path);
+    app.project_db_path = app.project_path.clone();
     app.base_port = base_port;
     app.requested_workers = worker_count;
 
@@ -109,6 +110,14 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
         } else {
             app.session_name_input = app.default_session_name_for_default();
         }
+        // Load branch list for the new session popup
+        if let Some(ref project_path) = app.project_path {
+            app.branch_list = crate::worktree::list_local_branches(project_path);
+        }
+        app.new_session_branch_index = app.detected_branch.as_ref()
+            .and_then(|db| app.branch_list.iter().position(|b| b == db))
+            .unwrap_or(0);
+        app.new_session_branch_focused = true;
         app.mode = app::AppMode::Popup(app::PopupMenu::NewSessionInput);
         app.creating_default_session = true;
     }
@@ -119,7 +128,7 @@ pub async fn run_squad(worker_count: u16, base_port: u16) -> Result<()> {
     // Kill child processes and restore terminal
     app.kill_all();
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste);
     let _ = terminal.show_cursor();
 
     std::process::exit(if result.is_ok() { 0 } else { 1 });
@@ -220,6 +229,10 @@ async fn run_event_loop(
                 }
             }
             app.persist_worker_count();
+            // Sync engine worker_count so scheduling loop covers all workers
+            if let Some(ref engine) = app.orchestrate {
+                engine.set_worker_count(app.worker_count() as u16).await;
+            }
         }
 
         // Sync max iterations to engine
@@ -235,6 +248,9 @@ async fn run_event_loop(
             match app.remove_single_worker(pane_index, &strategy) {
                 Ok(()) => {
                     app.persist_worker_count();
+                    if let Some(ref engine) = app.orchestrate {
+                        engine.set_worker_count(app.worker_count() as u16).await;
+                    }
                     tracing::info!("Worker removed successfully");
                 }
                 Err(e) => tracing::error!("Failed to remove worker: {}", e),
@@ -309,6 +325,15 @@ async fn run_event_loop(
                 Event::Mouse(mouse) => {
                     handle_mouse(app, mouse);
                 }
+                Event::Paste(data) => {
+                    // Wrap pasted text in bracketed paste escape sequences so the
+                    // inner PTY (Claude Code's readline) treats it as a single paste
+                    let mut paste_bytes = Vec::with_capacity(data.len() + 12);
+                    paste_bytes.extend_from_slice(b"\x1b[200~");
+                    paste_bytes.extend_from_slice(data.as_bytes());
+                    paste_bytes.extend_from_slice(b"\x1b[201~");
+                    app.write_to_pty(&paste_bytes);
+                }
                 Event::Resize(w, h) => {
                     app.resize_panes(w, h);
                 }
@@ -341,12 +366,61 @@ async fn run_event_loop(
             for wi in 1..=wc as usize {
                 if wi >= app.panes.len() { break; }
 
-                // Drain new SDK entries
+                // Drain new SDK entries and extract TeamActivity
                 let drained = app.panes[wi].sdk_task.as_mut()
                     .map(|sdk| sdk.drain_entries())
                     .unwrap_or_default();
                 if !drained.is_empty() {
                     app.panes[wi].last_sdk_activity = Some(std::time::Instant::now());
+                }
+                // Extract TeamActivity from Task tool entries
+                if let Some(ticket_id) = app.panes[wi].current_ticket_id {
+                    let elapsed = app.panes[wi].last_sdk_activity
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0);
+                    let mut last_was_task = false;
+                    for entry in &drained {
+                        match entry {
+                            crate::sdk::ProgressEntry::ToolUse { tool_name, summary } => {
+                                if tool_name == "Task" {
+                                    last_was_task = true;
+                                    if let Some((role, desc)) = crate::sdk::parse_team_activity(summary) {
+                                        let activities = app.ticket_team_activities.entry(ticket_id).or_default();
+                                        activities.push(crate::sdk::TeamActivity {
+                                            role,
+                                            description: desc,
+                                            status: crate::sdk::TeamActivityStatus::Running,
+                                            elapsed_secs: elapsed,
+                                        });
+                                    }
+                                } else {
+                                    last_was_task = false;
+                                }
+                            }
+                            crate::sdk::ProgressEntry::ToolResult { summary, is_error } if last_was_task => {
+                                last_was_task = false;
+                                // Update the last Running TeamActivity for this ticket
+                                if let Some(activities) = app.ticket_team_activities.get_mut(&ticket_id) {
+                                    if let Some(last) = activities.iter_mut().rev()
+                                        .find(|a| a.status == crate::sdk::TeamActivityStatus::Running)
+                                    {
+                                        last.status = if *is_error {
+                                            let msg = if summary.is_empty() { "Error".to_string() } else {
+                                                summary.chars().take(100).collect()
+                                            };
+                                            crate::sdk::TeamActivityStatus::Error(msg)
+                                        } else {
+                                            let msg = summary.chars().take(100).collect();
+                                            crate::sdk::TeamActivityStatus::Done(msg)
+                                        };
+                                    }
+                                }
+                            }
+                            _ => {
+                                last_was_task = false;
+                            }
+                        }
+                    }
                 }
                 app.panes[wi].sdk_entries.extend(drained);
 
@@ -419,11 +493,12 @@ async fn run_event_loop(
                                 let title = ts.title.clone();
                                 let context = ts.context.clone();
                                 let criteria = ts.criteria.clone();
+                                let structure_plan = ts.structure_plan.clone();
                                 // Clean up old SDK
                                 app.panes[wi].sdk_task = None;
                                 // Start new iteration
                                 app.start_sdk_task(wi, ticket_id, &prompt, &team_mode, iteration, Some(&feedback),
-                                    &title, context.as_deref(), criteria.as_deref());
+                                    &title, context.as_deref(), criteria.as_deref(), structure_plan.as_deref());
                                 continue;
                             }
                         } else {
@@ -499,12 +574,154 @@ async fn run_event_loop(
                     if promise_found {
                         if let (Some(project_path), Some(session)) = (&app.project_path, &app.current_session) {
                             let worker_label = format!("Worker {}", wi);
-                            match crate::worktree::merge_worker_into_leader(
+
+                            // Fallback: if worker forgot to commit, auto-commit before merge
+                            let worker_dir = crate::worktree::pane_worktree_path(
+                                project_path, &session.name, &worker_label,
+                            );
+                            if worker_dir.exists() {
+                                let status_out = std::process::Command::new("git")
+                                    .args(["status", "--porcelain"])
+                                    .current_dir(&worker_dir)
+                                    .output();
+                                if let Ok(out) = status_out {
+                                    let status_str = String::from_utf8_lossy(&out.stdout);
+                                    if !status_str.trim().is_empty() {
+                                        tracing::warn!("{} has uncommitted changes, auto-committing", worker_label);
+                                        let _ = std::process::Command::new("git")
+                                            .args(["add", "-A"])
+                                            .current_dir(&worker_dir)
+                                            .output();
+                                        let _ = std::process::Command::new("git")
+                                            .args(["commit", "-m", "feat: auto-commit worker changes (worker forgot to commit)"])
+                                            .current_dir(&worker_dir)
+                                            .output();
+                                    }
+                                }
+                            }
+
+                            // Smart merge: try clean merge first, then AI resolution on conflict
+                            match crate::worktree::merge_worker_no_abort(
                                 project_path, &session.name, &worker_label, session.is_default,
                             ) {
-                                Ok(()) => {
-                                    tracing::info!("Auto-merged {} into leader", worker_label);
+                                Ok(crate::worktree::MergeResult::Clean) => {
+                                    tracing::info!("Auto-merged {} into leader (clean)", worker_label);
                                     engine.set_merge_status(ticket_id, legion_core::MergeStatus::Merged).await;
+                                }
+                                Ok(crate::worktree::MergeResult::Conflict(conflict_ctx)) => {
+                                    tracing::warn!("Merge conflict for {}, launching AI resolver", worker_label);
+
+                                    // Gather done ticket context for the resolution prompt
+                                    let all_tickets = engine.all_tickets().await;
+                                    let done_tickets: Vec<(String, Option<String>)> = all_tickets.iter()
+                                        .filter(|t| t.status == legion_core::TicketStatus::Done && t.id != ticket_id)
+                                        .filter(|t| t.merge_status == legion_core::MergeStatus::Merged)
+                                        .map(|t| (t.title.clone(), t.summary.clone()))
+                                        .collect();
+
+                                    let ticket_title = all_tickets.iter()
+                                        .find(|t| t.id == ticket_id)
+                                        .map(|t| t.title.clone())
+                                        .unwrap_or_default();
+                                    let ticket_summary = all_tickets.iter()
+                                        .find(|t| t.id == ticket_id)
+                                        .and_then(|t| t.summary.clone());
+
+                                    let resolve_prompt = crate::claudemd::conflict_resolve_prompt(
+                                        &conflict_ctx, &ticket_title, ticket_summary.as_deref(), &done_tickets,
+                                    );
+
+                                    let leader_dir = if session.is_default {
+                                        project_path.to_path_buf()
+                                    } else {
+                                        crate::worktree::pane_worktree_path(project_path, &session.name, "Leader")
+                                    };
+
+                                    // Spawn SDK process to resolve conflicts (3 min timeout)
+                                    let (term_w, term_h) = app.term_size;
+                                    let resolve_parser = std::sync::Arc::new(std::sync::Mutex::new(
+                                        vt100::Parser::new(term_h.saturating_sub(4), term_w.saturating_sub(4), 1000)
+                                    ));
+                                    let use_proxy = app.pane_uses_proxy("Leader");
+                                    let leader_proxy_port = app.panes[0].proxy_port;
+
+                                    match crate::sdk::SdkHandle::spawn(
+                                        &leader_dir, &resolve_prompt, resolve_parser,
+                                        use_proxy, leader_proxy_port,
+                                        Some("You are a merge conflict resolver. Your job is to resolve git merge conflicts intelligently, preserving both sides' intent. Work in the current directory. Do not abort the merge."),
+                                        1, None, None,
+                                    ) {
+                                        Ok(mut resolver) => {
+                                            // Wait for resolution with 3 minute timeout
+                                            let resolve_result = tokio::time::timeout(
+                                                std::time::Duration::from_secs(180),
+                                                async {
+                                                    loop {
+                                                        if resolver.is_finished() {
+                                                            return resolver.result_text().unwrap_or_default();
+                                                        }
+                                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                                    }
+                                                }
+                                            ).await;
+
+                                            match resolve_result {
+                                                Ok(result_text) if crate::sdk::detect_promise(&result_text) => {
+                                                    // AI resolved successfully — finalize merge
+                                                    match crate::worktree::finalize_resolved_merge(
+                                                        &leader_dir, &worker_label, conflict_ctx.did_stash,
+                                                    ) {
+                                                        Ok(()) => {
+                                                            // Run build check
+                                                            match crate::worktree::run_build_check(&leader_dir) {
+                                                                Ok(true) => {
+                                                                    tracing::info!("AI-resolved merge for {} passed build check", worker_label);
+                                                                    engine.set_merge_status(ticket_id, legion_core::MergeStatus::Merged).await;
+                                                                }
+                                                                Ok(false) => {
+                                                                    tracing::warn!("AI-resolved merge for {} failed build check, aborting", worker_label);
+                                                                    // Undo the merge commit
+                                                                    let _ = std::process::Command::new("git")
+                                                                        .args(["reset", "--hard", "HEAD~1"])
+                                                                        .current_dir(&leader_dir)
+                                                                        .output();
+                                                                    if conflict_ctx.did_stash {
+                                                                        let _ = std::process::Command::new("git")
+                                                                            .args(["stash", "pop"])
+                                                                            .current_dir(&leader_dir)
+                                                                            .output();
+                                                                    }
+                                                                    engine.set_merge_status(ticket_id, legion_core::MergeStatus::Conflict).await;
+                                                                }
+                                                                Err(e) => {
+                                                                    tracing::warn!("Build check failed to run for {}: {}", worker_label, e);
+                                                                    // Don't abort — build check failure to run is not a merge failure
+                                                                    engine.set_merge_status(ticket_id, legion_core::MergeStatus::Merged).await;
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!("Failed to finalize AI-resolved merge for {}: {}", worker_label, e);
+                                                            let _ = crate::worktree::abort_merge_and_restore(&leader_dir, conflict_ctx.did_stash);
+                                                            engine.set_merge_status(ticket_id, legion_core::MergeStatus::Conflict).await;
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    // AI failed or timed out — abort merge
+                                                    tracing::warn!("AI conflict resolution failed/timed out for {}", worker_label);
+                                                    resolver.kill();
+                                                    let _ = crate::worktree::abort_merge_and_restore(&leader_dir, conflict_ctx.did_stash);
+                                                    engine.set_merge_status(ticket_id, legion_core::MergeStatus::Conflict).await;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to spawn AI conflict resolver for {}: {}", worker_label, e);
+                                            let _ = crate::worktree::abort_merge_and_restore(&leader_dir, conflict_ctx.did_stash);
+                                            engine.set_merge_status(ticket_id, legion_core::MergeStatus::Conflict).await;
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!("Auto-merge failed for {}: {}", worker_label, e);
@@ -553,7 +770,7 @@ async fn run_event_loop(
                         }
 
                         app.start_sdk_task(wi, ts.id, &ts.prompt, &ts.team_mode, 1, None,
-                            ts.title.as_str(), ts.context.as_deref(), ts.criteria.as_deref());
+                            ts.title.as_str(), ts.context.as_deref(), ts.criteria.as_deref(), ts.structure_plan.as_deref());
                     }
                 }
             }
@@ -717,6 +934,13 @@ fn read_leader_status(app: &mut App) {
                 .and_then(|v| v.as_f64())
             {
                 app.leader_context_pct = Some(pct.round() as u8);
+            }
+            // Output style (plan/normal/etc.)
+            if let Some(style_name) = json.get("output_style")
+                .and_then(|os| os.get("name"))
+                .and_then(|v| v.as_str())
+            {
+                app.leader_output_style = Some(style_name.to_string());
             }
             // Git branch from cwd
             if let Some(cwd) = json.get("cwd").and_then(|v| v.as_str()) {

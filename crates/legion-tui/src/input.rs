@@ -32,27 +32,6 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
 
     // Task Board navigation when right panel is focused
     if app.right_panel_focused && app.is_squad() {
-        if app.board_detail_open {
-            // Detail popup is open: j/k scroll, Esc closes
-            match key.code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    app.board_detail_scroll = app.board_detail_scroll.saturating_add(1);
-                    return InputResult::Continue;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.board_detail_scroll = app.board_detail_scroll.saturating_sub(1);
-                    return InputResult::Continue;
-                }
-                KeyCode::Esc => {
-                    app.board_detail_open = false;
-                    app.board_detail_scroll = 0;
-                    return InputResult::Continue;
-                }
-                _ => {
-                    return InputResult::Continue;
-                }
-            }
-        }
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
                 navigate_ticket_down(app);
@@ -63,8 +42,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
                 return InputResult::Continue;
             }
             KeyCode::Enter => {
-                app.board_detail_open = true;
                 app.board_detail_scroll = 0;
+                app.mode = AppMode::Popup(PopupMenu::BoardDetail);
                 return InputResult::Continue;
             }
             KeyCode::Char('r') => {
@@ -226,6 +205,11 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
                 } else {
                     app.right_panel_focused = true;
                 }
+                // Close board detail popup when switching panels to avoid stale state
+                if matches!(app.mode, AppMode::Popup(PopupMenu::BoardDetail)) {
+                    app.board_detail_scroll = 0;
+                    app.mode = AppMode::Normal;
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) if app.dragging_divider => {
@@ -245,7 +229,7 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
         MouseEventKind::ScrollUp => {
             if matches!(app.mode, AppMode::Popup(PopupMenu::FileDiff)) {
                 app.diff_scroll = app.diff_scroll.saturating_sub(3);
-            } else if app.board_detail_open {
+            } else if matches!(app.mode, AppMode::Popup(PopupMenu::BoardDetail)) {
                 app.board_detail_scroll = app.board_detail_scroll.saturating_sub(3);
             } else if app.right_panel_focused {
                 navigate_ticket_up(app);
@@ -259,7 +243,7 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
         MouseEventKind::ScrollDown => {
             if matches!(app.mode, AppMode::Popup(PopupMenu::FileDiff)) {
                 app.diff_scroll = app.diff_scroll.saturating_add(3);
-            } else if app.board_detail_open {
+            } else if matches!(app.mode, AppMode::Popup(PopupMenu::BoardDetail)) {
                 app.board_detail_scroll = app.board_detail_scroll.saturating_add(3);
             } else if app.right_panel_focused {
                 navigate_ticket_down(app);
@@ -313,6 +297,7 @@ fn handle_popup_mode(app: &mut App, key: KeyEvent) -> InputResult {
         AppMode::Popup(PopupMenu::RoleList) => handle_role_list_keys(app, key),
         AppMode::Popup(PopupMenu::RoleForm) => handle_role_form_keys(app, key),
         AppMode::Popup(PopupMenu::AddRoleToTeam) => handle_add_role_to_team_keys(app, key),
+        AppMode::Popup(PopupMenu::BoardDetail) => handle_board_detail_keys(app, key),
         _ => {}
     }
 
@@ -1151,6 +1136,24 @@ fn open_file_diff(
     } else {
         app.diff_error = Some("No active session".to_string());
         app.diff_loading = false;
+    }
+}
+
+fn handle_board_detail_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.board_detail_scroll = app.board_detail_scroll.saturating_add(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.board_detail_scroll = app.board_detail_scroll.saturating_sub(1);
+        }
+        KeyCode::Esc => {
+            app.board_detail_scroll = 0;
+            app.mode = AppMode::Normal;
+            // Restore right panel focus so user stays on ticket board
+            app.right_panel_focused = true;
+        }
+        _ => {}
     }
 }
 

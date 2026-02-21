@@ -442,3 +442,216 @@ pub fn list_local_branches(project_path: &Path) -> Vec<String> {
 pub fn sanitize_branch_name(branch: &str) -> String {
     branch.replace('/', "-")
 }
+
+// --- AI-powered smart merge ---
+
+/// Result of attempting to merge a worker branch into leader
+pub enum MergeResult {
+    /// Merge succeeded cleanly
+    Clean,
+    /// Merge has conflicts that need resolution
+    Conflict(ConflictContext),
+}
+
+/// Context collected from a conflicted merge state for AI resolution
+pub struct ConflictContext {
+    /// Files with merge conflicts
+    pub conflicted_files: Vec<String>,
+    /// Each file's full content including conflict markers
+    pub file_contents: Vec<(String, String)>,
+    /// Git log of the worker branch (recent commits)
+    pub worker_commits: String,
+    /// Whether leader changes were stashed before merge
+    pub did_stash: bool,
+}
+
+/// Merge worker branch into leader without aborting on conflict.
+/// On clean merge: commits and returns `Clean`.
+/// On conflict: leaves tree in conflicted state and returns `Conflict(ctx)`.
+pub fn merge_worker_no_abort(
+    project_path: &Path,
+    session_name: &str,
+    worker_label: &str,
+    is_default_session: bool,
+) -> Result<MergeResult> {
+    let worker_branch = pane_branch_name(session_name, worker_label);
+
+    let leader_dir = if is_default_session {
+        project_path.to_path_buf()
+    } else {
+        pane_worktree_path(project_path, session_name, "Leader")
+    };
+
+    if !leader_dir.exists() {
+        anyhow::bail!("Leader worktree not found: {}", leader_dir.display());
+    }
+
+    // Stash any uncommitted changes in leader
+    let stash_output = Command::new("git")
+        .args(["stash", "push", "-m", "legion-auto-merge-stash"])
+        .current_dir(&leader_dir)
+        .output()
+        .context("Failed to stash leader changes")?;
+    let did_stash =
+        String::from_utf8_lossy(&stash_output.stdout).contains("Saved working directory");
+
+    // Attempt merge without auto-commit
+    let output = Command::new("git")
+        .args([
+            "merge",
+            &worker_branch,
+            "--no-ff",
+            "--no-commit",
+        ])
+        .current_dir(&leader_dir)
+        .output()
+        .context("Failed to run git merge in leader worktree")?;
+
+    // Check for conflicted files
+    let conflict_output = Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(&leader_dir)
+        .output()
+        .context("Failed to check for conflicts")?;
+
+    let conflict_files: Vec<String> = String::from_utf8_lossy(&conflict_output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if conflict_files.is_empty() && output.status.success() {
+        // Clean merge — commit it
+        let _ = Command::new("git")
+            .args(["commit", "--no-edit", "-m", &format!("Auto-merge: {} completed", worker_label)])
+            .current_dir(&leader_dir)
+            .output();
+
+        // Restore stash
+        if did_stash {
+            let _ = Command::new("git")
+                .args(["stash", "pop"])
+                .current_dir(&leader_dir)
+                .output();
+        }
+
+        tracing::info!("Clean merge of {} into leader ({})", worker_branch, leader_dir.display());
+        Ok(MergeResult::Clean)
+    } else {
+        // Conflict — collect context for AI resolution
+        let ctx = collect_conflict_context(&leader_dir, &conflict_files, &worker_branch, did_stash)?;
+        Ok(MergeResult::Conflict(ctx))
+    }
+}
+
+/// Collect conflict context from the current conflicted merge state
+fn collect_conflict_context(
+    leader_dir: &Path,
+    conflicted_files: &[String],
+    worker_branch: &str,
+    did_stash: bool,
+) -> Result<ConflictContext> {
+    let mut file_contents = Vec::new();
+    for file in conflicted_files {
+        let file_path = leader_dir.join(file);
+        if let Ok(content) = std::fs::read_to_string(&file_path) {
+            file_contents.push((file.clone(), content));
+        }
+    }
+
+    // Get worker branch commits for context
+    let worker_commits = Command::new("git")
+        .args(["log", "--oneline", "-20", worker_branch])
+        .current_dir(leader_dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    Ok(ConflictContext {
+        conflicted_files: conflicted_files.to_vec(),
+        file_contents,
+        worker_commits,
+        did_stash,
+    })
+}
+
+/// After AI resolves conflicts, stage all files and commit the merge
+pub fn finalize_resolved_merge(leader_dir: &Path, worker_label: &str, did_stash: bool) -> Result<()> {
+    // Stage all resolved files
+    let add_output = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(leader_dir)
+        .output()
+        .context("Failed to stage resolved files")?;
+
+    if !add_output.status.success() {
+        anyhow::bail!("git add failed: {}", String::from_utf8_lossy(&add_output.stderr));
+    }
+
+    // Commit the merge
+    let commit_output = Command::new("git")
+        .args(["commit", "--no-edit", "-m", &format!("AI-resolved merge: {} completed", worker_label)])
+        .current_dir(leader_dir)
+        .output()
+        .context("Failed to commit resolved merge")?;
+
+    if !commit_output.status.success() {
+        anyhow::bail!("git commit failed: {}", String::from_utf8_lossy(&commit_output.stderr));
+    }
+
+    // Restore stash
+    if did_stash {
+        let _ = Command::new("git")
+            .args(["stash", "pop"])
+            .current_dir(leader_dir)
+            .output();
+    }
+
+    tracing::info!("Finalized AI-resolved merge for {} in {}", worker_label, leader_dir.display());
+    Ok(())
+}
+
+/// Abort a conflicted merge and restore the previous state
+pub fn abort_merge_and_restore(leader_dir: &Path, did_stash: bool) -> Result<()> {
+    let _ = Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(leader_dir)
+        .output();
+
+    if did_stash {
+        let _ = Command::new("git")
+            .args(["stash", "pop"])
+            .current_dir(leader_dir)
+            .output();
+    }
+
+    tracing::info!("Aborted merge and restored state in {}", leader_dir.display());
+    Ok(())
+}
+
+/// Run a build verification command in the given directory.
+/// Returns Ok(true) if build passes, Ok(false) if build fails, Err on execution failure.
+pub fn run_build_check(dir: &Path) -> Result<bool> {
+    // Detect project type and run appropriate build command
+    if dir.join("Cargo.toml").exists() {
+        let output = Command::new("cargo")
+            .args(["build"])
+            .current_dir(dir)
+            .output()
+            .context("Failed to run cargo build")?;
+        Ok(output.status.success())
+    } else if dir.join("package.json").exists() {
+        // Try npm run build or npm run compile
+        let output = Command::new("npm")
+            .args(["run", "build", "--if-present"])
+            .current_dir(dir)
+            .output()
+            .context("Failed to run npm build")?;
+        Ok(output.status.success())
+    } else {
+        // No recognized build system — assume OK
+        Ok(true)
+    }
+}

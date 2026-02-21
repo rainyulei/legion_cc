@@ -1,6 +1,6 @@
 //! legion-dispatch — Submit a ticket to the orchestrate queue
 //!
-//! Usage: legion-dispatch <worker_id> [-t "title"] [-c "context"] [-k "criteria"] [--after 1,3] [--team <team_name>] "ticket text"
+//! Usage: legion-dispatch <worker_id> [-t "title"] [-c "context"] [-k "criteria"] [--after 1,3] [--team <team_name>] [--plan "structure plan"] "ticket text"
 //! POSTs to /legion/orchestrate/submit with structured fields.
 //! (worker_id is kept for CLI compat but ignored by queue)
 
@@ -18,7 +18,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] [-c \"context\"] [-k \"criteria\"] [--after 1,3] [--team <team_name>] \"ticket text\"");
+        eprintln!("Usage: legion-dispatch <worker_id> [-t \"title\"] [-c \"context\"] [-k \"criteria\"] [--after 1,3] [--team <team_name>] [--plan \"structure plan\"] \"ticket text\"");
         process::exit(1);
     }
 
@@ -36,6 +36,7 @@ fn main() {
     let mut criteria: Option<String> = None;
     let mut after: Option<String> = None;
     let mut team: Option<String> = None;
+    let mut plan: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 2;
@@ -60,6 +61,10 @@ fn main() {
             "--team" => {
                 i += 1;
                 if i < args.len() { team = Some(args[i].clone()); }
+            }
+            "-p" | "--plan" => {
+                i += 1;
+                if i < args.len() { plan = Some(args[i].clone()); }
             }
             _ => positional.push(args[i].clone()),
         }
@@ -117,6 +122,9 @@ fn main() {
         if !blocked_by.is_empty() {
             body["blocked_by"] = serde_json::json!(blocked_by);
         }
+    }
+    if let Some(plan_str) = &plan {
+        body["structure_plan"] = serde_json::Value::String(plan_str.clone());
     }
 
     match ureq::post(&url)

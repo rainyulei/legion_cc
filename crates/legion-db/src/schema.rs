@@ -1,7 +1,8 @@
 use rusqlite::Connection;
 use anyhow::Result;
 
-pub const SCHEMA: &str = r#"
+/// Global DB schema: providers, roles, teams, pane_configs
+pub const GLOBAL_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -13,6 +14,34 @@ CREATE TABLE IF NOT EXISTS providers (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS pane_configs (
+    pane_label TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    model TEXT,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS roles (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    prompt_template TEXT NOT NULL,
+    is_builtin INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS teams (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    role_ids TEXT NOT NULL,
+    is_builtin INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+"#;
+
+/// Project DB schema: sessions, tickets, workers
+pub const PROJECT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     name TEXT,
@@ -45,13 +74,6 @@ CREATE TABLE IF NOT EXISTS workers (
     proxy_port INTEGER,
     pid INTEGER,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS pane_configs (
-    pane_label TEXT PRIMARY KEY,
-    provider_id TEXT NOT NULL,
-    model TEXT,
     updated_at INTEGER NOT NULL
 );
 
@@ -99,38 +121,13 @@ CREATE TABLE IF NOT EXISTS ticket_diffs (
     file_summary TEXT NOT NULL,
     cached_at INTEGER NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS roles (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL,
-    prompt_template TEXT NOT NULL,
-    is_builtin INTEGER DEFAULT 0,
-    created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS teams (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL,
-    role_ids TEXT NOT NULL,
-    is_builtin INTEGER DEFAULT 0,
-    created_at INTEGER NOT NULL
-);
 "#;
 
-pub fn init_db(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA)?;
-    // Migrations — safe to re-run (ignore "duplicate column" errors)
-    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0", []);
-    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN base_branch TEXT", []);
-    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN base_commit TEXT", []);
-    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN last_active_at INTEGER", []);
-    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN max_iterations INTEGER", []);
-    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN origin_session TEXT", []);
-    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN base_commit TEXT", []);
-    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN blocked_by TEXT DEFAULT '[]'", []);
-    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN merge_status TEXT DEFAULT 'pending'", []);
+/// Initialize global DB (providers, roles, teams, pane_configs + seed data)
+pub fn init_global_db(conn: &Connection) -> Result<()> {
+    conn.execute_batch(GLOBAL_SCHEMA)?;
+    // Migrations
+    let _ = conn.execute("ALTER TABLE teams ADD COLUMN team_prompt TEXT DEFAULT ''", []);
 
     // Seed roles
     let now = std::time::SystemTime::now()
@@ -140,7 +137,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 
     let _ = conn.execute("INSERT OR IGNORE INTO roles (id, name, description, prompt_template, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
         ["tech_lead", "Tech Lead", "Technical lead responsible for architecture and planning",
-         "You are the Tech Lead. Your approach: 1) Carefully analyze the requirements. 2) Design the architecture and identify components. 3) Break the work into concrete subtasks. 4) Review all code for correctness and edge cases. Focus on planning before implementation.", &now.to_string()]);
+         "You are the Tech Lead. Your approach: 1) **Technical Analysis**: Analyze requirements, identify dependencies, review existing code patterns, design the approach. 2) **Plan Alignment**: Review the Structure Plan (if provided) to ensure file paths match, import conventions are followed, new code integrates with existing modules. 3) **Produce Execution Guide**: Before delegating to Engineers, write a brief guide: exact file paths, import conventions, integration points, testing approach. 4) Review all code for correctness and edge cases. Focus on planning before implementation. Never deviate from the Structure Plan's file path conventions.", &now.to_string()]);
 
     let _ = conn.execute("INSERT OR IGNORE INTO roles (id, name, description, prompt_template, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
         ["engineer", "Engineer", "Software engineer responsible for implementation",
@@ -177,5 +174,45 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 
     let _ = conn.execute("INSERT OR IGNORE INTO teams (id, name, description, role_ids, is_builtin, created_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
         ["solo", "Solo", "Solo mode with no team", "[]", &now.to_string()]);
+
+    // Migrate existing tech_lead role prompt to include plan alignment
+    let _ = conn.execute("UPDATE roles SET prompt_template = ?1 WHERE id = 'tech_lead' AND prompt_template NOT LIKE '%Structure Plan%'",
+        ["You are the Tech Lead. Your approach: 1) **Technical Analysis**: Analyze requirements, identify dependencies, review existing code patterns, design the approach. 2) **Plan Alignment**: Review the Structure Plan (if provided) to ensure file paths match, import conventions are followed, new code integrates with existing modules. 3) **Produce Execution Guide**: Before delegating to Engineers, write a brief guide: exact file paths, import conventions, integration points, testing approach. 4) Review all code for correctness and edge cases. Focus on planning before implementation. Never deviate from the Structure Plan's file path conventions."]);
+
+    let _ = conn.execute("UPDATE teams SET team_prompt = ?1 WHERE id = 'tech_lead_team' AND team_prompt = ''",
+        ["This team follows a structured development workflow: 1) Tech Lead analyzes requirements and designs architecture 2) Engineer implements with strict TDD 3) QA validates all acceptance criteria. Communication: Sequential delegation by default. Use parallel only for independent review tasks."]);
+
+    let _ = conn.execute("UPDATE teams SET team_prompt = ?1 WHERE id = 'fullstack_team' AND team_prompt = ''",
+        ["Architecture-driven team: 1) Architect designs system structure and evaluates trade-offs 2) Engineer implements following the architecture 3) QA tests comprehensively. Communication: Architect reviews before Engineer starts. Parallel QA alongside implementation for independent test writing."]);
+
+    let _ = conn.execute("UPDATE teams SET team_prompt = ?1 WHERE id = 'backend_team' AND team_prompt = ''",
+        ["Focused backend pair: 1) Tech Lead plans and reviews 2) Engineer implements with TDD. Communication: Sequential — plan first, then implement."]);
+
+    let _ = conn.execute("UPDATE teams SET team_prompt = ?1 WHERE id = 'qa_team' AND team_prompt = ''",
+        ["Quality-focused pair: 1) Engineer implements features 2) QA writes independent tests and validates. Communication: Parallel — QA can write test specs while Engineer implements."]);
+    Ok(())
+}
+
+/// Initialize project DB (squad_sessions, tickets, workers, etc.)
+pub fn init_project_db(conn: &Connection) -> Result<()> {
+    conn.execute_batch(PROJECT_SCHEMA)?;
+    // Migrations
+    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN base_branch TEXT", []);
+    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN base_commit TEXT", []);
+    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN last_active_at INTEGER", []);
+    let _ = conn.execute("ALTER TABLE squad_sessions ADD COLUMN max_iterations INTEGER", []);
+    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN origin_session TEXT", []);
+    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN base_commit TEXT", []);
+    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN blocked_by TEXT DEFAULT '[]'", []);
+    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN merge_status TEXT DEFAULT 'pending'", []);
+    let _ = conn.execute("ALTER TABLE tickets ADD COLUMN structure_plan TEXT", []);
+    Ok(())
+}
+
+/// Legacy: initialize all tables in one DB (for backward compatibility during migration)
+pub fn init_db(conn: &Connection) -> Result<()> {
+    init_global_db(conn)?;
+    init_project_db(conn)?;
     Ok(())
 }

@@ -19,7 +19,10 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use super::transform::{anthropic_to_openai, openai_to_anthropic, wrap_anthropic_json_as_sse};
+use super::transform::{
+    anthropic_to_openai, openai_to_anthropic, wrap_anthropic_json_as_sse,
+    anthropic_to_openai_responses, openai_responses_to_anthropic,
+};
 use crate::copilot::{self, CopilotTokenInfo, COPILOT_USER_AGENT, COPILOT_API_VERSION, EDITOR_PLUGIN_VERSION, VSCODE_VERSION};
 
 /// A boxed stream of frames for SSE passthrough
@@ -192,8 +195,8 @@ async fn handle_request(
         }
     };
 
-    // For github_copilot format: resolve the short-lived API token and effective base URL
-    let copilot_resolved = if proxy_config.api_format.as_deref() == Some("github_copilot") {
+    // For github_copilot formats: resolve the short-lived API token and effective base URL
+    let copilot_resolved = if matches!(proxy_config.api_format.as_deref(), Some("github_copilot") | Some("github_copilot_responses")) {
         match resolve_copilot_token(&proxy_config, &copilot_cache).await {
             Ok(info) => Some(info),
             Err(e) => {
@@ -216,11 +219,11 @@ async fn handle_request(
         ));
     }
 
-    // For OpenAI-compat formats (github_copilot, openai_chat): count_tokens endpoint doesn't exist.
+    // For OpenAI-compat formats: count_tokens endpoint doesn't exist.
     // Return a mock response so Claude Code doesn't fail.
     let is_openai_compat_format = matches!(
         proxy_config.api_format.as_deref(),
-        Some("openai_chat") | Some("github_copilot")
+        Some("openai_chat") | Some("github_copilot") | Some("openai_responses") | Some("github_copilot_responses")
     );
     if is_openai_compat_format && path.contains("count_tokens") {
         debug!("Returning mock count_tokens response for OpenAI-compat format");
@@ -247,19 +250,51 @@ async fn handle_request(
     };
 
     // Transform request if needed
-    // Both openai_chat and github_copilot use OpenAI format
+    // Chat Completions formats
     let is_openai_compat = matches!(
         proxy_config.api_format.as_deref(),
         Some("openai_chat") | Some("github_copilot")
     );
+    // Responses API formats
+    let is_responses_compat = matches!(
+        proxy_config.api_format.as_deref(),
+        Some("openai_responses") | Some("github_copilot_responses")
+    );
 
     // Log the model override for debugging (info level for easy visibility)
-    if is_openai_compat {
+    if is_openai_compat || is_responses_compat {
         info!("Proxy config: api_format={:?}, model_override={:?}, target_url={:?}",
             proxy_config.api_format, proxy_config.model, proxy_config.target_url);
     }
 
     let (request_body, content_type) = match proxy_config.api_format.as_deref() {
+        Some("openai_responses") | Some("github_copilot_responses") => {
+            match anthropic_to_openai_responses(&body_bytes, proxy_config.model.as_deref()) {
+                Ok(transformed) => {
+                    // Force stream=false — we'll wrap the buffered response as Anthropic SSE
+                    let final_body = match serde_json::from_slice::<serde_json::Value>(&transformed) {
+                        Ok(mut v) => {
+                            let tools_count = v.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
+                            let input_count = v.get("input").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0);
+                            debug!("Responses API request: model={}, input={}, tools={}",
+                                v.get("model").and_then(|m| m.as_str()).unwrap_or("?"),
+                                input_count, tools_count);
+                            v["stream"] = serde_json::Value::Bool(false);
+                            serde_json::to_vec(&v).unwrap_or(transformed)
+                        }
+                        Err(_) => transformed,
+                    };
+                    (final_body, "application/json")
+                }
+                Err(e) => {
+                    error!("Failed to transform request for Responses API: {}", e);
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!(r#"{{"error": {{"type": "bad_request", "message": "Failed to transform request: {}"}}}}"#, e),
+                    ));
+                }
+            }
+        }
         Some("openai_chat") | Some("github_copilot") => {
             match anthropic_to_openai(&body_bytes, proxy_config.model.as_deref()) {
                 Ok(transformed) => {
@@ -307,14 +342,26 @@ async fn handle_request(
     };
 
     // Build the target URL
-    // For OpenAI-compatible formats: rewrite Anthropic endpoint to OpenAI endpoint
-    let is_copilot = proxy_config.api_format.as_deref() == Some("github_copilot");
-    let effective_path = if is_openai_compat && path.contains("/v1/messages") {
-        if is_copilot {
-            // Copilot API uses /chat/completions (no /v1 prefix)
-            path.replace("/v1/messages", "/chat/completions")
+    // For OpenAI-compatible formats: rewrite Anthropic endpoint to appropriate upstream endpoint
+    let is_copilot = matches!(
+        proxy_config.api_format.as_deref(),
+        Some("github_copilot") | Some("github_copilot_responses")
+    );
+    let effective_path = if path.contains("/v1/messages") {
+        if is_responses_compat {
+            if is_copilot {
+                path.replace("/v1/messages", "/responses")
+            } else {
+                path.replace("/v1/messages", "/v1/responses")
+            }
+        } else if is_openai_compat {
+            if proxy_config.api_format.as_deref() == Some("github_copilot") {
+                path.replace("/v1/messages", "/chat/completions")
+            } else {
+                path.replace("/v1/messages", "/v1/chat/completions")
+            }
         } else {
-            path.replace("/v1/messages", "/v1/chat/completions")
+            path.clone()
         }
     } else {
         path.clone()
@@ -348,7 +395,7 @@ async fn handle_request(
 
     // Add authentication and identity headers based on target format
     match proxy_config.api_format.as_deref() {
-        Some("github_copilot") => {
+        Some("github_copilot") | Some("github_copilot_responses") => {
             // GitHub Copilot: use the resolved short-lived token, not the gho_* OAuth token
             if let Some(ref info) = copilot_resolved {
                 use std::time::{SystemTime, UNIX_EPOCH};
@@ -370,7 +417,7 @@ async fn handle_request(
                     .header("X-Initiator", "agent");
             }
         }
-        Some("openai_chat") => {
+        Some("openai_chat") | Some("openai_responses") => {
             if let Some(api_key) = &proxy_config.api_key {
                 // OpenAI-compatible: Bearer auth + OpenCode Zen identity headers
                 request_builder = request_builder
@@ -425,10 +472,10 @@ async fn handle_request(
         .to_string();
     let is_sse = upstream_content_type.contains("text/event-stream");
 
-    debug!("Received {} response from upstream (sse={}, openai_compat={})", status, is_sse, is_openai_compat);
+    debug!("Received {} response from upstream (sse={}, openai_compat={}, responses_compat={})", status, is_sse, is_openai_compat, is_responses_compat);
 
     // --- SSE passthrough for anthropic/anthropic_bearer streaming responses ---
-    if is_sse && !is_openai_compat {
+    if is_sse && !is_openai_compat && !is_responses_compat {
         let stream = response.bytes_stream().map(|result| {
             match result {
                 Ok(bytes) => Ok::<_, Infallible>(Frame::data(bytes)),
@@ -468,8 +515,8 @@ async fn handle_request(
         }
     }
 
-    // For openai_chat/github_copilot: convert error responses to Anthropic format
-    if is_openai_compat && !status.is_success() {
+    // For OpenAI-compat formats: convert error responses to Anthropic format
+    if (is_openai_compat || is_responses_compat) && !status.is_success() {
         // Map HTTP status to Anthropic error type
         let error_type = match status.as_u16() {
             429 => "overloaded_error",
@@ -513,6 +560,43 @@ async fn handle_request(
                 serde_json::to_vec(&anthropic_error).unwrap_or_else(|_| response_body.to_vec())
             ))))
             .unwrap());
+    }
+
+    // For openai_responses: transform Responses API JSON → Anthropic JSON → Anthropic SSE
+    if is_responses_compat && status.is_success() {
+        if let Ok(resp_str) = std::str::from_utf8(&response_body) {
+            let truncated = truncate_utf8(resp_str, 500);
+            debug!("Responses API upstream response ({}): {}", response_body.len(), truncated);
+        }
+        match openai_responses_to_anthropic(&response_body) {
+            Ok(anthropic_json) => {
+                if let Ok(resp_str) = std::str::from_utf8(&anthropic_json) {
+                    let truncated = truncate_utf8(resp_str, 500);
+                    debug!("Anthropic transformed ({}): {}", anthropic_json.len(), truncated);
+                }
+                match wrap_anthropic_json_as_sse(&anthropic_json) {
+                    Ok(sse_bytes) => {
+                        return Ok(Response::builder()
+                            .status(status)
+                            .header("Content-Type", "text/event-stream")
+                            .header("Cache-Control", "no-cache")
+                            .body(Either::Left(Full::new(Bytes::from(sse_bytes))))
+                            .unwrap());
+                    }
+                    Err(e) => {
+                        warn!("Failed to wrap Responses API response as SSE, returning JSON: {}", e);
+                        return Ok(Response::builder()
+                            .status(status)
+                            .header("Content-Type", "application/json")
+                            .body(Either::Left(Full::new(Bytes::from(anthropic_json))))
+                            .unwrap());
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to transform Responses API response, returning as-is: {}", e);
+            }
+        }
     }
 
     // For openai_chat: transform OpenAI JSON → Anthropic JSON → Anthropic SSE

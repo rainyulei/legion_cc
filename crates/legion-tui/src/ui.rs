@@ -32,12 +32,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // Draw popup overlay if in popup mode
     if let AppMode::Popup(menu) = app.mode {
-        draw_popup(frame, app, menu);
-    }
-
-    // Draw board detail popup overlay (squad mode)
-    if app.board_detail_open && app.is_squad() {
-        draw_board_detail_popup(frame, app);
+        if menu == PopupMenu::BoardDetail {
+            // Board detail has its own dedicated renderer
+            if app.is_squad() {
+                draw_board_detail_popup(frame, app);
+            }
+        } else {
+            draw_popup(frame, app, menu);
+        }
     }
 }
 
@@ -345,9 +347,16 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
             let ids: Vec<String> = blocks_list.iter().map(|id| format!("#{}", id)).collect();
             format!(" \u{2192}{}", ids.join(","))
         } else { String::new() };
-        let detail = format!("iter {}/{} \u{00b7} {} \u{00b7} {}{}{}",
+        // Show current active role from team activities
+        let active_role = app.ticket_team_activities.get(&t.id)
+            .and_then(|activities| activities.iter().rev()
+                .find(|a| a.status == crate::sdk::TeamActivityStatus::Running)
+                .map(|a| format!(" \u{00b7} \u{1f504}{}", a.role))
+            )
+            .unwrap_or_default();
+        let detail = format!("iter {}/{} \u{00b7} {} \u{00b7} {}{}{}{}",
             t.iteration, t.max_iterations, format_elapsed(t.elapsed_secs), team_short,
-            dep_suffix, blocks_suffix);
+            active_role, dep_suffix, blocks_suffix);
         let content_line = format!("  \u{2502} {} ", detail);
         let content_pad = card_width.saturating_sub(detail.len() + 2);
         let content_full = format!("{}{}\u{2502}",
@@ -659,20 +668,24 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
         Span::styled(team_str, Style::default().fg(Color::White)),
     ]));
 
-    // Context
+    // Context (word-wrapped for long content)
     if let Some(ref ctx) = t.context {
         lines.push(Line::from(vec![
             Span::styled(" Context: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(ctx.as_str(), Style::default().fg(Color::White)),
         ]));
+        for wl in wrap_to_lines(ctx, wrap_w) {
+            lines.push(Line::from(Span::styled(format!("   {}", wl), Style::default().fg(Color::White))));
+        }
     }
 
-    // Criteria
+    // Criteria (word-wrapped for long content)
     if let Some(ref crit) = t.criteria {
         lines.push(Line::from(vec![
             Span::styled(" Criteria: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(crit.as_str(), Style::default().fg(Color::White)),
         ]));
+        for wl in wrap_to_lines(crit, wrap_w) {
+            lines.push(Line::from(Span::styled(format!("   {}", wl), Style::default().fg(Color::White))));
+        }
     }
 
     // Dependencies
@@ -762,6 +775,45 @@ fn draw_board_detail_popup(frame: &mut Frame, app: &App) {
             let cleaned = clean_xml_tags(summary);
             for wl in wrap_to_lines(&cleaned, wrap_w) {
                 lines.push(Line::from(Span::styled(format!(" {}", wl), Style::default().fg(Color::White))));
+            }
+        }
+    }
+
+    // --- Team Activity timeline ---
+    if let Some(activities) = app.ticket_team_activities.get(&t.id) {
+        if !activities.is_empty() {
+            let sep_w = inner.width.saturating_sub(2) as usize;
+            lines.push(Line::from(Span::raw("")));
+            lines.push(Line::from(Span::styled(
+                format!(" \u{2500}\u{2500}\u{2500} Team Activity {}", "\u{2500}".repeat(sep_w.saturating_sub(18))),
+                Style::default().fg(Color::Magenta),
+            )));
+            for activity in activities {
+                let (icon, icon_color) = match &activity.status {
+                    crate::sdk::TeamActivityStatus::Running => ("\u{1f504}", Color::Yellow),
+                    crate::sdk::TeamActivityStatus::Done(_) => ("\u{1f7e2}", Color::Green),
+                    crate::sdk::TeamActivityStatus::Error(_) => ("\u{1f534}", Color::Red),
+                };
+                let elapsed_str = match &activity.status {
+                    crate::sdk::TeamActivityStatus::Running => "--".to_string(),
+                    _ => format!("{}s", activity.elapsed_secs),
+                };
+                // Role line: icon + role name + elapsed
+                let role_text = format!(" {} {}", icon, activity.role);
+                let pad = wrap_w.saturating_sub(role_text.chars().count() + elapsed_str.len() + 2);
+                lines.push(Line::from(vec![
+                    Span::styled(role_text, Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{}{}", " ".repeat(pad), elapsed_str), Style::default().fg(Color::DarkGray)),
+                ]));
+                // Description line (indented, word-wrapped)
+                if !activity.description.is_empty() {
+                    for wl in wrap_to_lines(&activity.description, wrap_w.saturating_sub(4)) {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", wl),
+                            Style::default().fg(Color::Gray),
+                        )));
+                    }
+                }
             }
         }
     }
@@ -888,7 +940,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(": Menu ", Style::default().fg(Color::Gray)),
             Span::styled("\u{2502} ", Style::default().fg(Color::Gray)),
             Span::styled("Ctrl+Q", Style::default().fg(Color::Yellow)),
-            Span::styled(": Quit", Style::default().fg(Color::Gray)),
+            Span::styled(": Quit ", Style::default().fg(Color::Gray)),
+            Span::styled("\u{2502} ", Style::default().fg(Color::Gray)),
+            Span::styled("Shift+Drag", Style::default().fg(Color::Yellow)),
+            Span::styled(": Copy", Style::default().fg(Color::Gray)),
         ]
     } else {
         match app.mode {
@@ -1051,6 +1106,7 @@ fn draw_popup(frame: &mut Frame, app: &App, menu: PopupMenu) {
         PopupMenu::RoleList => draw_role_list(frame, app, area),
         PopupMenu::RoleForm => draw_role_form(frame, app, area),
         PopupMenu::AddRoleToTeam => draw_add_role_to_team(frame, app, area),
+        PopupMenu::BoardDetail => {} // handled separately
     }
 }
 
@@ -2309,7 +2365,7 @@ fn draw_file_diff(frame: &mut Frame, app: &App, area: Rect) {
     // === Right panel: diff content ===
     let selected_file = data.files.get(app.diff_file_selected);
     let diff_block = Block::default()
-        .title(format!(" {} ", selected_file.map(|f| f.path.as_str()).unwrap_or("...")))
+        .title(format!(" {} ", selected_file.map(|f| truncate_str(&f.path, 60)).unwrap_or_else(|| "...".to_string())))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue));
     let diff_inner = diff_block.inner(right_area);

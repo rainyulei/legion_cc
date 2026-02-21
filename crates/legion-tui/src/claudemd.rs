@@ -6,28 +6,47 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 /// Generate the Leader's CLAUDE.md content
-pub fn leader_instructions(worker_count: u16) -> String {
+pub fn leader_instructions(worker_count: u16, teams: &[(String, String, Vec<String>)]) -> String {
+    let mut team_table = String::from("| Team ID | Name | Roles |\n|---------|------|-------|\n");
+    for (id, name, roles) in teams {
+        let roles_str = if roles.is_empty() {
+            "(no roles, TDD mode)".to_string()
+        } else {
+            roles.join(", ")
+        };
+        team_table.push_str(&format!("| {} | {} | {} |\n", id, name, roles_str));
+    }
+    if teams.is_empty() {
+        team_table = String::from("No teams configured. Use default: tech_lead_team\n");
+    }
+
     format!(
         r#"# Squad Leader
 
-You coordinate a team of {} autonomous Workers.
+You coordinate a team of {worker_count} autonomous Workers.
 
 ## MANDATORY DISPATCH FORMAT — READ THIS FIRST
 
 Every `legion-dispatch` call MUST include ALL four parts. The command WILL FAIL without -t, -c, and -k:
 
 ```
-legion-dispatch <worker_id> [--team <team_name>] -t "title" -c "context" -k "criteria" [--after N,M] "task description"
+legion-dispatch <worker_id> [--team <team_name>] -t "title" -c "context" -k "criteria" [--after N,M] [--plan "structure plan"] "task description"
 ```
 
 - `-t` — Short title (3-6 words): "Implement heart animation"
 - `-c` — Context (language, dependencies, constraints): "Python 3, no external deps, terminal ANSI output"
 - `-k` — Success criteria (testable conditions): "heart.py exists, python3 heart.py runs, uses math curve"
 - `--after` — (Optional) Comma-separated ticket IDs this task depends on: "--after 1,3"
-- `--team` — (Optional) Team template: tech_lead_team (default), fullstack_team, backend_team, qa_team, solo
+- `--plan` — (Optional) Structure plan: file paths to create/modify, directory conventions, prior ticket structures
+- `--team` — (Optional) Team ID from Available Teams below. Default: tech_lead_team
 - Last arg — Full task description with all implementation details
 
 **IMPORTANT:** Do NOT include working directory paths in `-c`. Each Worker has its own dedicated worktree — they will create files in their current directory automatically.
+
+## Available Teams
+
+{team_table}
+Use `--team <team_id>` to assign a team to a ticket. Default: tech_lead_team (if not specified)
 
 Example:
 ```bash
@@ -42,7 +61,7 @@ legion-dispatch 2 -t "Add unit tests" -c "Python 3, pytest" -k "all tests pass" 
 
 With team:
 ```bash
-legion-dispatch 1 --team fullstack_team -t "Implement heart animation" -c "Python 3, no external deps" -k "heart.py exists, python3 heart.py shows animated heart, uses math-based curve" "Create heart.py with parametric heart curve animation using ANSI colors"
+legion-dispatch 1 --team <team_id> -t "Implement heart animation" -c "Python 3, no external deps" -k "heart.py exists, python3 heart.py shows animated heart, uses math-based curve" "Create heart.py with parametric heart curve animation using ANSI colors"
 ```
 
 ## Workflow
@@ -99,7 +118,8 @@ Do NOT include `--after` for tasks that are truly independent.
 - Workers retry automatically on failure (Ralph Loop).
 - If a Worker errors after max retries, reassign or modify the task.
 "#,
-        worker_count
+        worker_count = worker_count,
+        team_table = team_table,
     )
 }
 
@@ -109,7 +129,7 @@ Do NOT include `--after` for tasks that are truly independent.
 /// * `worker_id` - The worker's numeric ID
 /// * `working_dir` - Optional working directory path for the worker
 /// * `team_roles` - Optional slice of (role_id, role_name, prompt_template) tuples
-pub fn worker_instructions(worker_id: u16, working_dir: Option<&str>, team_roles: Option<&[(String, String, String)]>) -> String {
+pub fn worker_instructions(worker_id: u16, working_dir: Option<&str>, team_roles: Option<&[(String, String, String)]>, team_prompt: Option<&str>) -> String {
     let wd_note = working_dir.map(|d| format!(
         "\n\n## Working Directory\n\nYour working directory is: `{}`\nAll files you create MUST be in this directory. Use relative paths (e.g., `./heart.py`) or this absolute path. NEVER write files to any other location.\n", d
     )).unwrap_or_default();
@@ -134,26 +154,47 @@ You must work completely autonomously from start to finish.
     if let Some(roles) = team_roles {
         if !roles.is_empty() {
             prompt.push_str("\n## Agent Team\n\n");
-            prompt.push_str("You are the team lead of specialized agents. Your teammates are:\n\n");
 
+            // Team objective from team_prompt
+            if let Some(tp) = team_prompt {
+                if !tp.is_empty() {
+                    prompt.push_str("### Team Objective\n\n");
+                    prompt.push_str(tp);
+                    prompt.push_str("\n\n");
+                }
+            }
+
+            prompt.push_str("### Your Teammates\n\n");
             for (role_id, role_name, prompt_template) in roles {
                 prompt.push_str(&format!(
-                    "### {} (ID: {})\n{}\n\n",
+                    "#### {} (ID: {})\n{}\n\n",
                     role_name, role_id, prompt_template
                 ));
             }
 
             prompt.push_str(
-                r#"## Delegation Workflow
+                r#"### Communication Protocol
 
-1. **Analyze the task**: Break down the work and identify which specialist should handle each part.
-2. **Delegate**: Use the Task tool to assign work to the appropriate teammate:
-   ```
-   Task tool with subagent_type matching the role ID (e.g., "tech_lead", "frontend_engineer")
-   ```
-3. **Review**: When a teammate completes their work, review the output for quality and correctness.
-4. **Verify all criteria**: Ensure every success criterion is met across all delegated work.
-5. **Complete**: When ALL criteria pass, output `<promise>DONE</promise>` with a summary.
+You have two delegation modes. Choose based on task structure:
+
+**Sequential (default):** Delegate to one teammate at a time via the Task tool. Wait for their result, review it, then decide the next step.
+- Use when: tasks have dependencies, quality review needed between steps
+- Example flow: Tech Lead designs → Engineer implements → QA validates
+
+**Parallel (broadcast):** Delegate to multiple teammates simultaneously via multiple Task tool calls in one message.
+- Use when: tasks are independent, need diverse perspectives, or time-sensitive
+- Example: Multiple engineers implement different components; QA writes test specs while Engineer codes
+
+### Entropy Reduction Rules
+
+1. Each role focuses ONLY on their stated domain — do not cross-assign responsibilities
+2. When reviewing teammate output, provide SPECIFIC actionable feedback (not "looks good")
+3. If roles produce conflicting results, YOU (team lead) make the final decision based on success criteria
+4. Do not re-delegate the same work without concrete changes to the instructions
+5. Prefer fewer, more targeted delegations over many vague ones
+
+### Completion
+When ALL success criteria are met, output `<promise>DONE</promise>` with a summary of what each role contributed.
 
 "#
             );
@@ -231,7 +272,7 @@ pub fn split_tickets_command(worker_count: u16) -> String {
 每个 ticket 通过 `legion-dispatch` 提交：
 
 ```
-legion-dispatch <worker_id> -t "<title>" -c "<context>" -k "<criteria>" [--after N,M] "<prompt>"
+legion-dispatch <worker_id> -t "<title>" -c "<context>" -k "<criteria>" [--after N,M] [--plan "<structure plan>"] "<prompt>"
 ```
 
 | 字段 | CLI 标志 | 必填 | 说明 |
@@ -241,6 +282,7 @@ legion-dispatch <worker_id> -t "<title>" -c "<context>" -k "<criteria>" [--after
 | context | -c | 是 | 技术上下文 + 整体 plan 摘要 |
 | criteria | -k | 是 | 可验证的成功标准 |
 | after | --after | 否 | 依赖的 ticket IDs，逗号分隔 |
+| plan | --plan | 否 | 文件夹规划：文件路径、目录约定、前序 ticket 建立的结构 |
 | prompt | 最后位置参数 | 是 | 完整任务描述 |
 
 ## 字段写作要点
@@ -283,11 +325,57 @@ Worker 执行任务的全部信息，无需回来问问题。
 - 有明确的输入/输出边界
 - 有可独立验证的 success criteria
 
+### Step 2.5: 文件夹规划 (Structure Plan)
+
+为每个 ticket 编写 `--plan` 参数，确保 Worker 对项目结构有一致理解：
+
+**规划内容：**
+- 此 ticket 要创建/修改的文件路径（精确到文件名）
+- 目录结构约定（import 风格、模块组织方式）
+- 前序 ticket 已建立的文件/约定（递进式累积）
+- 与整体 plan 的关系（此 ticket 在架构中的位置）
+
+**递进式累积原则：**
+- Ticket 1 的 plan: 定义基础目录结构
+- Ticket 2 的 plan: 包含 ticket 1 建立的结构 + 本 ticket 新增的文件
+- Ticket 3 的 plan: 包含 ticket 1+2 的结构 + 本 ticket 新增的文件
+
+**示例：**
+```
+--plan "Files: src/db/schema.rs (new), src/db/mod.rs (modify). Convention: use crate::db::Schema for imports. This is the data layer foundation — ticket 2 will build API on top of these types."
+```
+
 ### Step 3: 识别依赖关系 (DAG)
 - ticket B 读取 ticket A 创建的文件 → B --after A
 - ticket C 需要 A 和 B 的输出 → C --after A,B
 - 完全无关的 ticket → 无 --after（并行执行）
 - 原则：最小化依赖，最大化并行
+
+### Step 3.5: 插入验证 Checkpoint
+
+每个功能模块的开发 ticket 完成后，插入一个 **验证 checkpoint ticket**：
+
+**规则：**
+- 每组相关开发 ticket 后面跟一个 checkpoint ticket
+- Checkpoint 用 `--after` 依赖该组所有开发 ticket
+- 后续模块的 ticket 应 `--after` checkpoint（而非直接依赖开发 ticket）
+- Checkpoint 确保集成后代码能编译、测试通过、lint 干净
+
+**Checkpoint ticket 的写法：**
+- title: "Verify [模块名] integration"
+- context: 列出前序 ticket 做了什么，项目技术栈
+- criteria: "cargo build succeeds, cargo test passes, cargo clippy has no warnings" (或对应的 npm/python 命令)
+- prompt: "验证前序任务的集成结果。依次运行 build、test、lint。如果有错误，分析原因并修复。所有检查通过后报告完成。"
+
+**示例 DAG：**
+```
+T1: DB schema          (独立)
+T2: DB tests           (--after 1)
+T3: Checkpoint         (--after 1,2)  ← 验证 DB 模块
+T4: API routes         (--after 3)    ← 依赖 checkpoint 而非 T1/T2
+T5: API tests          (--after 4)
+T6: Checkpoint         (--after 4,5)  ← 验证 API 模块
+```
 
 ### Step 4: 分配 worker
 - 用 `legion-status` 查看当前 worker 状态
@@ -295,11 +383,12 @@ Worker 执行任务的全部信息，无需回来问问题。
 - Worker 完成任务后会自动接新任务，无需等待
 
 ### Step 5: 批量 dispatch
-列出所有 dispatch 命令，确认后逐个执行：
+列出所有 dispatch 命令（含 checkpoint），确认后逐个执行：
 ```
-legion-dispatch 1 -t "..." -c "..." -k "..." "..."
-legion-dispatch 2 -t "..." -c "..." -k "..." --after 1 "..."
-legion-dispatch 3 -t "..." -c "..." -k "..." --after 1,2 "..."
+legion-dispatch 1 -t "Implement DB schema" -c "..." -k "..." --plan "Files: src/db/schema.rs (new). Base data layer." "..."
+legion-dispatch 2 -t "Add DB unit tests" -c "..." -k "..." --after 1 --plan "Files: tests/db_test.rs (new). Tests for schema from ticket 1." "..."
+legion-dispatch 3 -t "Verify DB module integration" -c "Tickets 1-2 implemented DB schema and tests. Tech: Rust with Cargo." -k "cargo build succeeds, cargo test passes, cargo clippy has no warnings" --after 1,2 "验证前序任务的集成结果。依次运行: 1) cargo build 2) cargo test 3) cargo clippy -- -D warnings。如果有错误，分析原因并修复。所有检查通过后报告完成。"
+legion-dispatch 4 -t "Implement API routes" -c "..." -k "..." --after 3 --plan "Files: src/api/routes.rs (new). Uses DB schema from ticket 1." "..."
 ```
 
 ## 分解原则
@@ -309,6 +398,7 @@ legion-dispatch 3 -t "..." -c "..." -k "..." --after 1,2 "..."
 3. **最小依赖**：能并行就并行，只在必要时用 --after
 4. **Context 要充分**：宁多勿少，Worker 看不到你的上下文
 5. **Criteria 要可测**：每条标准必须能用命令验证
+6. **模块间设 Checkpoint**：每个功能模块后插入验证 ticket，后续模块依赖 checkpoint 而非开发 ticket
 "#,
         worker_count = worker_count
     )
@@ -325,18 +415,79 @@ pub fn write_leader_commands(leader_worktree: &std::path::Path, worker_count: u1
     Ok(())
 }
 
+/// Generate a conflict resolution prompt for SDK-based merge resolution
+pub fn conflict_resolve_prompt(
+    conflict: &crate::worktree::ConflictContext,
+    ticket_title: &str,
+    ticket_summary: Option<&str>,
+    done_tickets: &[(String, Option<String>)],
+) -> String {
+    let mut prompt = String::new();
+
+    prompt.push_str("# Merge Conflict Resolution\n\n");
+    prompt.push_str("You are resolving merge conflicts in a multi-worker development session.\n\n");
+
+    // Current worker ticket context
+    prompt.push_str("## Current Worker's Ticket\n\n");
+    prompt.push_str(&format!("**Title**: {}\n", ticket_title));
+    if let Some(summary) = ticket_summary {
+        prompt.push_str(&format!("**Summary**: {}\n", summary));
+    }
+
+    // Worker's recent commits
+    if !conflict.worker_commits.is_empty() {
+        prompt.push_str("\n**Worker's recent commits:**\n```\n");
+        prompt.push_str(&conflict.worker_commits);
+        prompt.push_str("```\n");
+    }
+
+    // Already merged tickets for context
+    if !done_tickets.is_empty() {
+        prompt.push_str("\n## Previously Merged Tickets\n\n");
+        prompt.push_str("These tickets have already been merged into the leader branch:\n\n");
+        for (title, summary) in done_tickets {
+            prompt.push_str(&format!("- **{}**", title));
+            if let Some(s) = summary {
+                prompt.push_str(&format!(": {}", s));
+            }
+            prompt.push('\n');
+        }
+    }
+
+    // Conflicted files
+    prompt.push_str("\n## Conflicted Files\n\n");
+    for (filename, content) in &conflict.file_contents {
+        prompt.push_str(&format!("### `{}`\n\n", filename));
+        prompt.push_str("```\n");
+        prompt.push_str(content);
+        prompt.push_str("\n```\n\n");
+    }
+
+    // Instructions
+    prompt.push_str("## Instructions\n\n");
+    prompt.push_str("1. **Understand both sides**: The `<<<<<<< HEAD` section is the leader branch (previously merged work). The `>>>>>>> ...` section is the worker's new changes.\n");
+    prompt.push_str("2. **Resolve intelligently**: Keep BOTH sides' intent. Do not discard either side's changes unless they are truly redundant.\n");
+    prompt.push_str("3. **Edit each conflicted file**: Remove ALL conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) and produce the correct merged content.\n");
+    prompt.push_str("4. **Stage resolved files**: Run `git add <file>` for each resolved file.\n");
+    prompt.push_str("5. **Verify**: Ensure the code compiles/builds correctly after resolution.\n");
+    prompt.push_str("6. **Complete**: Output `<promise>DONE</promise>` when all conflicts are resolved and the code is valid.\n\n");
+    prompt.push_str("**CRITICAL**: Do NOT use `git merge --abort`. You must resolve the conflicts, not abandon them.\n");
+
+    prompt
+}
+
 /// Write CLAUDE.md files to a temp directory, return (leader_path, worker_paths)
 pub fn write_squad_claude_md(worker_count: u16) -> Result<(PathBuf, Vec<PathBuf>)> {
     let dir = PathBuf::from("/tmp/legion/claudemd");
     fs::create_dir_all(&dir)?;
 
     let leader_path = dir.join("leader-CLAUDE.md");
-    fs::write(&leader_path, leader_instructions(worker_count))?;
+    fs::write(&leader_path, leader_instructions(worker_count, &[]))?;
 
     let mut worker_paths = Vec::new();
     for i in 1..=worker_count {
         let path = dir.join(format!("worker-{}-CLAUDE.md", i));
-        fs::write(&path, worker_instructions(i, None, None))?;
+        fs::write(&path, worker_instructions(i, None, None, None))?;
         worker_paths.push(path);
     }
 
@@ -349,7 +500,7 @@ mod tests {
 
     #[test]
     fn worker_prompt_contains_key_elements() {
-        let prompt = worker_instructions(1, Some("/test/worktree"), None);
+        let prompt = worker_instructions(1, Some("/test/worktree"), None, None);
         assert!(prompt.contains("Worker 1"));
         assert!(prompt.contains("headless"));
         assert!(prompt.contains("TDD"));
@@ -365,7 +516,11 @@ mod tests {
 
     #[test]
     fn leader_prompt_mentions_dispatch_format() {
-        let prompt = leader_instructions(2);
+        let teams = vec![
+            ("tech_lead_team".to_string(), "Tech Lead Team".to_string(), vec!["Tech Lead".to_string(), "Engineer".to_string()]),
+            ("solo".to_string(), "Solo".to_string(), vec![]),
+        ];
+        let prompt = leader_instructions(2, &teams);
         assert!(prompt.contains("MANDATORY DISPATCH FORMAT"));
         assert!(prompt.contains("legion-dispatch"));
         assert!(prompt.contains("legion-check"));
@@ -373,6 +528,11 @@ mod tests {
         assert!(prompt.contains("/split-tickets"));
         assert!(prompt.contains("任务分解提示"));
         assert!(prompt.contains("不要直接开始执行"));
+        // Dynamic team table
+        assert!(prompt.contains("Available Teams"));
+        assert!(prompt.contains("tech_lead_team"));
+        assert!(prompt.contains("Tech Lead, Engineer"));
+        assert!(prompt.contains("(no roles, TDD mode)"));
     }
 
     #[test]
@@ -428,29 +588,32 @@ mod tests {
             ),
         ];
 
-        let prompt = worker_instructions(1, None, Some(&roles));
+        let team_prompt = "Sequential workflow: Lead designs, Engineer implements, QA validates.";
+        let prompt = worker_instructions(1, None, Some(&roles), Some(team_prompt));
 
-        // Should contain Agent Team section
+        // Agent Team section
         assert!(prompt.contains("## Agent Team"));
-        assert!(prompt.contains("team lead"));
+        assert!(prompt.contains("Team Objective"));
+        assert!(prompt.contains("Sequential workflow"));
 
-        // Should contain all role names
+        // Role names and IDs
         assert!(prompt.contains("Technical Lead"));
         assert!(prompt.contains("Frontend Engineer"));
         assert!(prompt.contains("QA Engineer"));
-
-        // Should contain role IDs
         assert!(prompt.contains("tech_lead"));
         assert!(prompt.contains("frontend_engineer"));
         assert!(prompt.contains("qa_engineer"));
 
-        // Should contain role templates
+        // Role templates
         assert!(prompt.contains("architecture and code reviews"));
         assert!(prompt.contains("React, TypeScript"));
         assert!(prompt.contains("comprehensive tests"));
 
-        // Should contain delegation workflow
-        assert!(prompt.contains("Delegation Workflow"));
+        // Collaboration framework
+        assert!(prompt.contains("Communication Protocol"));
+        assert!(prompt.contains("Sequential (default)"));
+        assert!(prompt.contains("Parallel (broadcast)"));
+        assert!(prompt.contains("Entropy Reduction"));
         assert!(prompt.contains("Task tool"));
 
         // Should NOT contain solo TDD workflow
@@ -459,7 +622,7 @@ mod tests {
 
     #[test]
     fn worker_prompt_without_team_is_solo() {
-        let prompt = worker_instructions(1, None, None);
+        let prompt = worker_instructions(1, None, None, None);
 
         // Should contain solo TDD workflow
         assert!(prompt.contains("Implement with TDD"));
@@ -474,7 +637,7 @@ mod tests {
     #[test]
     fn worker_prompt_with_empty_team_is_solo() {
         let empty_roles: Vec<(String, String, String)> = vec![];
-        let prompt = worker_instructions(1, None, Some(&empty_roles));
+        let prompt = worker_instructions(1, None, Some(&empty_roles), None);
 
         // Should contain solo TDD workflow
         assert!(prompt.contains("Implement with TDD"));

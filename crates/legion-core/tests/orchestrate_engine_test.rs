@@ -16,7 +16,7 @@ async fn test_engine_init_empty() {
 #[tokio::test]
 async fn test_submit_ticket() {
     let engine = OrchestrateEngine::new(2);
-    let id = engine.submit_ticket("Fix bug #42".into(), "Fix bug #42".into(), None, None, TeamMode::TechLeadTeam, 5, Vec::new()).await.unwrap();
+    let id = engine.submit_ticket("Fix bug #42".into(), "Fix bug #42".into(), None, None, TeamMode::TechLeadTeam, 5, Vec::new(), None).await.unwrap();
     assert_eq!(id, 1);
 
     let all = engine.all_tickets().await;
@@ -29,7 +29,7 @@ async fn test_submit_ticket() {
 #[tokio::test]
 async fn test_take_next() {
     let engine = OrchestrateEngine::new(2);
-    engine.submit_ticket("Task A".into(), "Task A".into(), None, None, TeamMode::Solo, 3, Vec::new()).await.unwrap();
+    engine.submit_ticket("Task A".into(), "Task A".into(), None, None, TeamMode::Solo, 3, Vec::new(), None).await.unwrap();
 
     // Worker 1 takes the ticket
     let taken = engine.take_next(1).await;
@@ -50,7 +50,7 @@ async fn test_take_next() {
 #[tokio::test]
 async fn test_report_iteration_success() {
     let engine = OrchestrateEngine::new(2);
-    engine.submit_ticket("Task B".into(), "Task B".into(), None, None, TeamMode::TechLeadTeam, 5, Vec::new()).await.unwrap();
+    engine.submit_ticket("Task B".into(), "Task B".into(), None, None, TeamMode::TechLeadTeam, 5, Vec::new(), None).await.unwrap();
     engine.take_next(1).await;
 
     let should_retry = engine.report_iteration(1, true, Some("All good".into())).await;
@@ -64,7 +64,7 @@ async fn test_report_iteration_success() {
 #[tokio::test]
 async fn test_report_iteration_retry() {
     let engine = OrchestrateEngine::new(2);
-    engine.submit_ticket("Task C".into(), "Task C".into(), None, None, TeamMode::TechLeadTeam, 3, Vec::new()).await.unwrap();
+    engine.submit_ticket("Task C".into(), "Task C".into(), None, None, TeamMode::TechLeadTeam, 3, Vec::new(), None).await.unwrap();
     engine.take_next(1).await;
 
     // First failure — should retry (iteration 2 <= max 3)
@@ -80,7 +80,7 @@ async fn test_report_iteration_retry() {
 #[tokio::test]
 async fn test_report_iteration_max_exceeded() {
     let engine = OrchestrateEngine::new(2);
-    engine.submit_ticket("Task D".into(), "Task D".into(), None, None, TeamMode::Solo, 2, Vec::new()).await.unwrap();
+    engine.submit_ticket("Task D".into(), "Task D".into(), None, None, TeamMode::Solo, 2, Vec::new(), None).await.unwrap();
     engine.take_next(1).await;
 
     // Fail iteration 1 -> retry (iter becomes 2)
@@ -98,8 +98,8 @@ async fn test_report_iteration_max_exceeded() {
 #[tokio::test]
 async fn test_stop_all() {
     let engine = OrchestrateEngine::new(3);
-    engine.submit_ticket("T1".into(), "T1".into(), None, None, TeamMode::default(), 5, Vec::new()).await.unwrap();
-    engine.submit_ticket("T2".into(), "T2".into(), None, None, TeamMode::default(), 5, Vec::new()).await.unwrap();
+    engine.submit_ticket("T1".into(), "T1".into(), None, None, TeamMode::default(), 5, Vec::new(), None).await.unwrap();
+    engine.submit_ticket("T2".into(), "T2".into(), None, None, TeamMode::default(), 5, Vec::new(), None).await.unwrap();
     engine.take_next(1).await;
     engine.take_next(2).await;
 
@@ -115,9 +115,9 @@ async fn test_stop_all() {
 #[tokio::test]
 async fn test_queue_stats() {
     let engine = OrchestrateEngine::new(2);
-    engine.submit_ticket("T1".into(), "T1".into(), None, None, TeamMode::default(), 5, Vec::new()).await.unwrap();
-    engine.submit_ticket("T2".into(), "T2".into(), None, None, TeamMode::default(), 5, Vec::new()).await.unwrap();
-    engine.submit_ticket("T3".into(), "T3".into(), None, None, TeamMode::default(), 5, Vec::new()).await.unwrap();
+    engine.submit_ticket("T1".into(), "T1".into(), None, None, TeamMode::default(), 5, Vec::new(), None).await.unwrap();
+    engine.submit_ticket("T2".into(), "T2".into(), None, None, TeamMode::default(), 5, Vec::new(), None).await.unwrap();
+    engine.submit_ticket("T3".into(), "T3".into(), None, None, TeamMode::default(), 5, Vec::new(), None).await.unwrap();
     engine.take_next(1).await; // T1 -> Working
     engine.report_iteration(1, true, None).await; // T1 -> Done
     engine.take_next(1).await; // T2 -> Working
@@ -135,7 +135,7 @@ async fn test_worker_idle() {
     let engine = OrchestrateEngine::new(2);
     assert!(engine.is_worker_idle(1).await);
 
-    engine.submit_ticket("Task".into(), "Task".into(), None, None, TeamMode::default(), 5, Vec::new()).await.unwrap();
+    engine.submit_ticket("Task".into(), "Task".into(), None, None, TeamMode::default(), 5, Vec::new(), None).await.unwrap();
     engine.take_next(1).await;
     assert!(!engine.is_worker_idle(1).await);
     assert!(engine.is_worker_idle(2).await);

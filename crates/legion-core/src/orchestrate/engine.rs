@@ -65,6 +65,7 @@ pub struct TaskTicket {
     pub base_commit: Option<String>,
     pub blocked_by: Vec<usize>,
     pub merge_status: MergeStatus,
+    pub structure_plan: Option<String>,
 }
 
 impl TaskTicket {
@@ -95,6 +96,7 @@ pub struct TicketSnapshot {
     pub base_commit: Option<String>,
     pub blocked_by: Vec<usize>,
     pub merge_status: MergeStatus,
+    pub structure_plan: Option<String>,
 }
 
 struct EngineInner {
@@ -178,6 +180,7 @@ impl OrchestrateEngine {
                             "skipped" => MergeStatus::Skipped,
                             _ => MergeStatus::Pending,
                         },
+                        structure_plan: row.structure_plan,
                     });
                     if row.id as usize >= next_id {
                         next_id = row.id as usize + 1;
@@ -242,6 +245,7 @@ impl OrchestrateEngine {
                     MergeStatus::Conflict => "conflict".to_string(),
                     MergeStatus::Skipped => "skipped".to_string(),
                 },
+                structure_plan: ticket.structure_plan.clone(),
             };
             if let Ok(db) = db.lock() {
                 let _ = db.insert_ticket(&row);
@@ -288,6 +292,7 @@ impl OrchestrateEngine {
                     MergeStatus::Conflict => "conflict".to_string(),
                     MergeStatus::Skipped => "skipped".to_string(),
                 },
+                structure_plan: ticket.structure_plan.clone(),
             };
             if let Ok(db) = db.lock() {
                 let _ = db.update_ticket(&row);
@@ -298,6 +303,7 @@ impl OrchestrateEngine {
     pub async fn submit_ticket(
         &self, title: String, prompt: String, context: Option<String>, criteria: Option<String>,
         team_mode: TeamMode, max_iterations: u16, blocked_by: Vec<usize>,
+        structure_plan: Option<String>,
     ) -> Result<usize, String> {
         let mut guard = self.inner.write().await;
         // Validate all blocked_by IDs exist in current tickets
@@ -326,6 +332,7 @@ impl OrchestrateEngine {
             base_commit: None,
             blocked_by,
             merge_status: MergeStatus::Pending,
+            structure_plan,
         };
         guard.tickets.push(ticket.clone());
         drop(guard);
@@ -607,5 +614,6 @@ fn ticket_to_snapshot(t: &TaskTicket) -> TicketSnapshot {
         base_commit: t.base_commit.clone(),
         blocked_by: t.blocked_by.clone(),
         merge_status: t.merge_status,
+        structure_plan: t.structure_plan.clone(),
     }
 }
