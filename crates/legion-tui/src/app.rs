@@ -321,6 +321,7 @@ pub struct App {
     // Board state (squad task board)
     pub board_selected: usize,          // selected ticket id in board view
     pub board_detail_scroll: usize,     // scroll offset in detail popup
+    pub board_scroll_offset: usize,     // viewport scroll offset for task board list
 
     // Per-ticket log buffers (ticket_id → log lines)
     pub ticket_logs: HashMap<usize, std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
@@ -476,6 +477,7 @@ impl App {
             board_selected: 0,
             // board_detail is now AppMode::Popup(PopupMenu::BoardDetail)
             board_detail_scroll: 0,
+            board_scroll_offset: 0,
             ticket_logs: HashMap::new(),
             ticket_team_activities: HashMap::new(),
             connect_provider_index: 0,

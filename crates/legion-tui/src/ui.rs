@@ -16,7 +16,7 @@ use crate::app::{App, AppMode, MainMenuItem, MatrixCol, ModelTarget, PopupMenu};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Main draw function
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -167,7 +167,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(header), area);
 }
 
-fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.panes.is_empty() {
         // No panes yet (startup session selection)
         let block = Block::default()
@@ -185,7 +185,7 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Squad mode: leader | divider | task board
-fn draw_squad_layout(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_squad_layout(frame: &mut Frame, app: &mut App, area: Rect) {
     let leader_width = (area.width as u32 * app.leader_ratio as u32 / 100) as u16;
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -279,7 +279,7 @@ fn draw_pane(frame: &mut Frame, app: &App, index: usize, area: Rect) {
 }
 
 /// Draw the embedded squad board in the right panel
-fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_task_board(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.right_panel_focused;
     let border_color = if is_focused { Color::Blue } else { Color::DarkGray };
 
@@ -306,6 +306,8 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
     // Build lines to render inside the outer block
     let inner = block.inner(area);
     let mut lines: Vec<Line> = Vec::new();
+    // Track which line each ticket starts at (ticket_id → line_index)
+    let mut ticket_line_map: Vec<(usize, usize)> = Vec::new();
 
     // --- WORKING section: bordered cards ---
     let selected_prefix = |ticket_id: usize| -> &'static str {
@@ -317,6 +319,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     )));
     for t in &working {
+        ticket_line_map.push((t.id, lines.len()));
         let w_label = t.assigned_worker.map(|w| format!("W{}", w)).unwrap_or_default();
         let team_short = team_mode_short(&t.team_mode);
         let card_width = inner.width.saturating_sub(4) as usize;
@@ -391,6 +394,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )));
     for t in &queued {
+        ticket_line_map.push((t.id, lines.len()));
         lines.push(ticket_compact_line(t, app, false, tickets));
     }
 
@@ -402,6 +406,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
     )));
     for t in &done {
+        ticket_line_map.push((t.id, lines.len()));
         lines.push(ticket_compact_line(t, app, true, tickets));
     }
 
@@ -413,6 +418,7 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     )));
     for t in &errored {
+        ticket_line_map.push((t.id, lines.len()));
         let sel = app.right_panel_focused && app.board_selected == t.id;
         let prefix = if sel { "\u{25b6} " } else { "  " };
         let row_style = if sel {
@@ -496,7 +502,36 @@ fn draw_task_board(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(actions));
     }
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    // Auto-scroll to keep selected ticket visible
+    let visible_height = inner.height as usize;
+    let total_lines = lines.len();
+    if let Some(&(_, sel_line)) = ticket_line_map.iter().find(|(id, _)| *id == app.board_selected) {
+        // Working tickets take 3 lines (top border + content + bottom border), others take 1
+        let sel_height = if working.iter().any(|t| t.id == app.board_selected) { 3 } else { 1 };
+        if sel_line < app.board_scroll_offset {
+            app.board_scroll_offset = sel_line;
+        } else if sel_line + sel_height > app.board_scroll_offset + visible_height {
+            app.board_scroll_offset = (sel_line + sel_height).saturating_sub(visible_height);
+        }
+    }
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    app.board_scroll_offset = app.board_scroll_offset.min(max_scroll);
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .scroll((app.board_scroll_offset as u16, 0));
+    frame.render_widget(paragraph, area);
+
+    // Scrollbar when content overflows
+    if total_lines > visible_height {
+        let mut scrollbar_state = ScrollbarState::new(total_lines)
+            .position(app.board_scroll_offset)
+            .viewport_content_length(visible_height);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"));
+        frame.render_stateful_widget(scrollbar, inner, &mut scrollbar_state);
+    }
 }
 
 /// Compact single-line ticket for Queued/Done sections
