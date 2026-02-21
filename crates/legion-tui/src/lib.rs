@@ -19,6 +19,8 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+use app::{AppMode, PopupMenu};
+
 use legion_core::proxy::{ProxyControlApi, ProxyServer};
 
 use app::App;
@@ -326,13 +328,29 @@ async fn run_event_loop(
                     handle_mouse(app, mouse);
                 }
                 Event::Paste(data) => {
-                    // Wrap pasted text in bracketed paste escape sequences so the
-                    // inner PTY (Claude Code's readline) treats it as a single paste
-                    let mut paste_bytes = Vec::with_capacity(data.len() + 12);
-                    paste_bytes.extend_from_slice(b"\x1b[200~");
-                    paste_bytes.extend_from_slice(data.as_bytes());
-                    paste_bytes.extend_from_slice(b"\x1b[201~");
-                    app.write_to_pty(&paste_bytes);
+                    // Route paste to the appropriate input buffer based on mode
+                    match app.mode {
+                        AppMode::Popup(PopupMenu::ProviderApiKeyInput) => {
+                            app.api_key_input.push_str(&data);
+                        }
+                        AppMode::Popup(PopupMenu::NewSessionInput) => {
+                            app.session_name_input.push_str(&data);
+                        }
+                        AppMode::Popup(PopupMenu::RetryForm) => {
+                            let focus = app.retry_form_focus as usize;
+                            if focus < app.retry_form_fields.len() {
+                                app.retry_form_fields[focus].push_str(&data);
+                            }
+                        }
+                        _ => {
+                            // Normal mode: send to PTY with bracketed paste
+                            let mut paste_bytes = Vec::with_capacity(data.len() + 12);
+                            paste_bytes.extend_from_slice(b"\x1b[200~");
+                            paste_bytes.extend_from_slice(data.as_bytes());
+                            paste_bytes.extend_from_slice(b"\x1b[201~");
+                            app.write_to_pty(&paste_bytes);
+                        }
+                    }
                 }
                 Event::Resize(w, h) => {
                     app.resize_panes(w, h);

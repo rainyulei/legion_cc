@@ -250,15 +250,24 @@ async fn handle_request(
     };
 
     // Transform request if needed
+    // Auto-detect: github_copilot + codex model → use Responses API path
+    let model_needs_responses = proxy_config.model.as_deref()
+        .map(|m| m.contains("codex"))
+        .unwrap_or(false);
+    let effective_format = if proxy_config.api_format.as_deref() == Some("github_copilot") && model_needs_responses {
+        "github_copilot_responses"
+    } else {
+        proxy_config.api_format.as_deref().unwrap_or("")
+    };
     // Chat Completions formats
     let is_openai_compat = matches!(
-        proxy_config.api_format.as_deref(),
-        Some("openai_chat") | Some("github_copilot")
+        effective_format,
+        "openai_chat" | "github_copilot"
     );
     // Responses API formats
     let is_responses_compat = matches!(
-        proxy_config.api_format.as_deref(),
-        Some("openai_responses") | Some("github_copilot_responses")
+        effective_format,
+        "openai_responses" | "github_copilot_responses"
     );
 
     // Log the model override for debugging (info level for easy visibility)
@@ -267,8 +276,8 @@ async fn handle_request(
             proxy_config.api_format, proxy_config.model, proxy_config.target_url);
     }
 
-    let (request_body, content_type) = match proxy_config.api_format.as_deref() {
-        Some("openai_responses") | Some("github_copilot_responses") => {
+    let (request_body, content_type) = match effective_format {
+        "openai_responses" | "github_copilot_responses" => {
             match anthropic_to_openai_responses(&body_bytes, proxy_config.model.as_deref()) {
                 Ok(transformed) => {
                     // Force stream=false — we'll wrap the buffered response as Anthropic SSE
@@ -295,7 +304,7 @@ async fn handle_request(
                 }
             }
         }
-        Some("openai_chat") | Some("github_copilot") => {
+        "openai_chat" | "github_copilot" => {
             match anthropic_to_openai(&body_bytes, proxy_config.model.as_deref()) {
                 Ok(transformed) => {
                     // Force stream=false — we'll wrap the buffered response as Anthropic SSE
@@ -344,8 +353,8 @@ async fn handle_request(
     // Build the target URL
     // For OpenAI-compatible formats: rewrite Anthropic endpoint to appropriate upstream endpoint
     let is_copilot = matches!(
-        proxy_config.api_format.as_deref(),
-        Some("github_copilot") | Some("github_copilot_responses")
+        effective_format,
+        "github_copilot" | "github_copilot_responses"
     );
     let effective_path = if path.contains("/v1/messages") {
         if is_responses_compat {
@@ -355,7 +364,7 @@ async fn handle_request(
                 path.replace("/v1/messages", "/v1/responses")
             }
         } else if is_openai_compat {
-            if proxy_config.api_format.as_deref() == Some("github_copilot") {
+            if is_copilot {
                 path.replace("/v1/messages", "/chat/completions")
             } else {
                 path.replace("/v1/messages", "/v1/chat/completions")
@@ -394,8 +403,8 @@ async fn handle_request(
         .body(request_body);
 
     // Add authentication and identity headers based on target format
-    match proxy_config.api_format.as_deref() {
-        Some("github_copilot") | Some("github_copilot_responses") => {
+    match effective_format {
+        "github_copilot" | "github_copilot_responses" => {
             // GitHub Copilot: use the resolved short-lived token, not the gho_* OAuth token
             if let Some(ref info) = copilot_resolved {
                 use std::time::{SystemTime, UNIX_EPOCH};
@@ -417,7 +426,7 @@ async fn handle_request(
                     .header("X-Initiator", "agent");
             }
         }
-        Some("openai_chat") | Some("openai_responses") => {
+        "openai_chat" | "openai_responses" => {
             if let Some(api_key) = &proxy_config.api_key {
                 // OpenAI-compatible: Bearer auth + OpenCode Zen identity headers
                 request_builder = request_builder
@@ -429,7 +438,7 @@ async fn handle_request(
                     .header("x-opencode-client", "cli");
             }
         }
-        Some("anthropic_bearer") => {
+        "anthropic_bearer" => {
             if let Some(api_key) = &proxy_config.api_key {
                 // Anthropic protocol with Bearer auth (e.g. third-party Anthropic-compatible APIs)
                 request_builder = request_builder
