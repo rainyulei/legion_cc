@@ -3,6 +3,7 @@
 **Multi-agent orchestration for Claude Code** — turn one AI coding assistant into a coordinated squad.
 
 > [**中文文档**](docs/README_CN.md)
+> [**Roadmap**](ROADMAP.md)
 
 ---
 
