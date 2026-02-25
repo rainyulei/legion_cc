@@ -12,6 +12,47 @@ Turn one AI coding assistant into a coordinated squad. While Claude Code is powe
 
 ---
 
+## Upcoming Plans
+
+### Plan 1: Agent Teams Full Coverage
+
+**Goal**: Complete coverage of agent teams in Leader + full visibility and interactivity in panel
+
+- [ ] Leader agent teams subdivision (Tech Lead, Engineer, QA, etc.)
+- [ ] Visible team structure in TUI panel
+- [ ] Interactive team member management
+- [ ] Each team member can proxy to different models
+- [ ] Team member configuration (provider, model per member)
+- [ ] Real-time team status display
+- [ ] Team communication in TUI
+
+### Plan 2: Global MCP & Skill Injection
+
+**Goal**: Unified MCP tools and skills available to all agents
+
+- [ ] Global MCP registry (add/remove/manage)
+- [ ] Inject MCP to both Leader and Workers
+- [ ] Global skill system
+- [ ] Skill visibility control (per-agent or global)
+- [ ] MCP/Skill enable/disable toggle
+- [ ] MCP credential management
+- [ ] Skill parameter configuration
+
+### Plan 3: Remote Coding
+
+**Goal**: Control Legion from anywhere via phone/voice
+
+- [ ] Mobile-friendly web interface
+- [ ] Voice message input (speech-to-text)
+- [ ] Task creation via voice
+- [ ] Task status monitoring
+- [ ] Code review via mobile
+- [ ] Interactive chat with Leader
+- [ ] Push notifications for task updates
+- [ ] Secure remote authentication
+
+---
+
 ## Milestones
 
 ### v0.2.0 — Multi-Session Persistence
