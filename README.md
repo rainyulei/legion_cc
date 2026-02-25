@@ -89,14 +89,23 @@ Each worker gets its own git worktree and branch. They write to the same repo bu
 ```bash
 git clone https://github.com/rainyulei/legion_cc.git
 cd legion
+
+# Quick build (current architecture)
 make build
 
 # Install to /usr/local/bin
 make install
 
-# Or create macOS .pkg installer
-make pkg
+# Build & package for your Mac's chip (arm64 or x86_64)
+./build-mac.sh
 ```
+
+### Install from Package
+
+Download the `.pkg` installer from [Releases](https://github.com/rainyulei/legion_cc/releases):
+
+- **Apple Silicon (M1/M2/M3/M4)**: `legion-X.X.X-arm64.pkg`
+- **Intel Mac**: `legion-X.X.X-x86_64.pkg`
 
 ### First Run
 
