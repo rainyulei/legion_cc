@@ -101,19 +101,24 @@ pub fn anthropic_to_openai(body: &[u8], model_override: Option<&str>) -> Result<
                         assistant_msg["content"] = json!(text_parts.join(""));
                     }
                     messages.push(assistant_msg);
-                } else if !text_parts.is_empty() {
-                    messages.push(json!({
-                        "role": role,
-                        "content": text_parts.join("")
-                    }));
                 }
 
-                // Emit tool result messages (OpenAI: role=tool, one message per result)
-                for (tool_call_id, content) in tool_results {
+                // Emit tool result messages BEFORE any user text,
+                // so they immediately follow the assistant's tool_calls
+                // (required by minimax and other OpenAI-compatible APIs)
+                for (tool_call_id, content) in &tool_results {
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
                         "content": content
+                    }));
+                }
+
+                // Emit text for non-assistant roles (user text after tool results)
+                if role != "assistant" && !text_parts.is_empty() {
+                    messages.push(json!({
+                        "role": role,
+                        "content": text_parts.join("")
                     }));
                 }
             } else {
@@ -550,13 +555,17 @@ pub fn anthropic_to_openai_responses(body: &[u8], model_override: Option<&str>) 
     }
 
     // Convert tools (same structure as chat completions: {type: "function", function: {...}})
+    // OpenAI strict mode requires ALL properties to be in `required` array,
+    // so we patch schemas to ensure completeness.
     if let Some(tools) = anthropic.get("tools").and_then(|t| t.as_array()) {
         let resp_tools: Vec<Value> = tools
             .iter()
             .map(|tool| {
                 let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let description = tool.get("description").and_then(|d| d.as_str()).unwrap_or("");
-                let parameters = tool.get("input_schema").cloned().unwrap_or(json!({"type": "object"}));
+                let mut parameters = tool.get("input_schema").cloned().unwrap_or(json!({"type": "object"}));
+                // Patch: ensure `required` includes ALL property keys for strict mode
+                ensure_all_properties_required(&mut parameters);
                 json!({
                     "type": "function",
                     "name": name,
@@ -678,6 +687,71 @@ pub fn openai_responses_to_anthropic(body: &[u8]) -> Result<Vec<u8>> {
 
     serde_json::to_vec(&anthropic_response)
         .map_err(|e| anyhow!("Failed to serialize Anthropic response: {}", e))
+}
+
+/// Whitelist of JSON Schema keywords supported by OpenAI strict mode.
+/// Everything not in this list gets stripped to avoid schema validation errors.
+const STRICT_MODE_ALLOWED_KEYS: &[&str] = &[
+    "type", "properties", "required", "items", "additionalProperties",
+    "enum", "const", "anyOf", "$ref", "$defs", "description", "title", "default",
+];
+
+/// Recursively sanitize a JSON Schema for OpenAI strict mode:
+/// 1. Strip all unsupported keywords (whitelist approach)
+/// 2. Ensure `required` includes ALL property keys
+/// 3. Set `additionalProperties: false` on all objects
+fn ensure_all_properties_required(schema: &mut Value) {
+    let obj = match schema.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+
+    // Strip unsupported keywords
+    obj.retain(|key, _| STRICT_MODE_ALLOWED_KEYS.contains(&key.as_str()));
+
+    // Ensure all property keys are in `required`
+    if let Some(props_keys) = obj.get("properties").and_then(|p| p.as_object()).map(|o| {
+        o.keys().cloned().collect::<Vec<String>>()
+    }) {
+        let required = props_keys.iter().map(|k| json!(k)).collect::<Vec<Value>>();
+        obj.insert("required".to_string(), json!(required));
+    }
+
+    // Recurse into nested schemas within `properties`
+    if let Some(props_obj) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        for (_key, prop_schema) in props_obj.iter_mut() {
+            ensure_all_properties_required(prop_schema);
+        }
+    }
+
+    // Recurse into `items` (array element schema)
+    if let Some(items) = obj.get_mut("items") {
+        ensure_all_properties_required(items);
+    }
+
+    // Recurse into `anyOf` variants
+    if let Some(any_of) = obj.get_mut("anyOf").and_then(|v| v.as_array_mut()) {
+        for variant in any_of.iter_mut() {
+            ensure_all_properties_required(variant);
+        }
+    }
+
+    // Recurse into `$defs`
+    if let Some(defs) = obj.get_mut("$defs").and_then(|v| v.as_object_mut()) {
+        for (_name, def_schema) in defs.iter_mut() {
+            ensure_all_properties_required(def_schema);
+        }
+    }
+
+    // All objects must have properties, required, and additionalProperties: false
+    if obj.get("type").and_then(|t| t.as_str()) == Some("object") {
+        obj.insert("additionalProperties".to_string(), json!(false));
+        // Objects without `properties` need empty ones (strict mode requires it)
+        if obj.get("properties").is_none() {
+            obj.insert("properties".to_string(), json!({}));
+            obj.insert("required".to_string(), json!([]));
+        }
+    }
 }
 
 /// Generate a simple UUID v4-like string (not cryptographically secure)
@@ -1044,5 +1118,115 @@ mod tests {
         assert_eq!(content[0]["name"], "Write");
         assert_eq!(content[0]["id"], "call_abc");
         assert_eq!(content[0]["input"]["file_path"], "/tmp/test.py");
+    }
+
+    #[test]
+    fn test_responses_api_strict_mode_all_properties_required() {
+        // Simulate the Task tool schema where `isolation` is optional (not in required)
+        let anthropic = json!({
+            "model": "gpt-5.2-codex",
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "name": "Task",
+                    "description": "Launch a subagent",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string"},
+                            "prompt": {"type": "string"},
+                            "subagent_type": {"type": "string"},
+                            "isolation": {
+                                "type": "string",
+                                "enum": ["worktree"]
+                            }
+                        },
+                        "required": ["description", "prompt", "subagent_type"]
+                    }
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+
+        let result = anthropic_to_openai_responses(anthropic.to_string().as_bytes(), None).unwrap();
+        let resp: Value = serde_json::from_slice(&result).unwrap();
+
+        let tool = &resp["tools"][0];
+        assert_eq!(tool["strict"], true);
+
+        // All 4 properties must be in required (including optional `isolation`)
+        let required = tool["parameters"]["required"].as_array().unwrap();
+        let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required_strs.contains(&"description"));
+        assert!(required_strs.contains(&"prompt"));
+        assert!(required_strs.contains(&"subagent_type"));
+        assert!(required_strs.contains(&"isolation"), "isolation must be in required for strict mode");
+
+        // additionalProperties should be false
+        assert_eq!(tool["parameters"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn test_responses_api_strict_mode_strips_unsupported_keywords() {
+        // Simulate TaskCreate schema with propertyNames and other unsupported keywords
+        let anthropic = json!({
+            "model": "gpt-5.2-codex",
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "name": "TaskCreate",
+                    "description": "Create a task",
+                    "input_schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "properties": {
+                            "subject": {"type": "string", "minLength": 1, "maxLength": 200},
+                            "description": {"type": "string"},
+                            "metadata": {
+                                "type": "object",
+                                "additionalProperties": {},
+                                "propertyNames": {"type": "string"}
+                            }
+                        },
+                        "required": ["subject", "description"]
+                    }
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+
+        let result = anthropic_to_openai_responses(anthropic.to_string().as_bytes(), None).unwrap();
+        let resp: Value = serde_json::from_slice(&result).unwrap();
+
+        let params = &resp["tools"][0]["parameters"];
+
+        // $schema should be stripped
+        assert!(params.get("$schema").is_none(), "$schema must be stripped");
+
+        // subject should lose minLength/maxLength
+        let subject = &params["properties"]["subject"];
+        assert!(subject.get("minLength").is_none(), "minLength must be stripped");
+        assert!(subject.get("maxLength").is_none(), "maxLength must be stripped");
+        assert_eq!(subject["type"], "string"); // type preserved
+
+        // metadata should lose propertyNames, additionalProperties forced to false,
+        // and gain empty properties + required (strict mode requires them for objects)
+        let metadata = &params["properties"]["metadata"];
+        assert!(metadata.get("propertyNames").is_none(), "propertyNames must be stripped");
+        assert_eq!(metadata["additionalProperties"], false);
+        assert_eq!(metadata["type"], "object");
+        assert_eq!(metadata["properties"], json!({}), "empty properties required for strict objects");
+        assert_eq!(metadata["required"], json!([]), "empty required for strict objects without properties");
+
+        // All 3 properties in required
+        let required = params["required"].as_array().unwrap();
+        let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required_strs.contains(&"subject"));
+        assert!(required_strs.contains(&"description"));
+        assert!(required_strs.contains(&"metadata"));
     }
 }

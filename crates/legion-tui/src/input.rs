@@ -33,12 +33,22 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputResult {
     // Task Board navigation when right panel is focused
     if app.right_panel_focused && app.is_squad() {
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 navigate_ticket_down(app);
                 return InputResult::Continue;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 navigate_ticket_up(app);
+                return InputResult::Continue;
+            }
+            KeyCode::Char('j') => {
+                app.board_scroll_offset = app.board_scroll_offset.saturating_add(1);
+                app.board_manual_scroll = true;
+                return InputResult::Continue;
+            }
+            KeyCode::Char('k') => {
+                app.board_scroll_offset = app.board_scroll_offset.saturating_sub(1);
+                app.board_manual_scroll = true;
                 return InputResult::Continue;
             }
             KeyCode::Enter => {
@@ -232,7 +242,8 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
             } else if matches!(app.mode, AppMode::Popup(PopupMenu::BoardDetail)) {
                 app.board_detail_scroll = app.board_detail_scroll.saturating_sub(3);
             } else if app.right_panel_focused {
-                navigate_ticket_up(app);
+                app.board_scroll_offset = app.board_scroll_offset.saturating_sub(3);
+                app.board_manual_scroll = true;
             } else if matches!(app.mode, AppMode::Normal) {
                 // Scroll focused pane up (into scrollback)
                 if let Some(pane) = app.panes.get_mut(app.focused_pane) {
@@ -246,7 +257,8 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
             } else if matches!(app.mode, AppMode::Popup(PopupMenu::BoardDetail)) {
                 app.board_detail_scroll = app.board_detail_scroll.saturating_add(3);
             } else if app.right_panel_focused {
-                navigate_ticket_down(app);
+                app.board_scroll_offset = app.board_scroll_offset.saturating_add(3);
+                app.board_manual_scroll = true;
             } else if matches!(app.mode, AppMode::Normal) {
                 // Scroll focused pane down (towards live view)
                 if let Some(pane) = app.panes.get_mut(app.focused_pane) {
@@ -338,9 +350,16 @@ fn handle_submenu_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') => app.menu_up(),
         KeyCode::Down | KeyCode::Char('j') => app.menu_down(),
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            // Capture leader's proxy state before the switch
+            let leader_used_proxy_before = app.pane_uses_proxy("Leader");
             app.select_submenu_item();
             update_proxy_config(app);
             save_pane_configs(app);
+            // If leader's proxy state changed, respawn the PTY so ANTHROPIC_BASE_URL matches
+            let leader_uses_proxy_now = app.pane_uses_proxy("Leader");
+            if leader_used_proxy_before != leader_uses_proxy_now {
+                app.respawn_leader_pty();
+            }
         }
         _ => {}
     }
@@ -809,6 +828,7 @@ fn navigate_ticket_down(app: &mut App) {
             0
         };
         app.board_selected = ids[next];
+        app.board_manual_scroll = false;
     }
 }
 
@@ -825,6 +845,7 @@ fn navigate_ticket_up(app: &mut App) {
             ids.len() - 1
         };
         app.board_selected = ids[prev];
+        app.board_manual_scroll = false;
     }
 }
 

@@ -185,8 +185,8 @@ pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
     ProviderTemplate {
         id: "minimax",
         name: "MiniMax",
-        base_url: "https://api.minimax.io/v1",
-        api_format: "openai_chat",
+        base_url: "https://api.minimax.io/anthropic",
+        api_format: "anthropic",
         models: &["MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1", "MiniMax-M2"],
         env_var: "MINIMAX_API_KEY",
         auth_method: "api_key",
@@ -322,6 +322,8 @@ pub struct App {
     pub board_selected: usize,          // selected ticket id in board view
     pub board_detail_scroll: usize,     // scroll offset in detail popup
     pub board_scroll_offset: usize,     // viewport scroll offset for task board list
+    pub board_manual_scroll: bool,      // manual scroll lock for board viewport
+    pub board_last_selected: usize,     // track selection changes for auto-scroll
 
     // Per-ticket log buffers (ticket_id → log lines)
     pub ticket_logs: HashMap<usize, std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
@@ -478,6 +480,8 @@ impl App {
             // board_detail is now AppMode::Popup(PopupMenu::BoardDetail)
             board_detail_scroll: 0,
             board_scroll_offset: 0,
+            board_manual_scroll: false,
+            board_last_selected: 0,
             ticket_logs: HashMap::new(),
             ticket_team_activities: HashMap::new(),
             connect_provider_index: 0,
@@ -1268,6 +1272,59 @@ impl App {
                 }
             }
             self.panes[i].spawned_with_continue = false;
+        }
+    }
+
+    /// Respawn the leader PTY after a provider/model switch.
+    ///
+    /// This is needed because `ANTHROPIC_BASE_URL` is an env var set at spawn time
+    /// and cannot be changed for a running process. When switching between default
+    /// (direct connection) and proxy providers, the leader PTY must be restarted.
+    pub fn respawn_leader_pty(&mut self) {
+        if self.panes.is_empty() { return; }
+        let worker_count = if self.panes.len() > 1 { (self.panes.len() - 1) as u16 } else { 0 };
+
+        // Kill existing leader PTY
+        if let Some(ref mut pty) = self.panes[0].pty {
+            pty.kill();
+        }
+
+        // Calculate PTY size
+        let (tw, th) = self.term_size;
+        let ch = th.saturating_sub(2);
+        let (rows, cols) = if worker_count > 0 {
+            let lw = (tw as u32 * self.leader_ratio as u32 / 100) as u16;
+            (ch.saturating_sub(2), lw.saturating_sub(2))
+        } else {
+            (ch.saturating_sub(2), tw.saturating_sub(2))
+        };
+
+        let proxy_port = self.panes[0].proxy_port;
+        let control_port = self.panes[0].control_port;
+        let orchestrate_port = self.base_port + 2000;
+        let use_proxy = self.pane_uses_proxy("Leader");
+        let working_dir = self.pane_worktree("Leader");
+
+        let teams_for_leader = self.load_teams_for_leader();
+        let prompt = crate::claudemd::leader_instructions(worker_count, &teams_for_leader);
+
+        tracing::info!("Respawning leader PTY: use_proxy={}, proxy_port={}", use_proxy, proxy_port);
+
+        match crate::pty::PtyHandle::spawn(
+            rows, cols, proxy_port, control_port,
+            false, None, Some(orchestrate_port),
+            Some(&prompt), use_proxy,
+            working_dir.as_deref(), false,
+        ) {
+            Ok(handle) => {
+                self.panes[0].pty = Some(handle);
+                self.panes[0].spawned_with_continue = false;
+                self.panes[0].scroll_offset = 0;
+            }
+            Err(e) => {
+                tracing::error!("Failed to respawn leader PTY: {}", e);
+                self.panes[0].pty = None;
+            }
         }
     }
 

@@ -505,13 +505,23 @@ fn draw_task_board(frame: &mut Frame, app: &mut App, area: Rect) {
     // Auto-scroll to keep selected ticket visible
     let visible_height = inner.height as usize;
     let total_lines = lines.len();
+    let selection_changed = app.board_last_selected != app.board_selected;
+    if selection_changed {
+        app.board_last_selected = app.board_selected;
+        app.board_manual_scroll = false;
+    }
+
     if let Some(&(_, sel_line)) = ticket_line_map.iter().find(|(id, _)| *id == app.board_selected) {
         // Working tickets take 3 lines (top border + content + bottom border), others take 1
         let sel_height = if working.iter().any(|t| t.id == app.board_selected) { 3 } else { 1 };
-        if sel_line < app.board_scroll_offset {
-            app.board_scroll_offset = sel_line;
-        } else if sel_line + sel_height > app.board_scroll_offset + visible_height {
-            app.board_scroll_offset = (sel_line + sel_height).saturating_sub(visible_height);
+
+        // Only auto-scroll if selection moved or manual scroll isn't active
+        if !app.board_manual_scroll {
+            if sel_line < app.board_scroll_offset {
+                app.board_scroll_offset = sel_line;
+            } else if sel_line + sel_height > app.board_scroll_offset + visible_height {
+                app.board_scroll_offset = (sel_line + sel_height).saturating_sub(visible_height);
+            }
         }
     }
     let max_scroll = total_lines.saturating_sub(visible_height);
