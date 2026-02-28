@@ -34,7 +34,8 @@ pub fn pane_branch_name(session_name: &str, pane_label: &str) -> String {
 /// Create a git worktree for a pane
 ///
 /// If the worktree already exists, returns its path.
-/// If the branch already exists (leftover from incomplete cleanup), reuses it.
+/// If the branch/path already exists (from another worktree or user), tries
+/// suffixed names (e.g. leader-2, leader-3) to avoid conflicts.
 pub fn create_worktree(
     project_path: &Path,
     session_name: &str,
@@ -52,30 +53,67 @@ pub fn create_worktree(
         std::fs::create_dir_all(parent).context("Failed to create worktree parent directory")?;
     }
 
+    // Try creating with the original name first
+    if try_create_worktree(project_path, &wt_path, &branch)? {
+        return Ok(wt_path);
+    }
+
+    // Conflict — try suffixed names to avoid touching existing branches/worktrees
+    for suffix in 2..=20 {
+        let suffixed_label = format!("{}-{}", pane_label, suffix);
+        let suffixed_path = pane_worktree_path(project_path, session_name, &suffixed_label);
+        let suffixed_branch = pane_branch_name(session_name, &suffixed_label);
+
+        if worktree_exists(&suffixed_path) {
+            continue;
+        }
+
+        if let Some(parent) = suffixed_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        if try_create_worktree(project_path, &suffixed_path, &suffixed_branch)? {
+            tracing::info!(
+                "Used suffixed worktree '{}' (original '{}' was occupied)",
+                suffixed_branch, branch
+            );
+            return Ok(suffixed_path);
+        }
+    }
+
+    anyhow::bail!(
+        "git worktree add failed: could not create worktree for '{}' \
+         (branch or path already in use, tried up to 20 suffixes)",
+        pane_label
+    )
+}
+
+/// Try to create a worktree at the given path with the given branch.
+/// Returns Ok(true) on success, Ok(false) if branch/path conflicts.
+fn try_create_worktree(project_path: &Path, wt_path: &Path, branch: &str) -> Result<bool> {
     // Try creating with new branch
     let output = Command::new("git")
-        .args(["worktree", "add", &wt_path.to_string_lossy(), "-b", &branch])
+        .args(["worktree", "add", &wt_path.to_string_lossy(), "-b", branch])
         .current_dir(project_path)
         .output()
         .context("Failed to run git worktree add")?;
 
     if output.status.success() {
-        return Ok(wt_path);
+        return Ok(true);
     }
 
-    // Branch might already exist (leftover) — try using existing branch
+    // Branch might already exist — try using it directly
     let output2 = Command::new("git")
-        .args(["worktree", "add", &wt_path.to_string_lossy(), &branch])
+        .args(["worktree", "add", &wt_path.to_string_lossy(), branch])
         .current_dir(project_path)
         .output()
         .context("Failed to run git worktree add with existing branch")?;
 
     if output2.status.success() {
-        return Ok(wt_path);
+        return Ok(true);
     }
 
-    let stderr = String::from_utf8_lossy(&output2.stderr);
-    anyhow::bail!("git worktree add failed: {}", stderr.trim())
+    Ok(false)
 }
 
 /// Check if a worktree path exists and is valid
